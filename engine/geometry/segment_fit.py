@@ -6,8 +6,9 @@ from collections.abc import Sequence
 from dataclasses import replace
 
 import numpy as np
+from scipy.optimize import minimize_scalar
 
-from engine.geometry.bezier import fit_cubic
+from engine.geometry.bezier import fit_cubic, sample
 from engine.presets import FitParams
 from engine.types import Arc, CubicBezier, Line, Point, Segment
 
@@ -17,6 +18,7 @@ _BEZIER_PARAMS = 8
 _MAX_RADIUS_TO_CHORD = 10.0
 _EPS = 1e-12
 _CURVE_SAMPLES = 64
+_G1_COS = math.cos(math.radians(10.0))  # handles within 10 deg of a line count as G1
 
 
 def _as_array(points: Sequence[Point]) -> np.ndarray:
@@ -42,16 +44,42 @@ def fit_line(points: Sequence[Point]) -> tuple[Line, float]:
     return Line(_exact(points[0]), _exact(points[-1])), float(np.sum(d**2))
 
 
-def _kasa_circle(pts: np.ndarray) -> tuple[np.ndarray, float] | None:
-    mean = pts.mean(axis=0)
-    q = pts - mean
-    a = np.column_stack((2 * q[:, 0], 2 * q[:, 1], np.ones(len(q))))
-    b = (q**2).sum(axis=1)
-    sol, *_ = np.linalg.lstsq(a, b, rcond=None)
-    r_sq = sol[2] + sol[0] ** 2 + sol[1] ** 2
-    if not np.isfinite(r_sq) or r_sq <= _EPS:
+def _bisector_circle(pts: np.ndarray) -> tuple[np.ndarray, float] | None:
+    """Circle through p0 and p1 (center on their perpendicular bisector) best fitting the points.
+
+    This is the circle an SVG renderer reconstructs from `A r r 0 large sweep p1` at p0, so
+    fitting and scoring against it means the tolerance gate sees what is actually drawn.
+    """
+    p0, p1 = pts[0], pts[-1]
+    chord = p1 - p0
+    length = float(np.hypot(*chord))
+    if length < _EPS:
         return None
-    return np.array([sol[0], sol[1]]) + mean, float(math.sqrt(r_sq))
+    mid = (p0 + p1) / 2
+    normal = np.array([-chord[1], chord[0]]) / length
+    limit = 2 * _MAX_RADIUS_TO_CHORD * length  # search past the cutoff so it rejects, not clips
+
+    def center(s: float) -> np.ndarray:
+        return mid + s * normal
+
+    def cost(s: float) -> float:
+        c = center(s)
+        r = float(np.hypot(*(p0 - c)))
+        return float(np.sum((np.hypot(*(pts - c).T) - r) ** 2))
+
+    # algebraic start: |p-c|^2 - |p0-c|^2 = a_i - s*b_i is linear in the offset s
+    q = pts - p0
+    a = (pts**2).sum(axis=1) - (p0**2).sum() - 2 * (q @ mid)
+    b = 2 * (q @ normal)
+    denom = float(b @ b)
+    s0 = float(a @ b) / denom if denom > _EPS else 0.0
+    best = min((min(max(s0, -limit), limit), 0.0), key=cost)
+    for lo, hi in ((best - length, best + length), (-limit, limit)):
+        res = minimize_scalar(cost, bounds=(max(lo, -limit), min(hi, limit)), method="bounded")
+        if cost(float(res.x)) < cost(best):
+            best = float(res.x)
+    c = center(best)
+    return c, float(np.hypot(*(p0 - c)))
 
 
 def _angular_travel(pts: np.ndarray, center: np.ndarray) -> float:
@@ -62,12 +90,12 @@ def _angular_travel(pts: np.ndarray, center: np.ndarray) -> float:
 
 
 def fit_arc(points: Sequence[Point]) -> tuple[Arc, float] | None:
-    """Kasa circle fit. None if degenerate or radius > 10x the chord length."""
+    """Circular arc through points[0] and points[-1]; None if degenerate or radius > 10x chord."""
     if len(points) < 3:
         return None
     pts = _as_array(points)
     chord = float(np.hypot(*(pts[-1] - pts[0])))
-    fit = _kasa_circle(pts)
+    fit = _bisector_circle(pts)
     if fit is None:
         return None
     center, radius = fit
@@ -91,15 +119,7 @@ def _arc_max_error(arc: Arc, pts: np.ndarray) -> float:
 
 def _bezier_distances(chain: Sequence[CubicBezier], pts: np.ndarray) -> np.ndarray:
     t = np.linspace(0.0, 1.0, _CURVE_SAMPLES)
-    s = 1.0 - t
-    samples = []
-    for seg in chain:
-        c = _as_array([seg.p0, seg.c1, seg.c2, seg.p1])
-        samples.append(
-            (s**3)[:, None] * c[0] + (3 * s * s * t)[:, None] * c[1]
-            + (3 * s * t * t)[:, None] * c[2] + (t**3)[:, None] * c[3]
-        )
-    curve = np.vstack(samples)
+    curve = np.vstack([sample(seg, t) for seg in chain])
     diff = pts[:, None, :] - curve[None, :, :]
     return np.sqrt((diff**2).sum(axis=2)).min(axis=1)
 
@@ -134,28 +154,50 @@ def _shift(p: Point, delta: Point) -> Point:
     return (p[0] + delta[0], p[1] + delta[1])
 
 
-def _move_end(seg: Segment, at_end: bool, delta: Point) -> Segment:
-    """Move a Line/Bezier endpoint (and its adjacent control point) by delta."""
+def _move_end(seg: Segment, at_end: bool, delta: Point, direction: Point) -> Segment:
+    """Move a Line/Bezier endpoint by delta; `direction` is the snapped line's unit direction.
+
+    A Bezier handle that was (nearly) collinear with the line keeps G1: it is re-aimed along
+    `direction`, preserving its length. Other handles just follow their endpoint.
+    """
     if isinstance(seg, Line):
         return replace(seg, p1=_shift(seg.p1, delta)) if at_end else replace(seg, p0=_shift(seg.p0, delta))
+    anchor, handle = (seg.p1, seg.c2) if at_end else (seg.p0, seg.c1)
+    vec = (handle[0] - anchor[0], handle[1] - anchor[1])  # points away from the junction
+    length = math.hypot(*vec)
+    new_anchor = _shift(anchor, delta)
+    new_handle = _shift(handle, delta)
+    if length > _EPS:
+        # leaving the junction, the next segment's handle runs along +direction and the
+        # previous segment's handle along -direction
+        wanted = (-direction[0], -direction[1]) if at_end else direction
+        if (vec[0] * wanted[0] + vec[1] * wanted[1]) / length >= _G1_COS:
+            new_handle = (new_anchor[0] + wanted[0] * length, new_anchor[1] + wanted[1] * length)
     if at_end:
-        return replace(seg, c2=_shift(seg.c2, delta), p1=_shift(seg.p1, delta))
-    return replace(seg, p0=_shift(seg.p0, delta), c1=_shift(seg.c1, delta))
+        return replace(seg, c2=new_handle, p1=new_anchor)
+    return replace(seg, p0=new_anchor, c1=new_handle)
 
 
-def _snap_deltas(line: Line, tol_rad: float) -> tuple[Point, Point] | None:
-    """Endpoint displacements that make `line` exactly horizontal/vertical, or None."""
+def _snap_deltas(line: Line, tol_rad: float, max_move: float) -> tuple[Point, Point] | None:
+    """Endpoint displacements that make `line` exactly horizontal/vertical, or None.
+
+    None when the line is not within tol_rad of an axis or an endpoint would move > max_move.
+    """
     dx, dy = line.p1[0] - line.p0[0], line.p1[1] - line.p0[1]
     if math.hypot(dx, dy) < _EPS:
         return None
     angle = math.atan2(abs(dy), abs(dx))  # 0 = horizontal, pi/2 = vertical
     if angle <= tol_rad:
         y = (line.p0[1] + line.p1[1]) / 2
-        return (0.0, y - line.p0[1]), (0.0, y - line.p1[1])
-    if math.pi / 2 - angle <= tol_rad:
+        deltas = ((0.0, y - line.p0[1]), (0.0, y - line.p1[1]))
+    elif math.pi / 2 - angle <= tol_rad:
         x = (line.p0[0] + line.p1[0]) / 2
-        return (x - line.p0[0], 0.0), (x - line.p1[0], 0.0)
-    return None
+        deltas = ((x - line.p0[0], 0.0), (x - line.p1[0], 0.0))
+    else:
+        return None
+    if any(math.hypot(*d) > max_move for d in deltas):
+        return None
+    return deltas
 
 
 def snap_axis(segments: Sequence[Segment], params: FitParams) -> tuple[Segment, ...]:
@@ -163,7 +205,7 @@ def snap_axis(segments: Sequence[Segment], params: FitParams) -> tuple[Segment, 
 
     Only Lines that are neither the first nor the last segment qualify (their endpoints are
     interior corners); the neighbours' shared endpoints move identically. Lines next to an Arc
-    are left alone.
+    are left alone, as are lines whose snap would move an endpoint more than tolerance_px.
     """
     segs = list(segments)
     tol_rad = math.radians(params.axis_snap_deg)
@@ -171,11 +213,14 @@ def snap_axis(segments: Sequence[Segment], params: FitParams) -> tuple[Segment, 
         seg, prev, nxt = segs[i], segs[i - 1], segs[i + 1]
         if not isinstance(seg, Line) or isinstance(prev, Arc) or isinstance(nxt, Arc):
             continue
-        deltas = _snap_deltas(seg, tol_rad)
+        deltas = _snap_deltas(seg, tol_rad, params.tolerance_px)
         if deltas is None:
             continue
         d0, d1 = deltas
-        segs[i - 1] = _move_end(prev, True, d0)
-        segs[i] = Line(_shift(seg.p0, d0), _shift(seg.p1, d1))
-        segs[i + 1] = _move_end(nxt, False, d1)
+        snapped = Line(_shift(seg.p0, d0), _shift(seg.p1, d1))
+        length = math.hypot(snapped.p1[0] - snapped.p0[0], snapped.p1[1] - snapped.p0[1])
+        direction = ((snapped.p1[0] - snapped.p0[0]) / length, (snapped.p1[1] - snapped.p0[1]) / length)
+        segs[i - 1] = _move_end(prev, True, d0, direction)
+        segs[i] = snapped
+        segs[i + 1] = _move_end(nxt, False, d1, direction)
     return tuple(segs)

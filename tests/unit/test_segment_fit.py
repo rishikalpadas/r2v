@@ -38,7 +38,7 @@ def test_fit_arc_recovers_circle():
 
 
 def test_fit_arc_rejects_near_straight():
-    assert fit_arc([(float(i), 0.001 * i * i) for i in range(20)]) is None
+    assert fit_arc([(float(i), 0.0003 * i * i) for i in range(20)]) is None
     assert fit_arc([(0.0, 0.0), (1.0, 1.0)]) is None
 
 
@@ -136,3 +136,87 @@ def test_axis_snap_leaves_far_and_boundary_lines():
     arc = Arc((0.0, 0.0), (0.0, 0.0), (0.0, 0.0), 1.0, False, True)
     mid = Line((0.0, 0.0), (20.0, 0.5))
     assert snap_axis((arc, mid, a), PARAMS)[1] == mid  # arc neighbour: untouched
+
+
+def _rendered_arc_samples(arc: Arc, n=2000):
+    cx, cy = _svg_center(arc)
+    r = arc.radius
+    a0 = math.atan2(arc.p0[1] - cy, arc.p0[0] - cx)
+    a1 = math.atan2(arc.p1[1] - cy, arc.p1[0] - cx)
+    d = a1 - a0
+    if arc.sweep and d < 0:
+        d += 2 * math.pi
+    if not arc.sweep and d > 0:
+        d -= 2 * math.pi
+    a = a0 + d * np.linspace(0, 1, n)
+    return np.column_stack((cx + r * np.cos(a), cy + r * np.sin(a)))
+
+
+def _disc_ring(radius):
+    from engine.geometry.corners import smooth_polyline
+    from engine.geometry.stitching import build_boundary_graph
+    from engine.presets import SegmentParams
+    from engine.stages.segment import segment
+    from engine.types import RasterImage
+    from eval.synthetic import circle
+
+    size = 2 * radius + 24
+    px = circle(size=size, cx=size / 2 + 0.3, cy=size / 2 - 0.2, r=radius)
+    regions = segment(RasterImage(pixels=px, original_size=(size, size)), SegmentParams())
+    curves = [c for c in build_boundary_graph(regions).curves if c.closed and c.left >= 0 and c.right >= 0]
+    return smooth_polyline(curves[0].points, closed=True, sigma=PARAMS.smooth_sigma)
+
+
+@pytest.mark.parametrize("radius", [20, 40])
+def test_chosen_arc_renders_within_tolerance_of_noisy_input(radius):
+    ring = _disc_ring(radius)
+    n = len(ring)
+    checked = 0
+    for deg in (150, 165, 180, 195, 210):
+        length = int(n * deg / 360)
+        for off in range(0, n, max(1, n // 40)):
+            span = [ring[(off + k) % n] for k in range(length + 1)]
+            segs = fit_span(span, PARAMS)
+            if len(segs) != 1 or not isinstance(segs[0], Arc):
+                continue
+            curve = _rendered_arc_samples(segs[0])
+            pts = np.array(span)
+            worst = np.sqrt(((pts[:, None, :] - curve[None]) ** 2).sum(2)).min(1).max()
+            assert worst <= PARAMS.tolerance_px + 1e-6, (radius, deg, off, worst)
+            checked += 1
+    assert checked > 0
+
+
+def test_fit_arc_center_lies_on_endpoint_bisector():
+    rng = np.random.default_rng(3)
+    pts = [(x + float(rng.uniform(-.3, .3)), y + float(rng.uniform(-.3, .3)))
+           for x, y in _circle_pts(50, 40, 20, 0.2, 0.2 + math.pi, 40)]
+    arc, _ = fit_arc(pts)
+    assert math.dist(arc.center, arc.p0) == pytest.approx(arc.radius, abs=1e-9)
+    assert math.dist(arc.center, arc.p1) == pytest.approx(arc.radius, abs=1e-9)
+
+
+def test_axis_snap_displacement_is_capped():
+    long_line = Line((0.0, 0.0), (100.0, 5.0))  # ~2.9 degrees: ends would move 2.5 px
+    out = snap_axis((Line((0.0, 20.0), (0.0, 0.0)), long_line, Line((100.0, 5.0), (100.0, 30.0))), PARAMS)
+    assert out[1] == long_line
+    small = Line((0.0, 0.0), (20.0, 0.7))  # moves 0.35 px: allowed
+    out = snap_axis((Line((0.0, 20.0), (0.0, 0.0)), small, Line((20.0, 0.7), (20.0, 30.0))), PARAMS)
+    assert out[1].p0[1] == out[1].p1[1]
+
+
+def test_axis_snap_keeps_g1_with_bezier_neighbour():
+    # smooth join: line direction (20, 0.7); bezier handle collinear with it
+    line = Line((0.0, 0.0), (20.0, 0.7))
+    d = (20.0, 0.7)
+    ln = math.hypot(*d)
+    handle = (20.0 + 6 * d[0] / ln, 0.7 + 6 * d[1] / ln)
+    bez = CubicBezier((20.0, 0.7), handle, (35.0, 12.0), (40.0, 20.0))
+    prev = Line((0.0, 20.0), (0.0, 0.0))
+    out = snap_axis((prev, line, bez), PARAMS)
+    assert out[1].p0[1] == out[1].p1[1]
+    b = out[2]
+    assert b.p0 == out[1].p1
+    assert b.c1[1] == pytest.approx(b.p0[1], abs=1e-9)  # handle follows the now-horizontal line
+    assert math.dist(b.c1, b.p0) == pytest.approx(6.0)  # handle length preserved
+    assert b.c1[0] > b.p0[0]

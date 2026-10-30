@@ -37,6 +37,18 @@ def _bezier_at(ctrl: np.ndarray, t: np.ndarray) -> np.ndarray:
     )
 
 
+def sample(seg: CubicBezier, ts: np.ndarray) -> np.ndarray:
+    """Points of `seg` at parameters `ts` as an Nx2 array."""
+    ctrl = np.array([seg.p0, seg.c1, seg.c2, seg.p1], dtype=float)
+    return _bezier_at(ctrl, np.asarray(ts, dtype=float))
+
+
+def evaluate(seg: CubicBezier, t: float) -> Point:
+    """Point of `seg` at parameter t in [0, 1]."""
+    x, y = sample(seg, np.array([t]))[0]
+    return (float(x), float(y))
+
+
 def _chord_params(d: np.ndarray) -> np.ndarray:
     steps = np.hypot(*np.diff(d, axis=0).T)
     u = np.concatenate(([0.0], np.cumsum(steps)))

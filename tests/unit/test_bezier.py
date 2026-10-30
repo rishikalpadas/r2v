@@ -56,3 +56,13 @@ def test_fit_cubic_degenerate_inputs():
     assert len(two) == 1 and two[0].p0 == (0.0, 0.0) and two[0].p1 == (6.0, 0.0)
     same = fit_cubic([(2.0, 2.0)] * 4, 0.5)
     assert len(same) == 1 and same[0].p0 == same[0].p1 == (2.0, 2.0)
+
+
+def test_evaluate_public_matches_endpoints_and_midpoint():
+    from engine.geometry.bezier import evaluate
+    from engine.types import CubicBezier
+
+    seg = CubicBezier((0.0, 0.0), (0.0, 4.0), (8.0, 4.0), (8.0, 0.0))
+    assert evaluate(seg, 0.0) == (0.0, 0.0)
+    assert evaluate(seg, 1.0) == (8.0, 0.0)
+    assert evaluate(seg, 0.5) == (4.0, 3.0)
