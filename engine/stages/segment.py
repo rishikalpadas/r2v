@@ -82,7 +82,9 @@ def _merge_clusters(
     return new_id, palette
 
 
-def _drop_blend_clusters(cluster: np.ndarray, palette: np.ndarray, counts: np.ndarray):
+def _drop_blend_clusters(
+    cluster: np.ndarray, palette: np.ndarray, counts: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """Remove minor clusters whose color lies between two larger clusters (JPEG/AA blends).
 
     Only used on the noisy (KMeans) path. Returns (remapped cluster ids, palette).
@@ -91,7 +93,6 @@ def _drop_blend_clusters(cluster: np.ndarray, palette: np.ndarray, counts: np.nd
     dist = deltaE_ciede2000(lab[:, None, :], lab[None, :, :])
     alive = np.ones(len(palette), dtype=bool)
     total = counts.sum()
-    remap = np.arange(len(palette))
     for c in np.argsort(counts, kind="stable"):
         if counts[c] > BLEND_MAX_SHARE * total:
             break
@@ -102,11 +103,11 @@ def _drop_blend_clusters(cluster: np.ndarray, palette: np.ndarray, counts: np.nd
         via = dist[bigger, c][:, None] + dist[c, bigger][None, :]
         if np.any((via <= BLEND_CLUSTER_TOLERANCE * pair) & (pair > 0)):
             alive[c] = False
-            remap[c] = bigger[np.argmin(dist[c, bigger])]
     kept = np.flatnonzero(alive)
-    new_index = np.full(len(palette), -1)
-    new_index[kept] = np.arange(len(kept))
-    return new_index[remap][cluster], palette[kept]
+    # Nearest *surviving* cluster for every cluster (kept ones map to themselves).
+    nearest = np.argmin(dist[:, kept], axis=1)
+    nearest[kept] = np.arange(len(kept))
+    return nearest[cluster], palette[kept]
 
 
 def _blend_vote_changes(
@@ -118,14 +119,14 @@ def _blend_vote_changes(
     """
     lab = _to_lab(palette)
     dist = deltaE_ciede2000(lab[:, None, :], lab[None, :, :])
-    others = votes.astype(np.int16)
-    np.put_along_axis(others, np.clip(labels, 0, None)[None], -1, axis=0)
+    others = votes.copy()
+    np.put_along_axis(others, labels[None], -1, axis=0)
     first = others.argmax(axis=0)
     first_votes = others.max(axis=0)
     np.put_along_axis(others, first[None], -1, axis=0)
     second = others.argmax(axis=0)
     second_votes = others.max(axis=0)
-    own_lab = np.clip(labels, 0, None)
+    own_lab = labels
     via = dist[first, own_lab] + dist[own_lab, second]
     between = via <= BLEND_TOLERANCE * dist[first, second]
     is_blend = (own <= MAX_BLEND_OWN_VOTES) & (second_votes >= 1) & (first_votes >= own) & between
@@ -142,27 +143,26 @@ def _majority_cleanup(labels: np.ndarray, palette: np.ndarray, noisy: bool) -> n
         & (pad[1:-1, :-2] == labels) & (pad[1:-1, 2:] == labels)
     )
     candidate = opaque & ~same_4
-    if not candidate.any():
+    ys, xs = np.nonzero(candidate)
+    if len(ys) == 0:
         return labels
-    kernel = np.ones((3, 3), np.int8)
-    votes = np.stack(
-        [
-            ndimage.convolve((labels == c).astype(np.int8), kernel, mode="nearest")
-            for c in range(n_labels)
-        ]
-    )
-    own = np.take_along_axis(votes, np.clip(labels, 0, None)[None], axis=0)[0]
+    # 3x3 neighborhood labels for candidate pixels only: (N, 9); votes: (K, N).
+    window = np.stack([pad[ys + dy, xs + dx] for dy in range(3) for dx in range(3)], axis=1)
+    votes = np.stack([(window == c).sum(axis=1, dtype=np.int16) for c in range(n_labels)])
+    cand_labels = labels[ys, xs]
+    own = np.take_along_axis(votes, cand_labels[None], axis=0)[0]
     winner = votes.argmax(axis=0)
     win_votes = votes.max(axis=0)
     speckle = (own <= MAX_SPECKLE_OWN_VOTES) & (win_votes >= MIN_WINNER_VOTES)
     target = winner
-    change = candidate & speckle & (winner != labels)
+    change = speckle & (winner != cand_labels)
     if noisy and n_labels >= 3:
-        is_blend, blend_target = _blend_vote_changes(labels, votes, own, palette)
-        blend = candidate & is_blend & ~speckle
+        is_blend, blend_target = _blend_vote_changes(cand_labels, votes, own, palette)
+        blend = is_blend & ~speckle
         change |= blend
         target = np.where(blend, blend_target, winner)
-    out = np.where(change, target, labels).astype(labels.dtype)
+    out = labels.copy()
+    out[ys[change], xs[change]] = target[change]
     lost = np.setdiff1d(np.unique(labels[opaque]), np.unique(out[out >= 0]))
     if len(lost):
         out = np.where(np.isin(labels, lost), labels, out)
@@ -197,8 +197,9 @@ def _diagonal_reach(comp: np.ndarray, comp_cluster: np.ndarray) -> np.ndarray:
     """
     reach = np.zeros(len(comp_cluster), dtype=np.int64)
     eight = np.ones((3, 3), dtype=int)
+    cluster_map = comp_cluster[comp]
     for c in np.unique(comp_cluster[1:]):
-        mask = comp_cluster[comp] == c
+        mask = cluster_map == c
         lab, n = ndimage.label(mask, structure=eight)
         group_sizes = np.bincount(lab.ravel(), minlength=n + 1)
         ids, first = np.unique(comp[mask], return_index=True)
@@ -215,8 +216,10 @@ def _merge_small_components(comp: np.ndarray, comp_cluster: np.ndarray, min_px: 
     reach = _diagonal_reach(comp, comp_cluster)
     a, b = _edge_pairs(comp)
     borders: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-    for x, y in zip(a.tolist(), b.tolist()):
-        borders[x][y] += 1
+    n_ids = len(comp_cluster)
+    keys, cnts = np.unique(a * n_ids + b, return_counts=True)
+    for key, cnt in zip(keys.tolist(), cnts.tolist()):
+        borders[key // n_ids][key % n_ids] = cnt
     per_cluster = np.bincount(comp_cluster[1:], minlength=int(comp_cluster.max()) + 1)
     parent = np.arange(len(comp_cluster))
 
@@ -271,10 +274,11 @@ def segment(image: RasterImage, params: SegmentParams) -> RegionMap:
     if not opaque.any():
         return _empty_map((h, w))
 
-    colors, pixel_colors, counts = np.unique(
-        px[..., :3][opaque], axis=0, return_inverse=True, return_counts=True
-    )
+    rgb = px[..., :3][opaque].astype(np.uint32)
+    packed = (rgb[:, 0] << 16) | (rgb[:, 1] << 8) | rgb[:, 2]
+    keys, pixel_colors, counts = np.unique(packed, return_inverse=True, return_counts=True)
     pixel_colors = pixel_colors.ravel()
+    colors = np.stack([keys >> 16, (keys >> 8) & 255, keys & 255], axis=1).astype(np.uint8)
     cluster = _cluster_colors(colors, pixel_colors, params)
     cluster, palette = _merge_clusters(colors, counts, cluster, params.merge_delta_e)
     noisy = len(colors) > params.max_colors  # quantized (KMeans) input

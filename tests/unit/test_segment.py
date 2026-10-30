@@ -1,4 +1,5 @@
 import io
+import time
 
 import numpy as np
 import pytest
@@ -6,7 +7,7 @@ from scipy import ndimage
 from PIL import Image
 
 from engine.presets import SegmentParams
-from engine.stages.segment import segment
+from engine.stages.segment import _drop_blend_clusters, segment
 from engine.types import TRANSPARENT, RasterImage
 from eval.synthetic import flat_shapes, solid, transparent_logo
 
@@ -116,3 +117,45 @@ def test_kmeans_path_deterministic():
     a, b = segment(_img(px), p), segment(_img(px), p)
     assert (a.labels == b.labels).all()
     assert len(np.unique(a.palette_rgb, axis=0)) <= 4
+
+
+def test_drop_blend_clusters_never_yields_invalid_ids():
+    palette = np.array([[0, 0, 0], [255, 255, 255], [120, 120, 120], [127, 127, 127]], np.uint8)
+    counts = np.array([1000, 1000, 30, 10])
+    cluster = np.array([0, 1, 2, 3])
+    new, kept = _drop_blend_clusters(cluster, palette, counts)
+    assert (new >= 0).all() and (new < len(kept)).all()
+
+
+def test_noisy_opaque_pixels_never_transparent():
+    rng = np.random.default_rng(1)
+    base = flat_shapes(2, n_colors=3)
+    noise = rng.integers(-12, 13, base[..., :3].shape)
+    px = base.copy()
+    px[..., :3] = np.clip(base[..., :3].astype(int) + noise, 0, 255).astype(np.uint8)
+    rm = segment(_img(px), SegmentParams())
+    assert (rm.labels >= 0).all()
+
+
+def test_large_noisy_image_is_fast():
+    base = np.kron(flat_shapes(4, n_colors=5), np.ones((16, 16, 1), np.uint8))
+    buf = io.BytesIO()
+    Image.fromarray(base[..., :3], "RGB").save(buf, format="JPEG", quality=85)
+    rgb = np.array(Image.open(io.BytesIO(buf.getvalue())).convert("RGB"))
+    px = np.dstack([rgb, np.full(rgb.shape[:2], 255, np.uint8)])
+    assert px.shape[:2] == (2048, 2048)
+    t0 = time.perf_counter()
+    rm = segment(_img(px), SegmentParams())
+    elapsed = time.perf_counter() - t0
+    print(f"segment 2048x2048 noisy: {elapsed:.2f}s")
+    assert (rm.labels >= 0).all()
+    assert elapsed < 20
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"max_colors": 0}, {"min_region_px": -1}, {"merge_delta_e": -1.0}, {"sample_px": 0}],
+)
+def test_params_validated(kwargs):
+    with pytest.raises(ValueError):
+        SegmentParams(**kwargs)
