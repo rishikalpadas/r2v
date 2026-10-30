@@ -1,4 +1,6 @@
 import csv
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -75,3 +77,21 @@ def test_report_escapes_names(tmp_path):
     assert "a&lt;b&gt;" in html
     assert "<b>" not in html
     assert "<i>" not in html
+
+
+def test_ours_skipped_only_when_engine_missing(dataset, tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "engine", None)
+    rows = _rows(run_benchmark(dataset, tmp_path / "out", ["ours"]))
+    assert {r["status"] for r in rows} == {"skipped"}
+
+
+def test_ours_broken_engine_is_error(dataset, tmp_path, monkeypatch):
+    broken = types.ModuleType("engine")  # importable but lacks vectorize/to_svg
+    monkeypatch.setitem(sys.modules, "engine", broken)
+    rows = _rows(run_benchmark(dataset, tmp_path / "out", ["ours"]))
+    assert {r["status"] for r in rows} == {"error"}
+
+
+def test_ours_runs_real_engine(dataset, tmp_path):
+    rows = _rows(run_benchmark(dataset, tmp_path / "out", ["ours"]))
+    assert {r["status"] for r in rows} == {"ok"}

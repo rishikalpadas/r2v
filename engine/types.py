@@ -148,12 +148,22 @@ class Primitive:
 
 
 @dataclass(frozen=True)
+class FittedCurve:
+    """A boundary curve replaced by fitted segments (or recognised as a primitive shape)."""
+
+    curve_id: int
+    segments: tuple[Segment, ...]
+    primitive: PrimitiveShape | None
+
+
+@dataclass(frozen=True)
 class VectorDoc:
     width: int
     height: int
     paths: tuple[Path, ...]
     primitives: tuple[Primitive, ...]
     layer_mode: Literal["stacked", "cutout"]
+    precision: int = 2  # decimal places used when serialising numbers
 
 
 @dataclass(frozen=True)

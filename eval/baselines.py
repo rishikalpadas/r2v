@@ -22,9 +22,11 @@ POTRACE_THRESHOLD = 128
 def run_ours(path: Path) -> str | None:
     try:
         from engine import to_svg, vectorize
-    except (ImportError, AttributeError) as exc:
-        raise NotImplementedError("engine.vectorize/to_svg not available yet") from exc
-    return to_svg(vectorize(path.read_bytes()))
+    except ModuleNotFoundError as exc:
+        if exc.name != "engine":  # a broken engine is an error; only a missing one is a skip
+            raise
+        raise NotImplementedError("engine is not installed") from exc
+    return to_svg(vectorize(path.read_bytes()).doc)
 
 
 def run_vtracer(path: Path) -> str | None:
