@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+eval/reports/
+eval/dataset/
+.coverage
+.superpowers/
+*.egg-info/
+eval/dataset_synthetic/
