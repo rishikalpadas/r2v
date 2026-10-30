@@ -187,3 +187,44 @@ def test_stacked_transparent_hole_blocks_primitive():
     fitted = tuple(FittedCurve(f.curve_id, f.segments, Circle(0, 0, 1)) for f in polyline_fit(graph))
     doc = build_doc(regions, graph, fitted, ExportParams("stacked"))
     assert len(doc.paths) == 1 and not doc.primitives
+
+
+def _nested_frame() -> np.ndarray:
+    px = np.full((96, 96, 4), 255, np.uint8)
+    px[60:92, 60:92] = (30, 60, 200, 255)
+    px[64:88, 64:88] = (40, 170, 60, 255)
+    for x in (68, 74, 80):
+        px[64:88, x : x + 3] = (220, 30, 30, 255)
+    return px
+
+
+def test_nested_region_painted_after_container():
+    regions, _, doc = _regions_graph(_nested_frame())
+    z_by_color = {}
+    for p in doc.paths:
+        z_by_color[p.fill.rgb] = p.z_order
+    assert z_by_color[(30, 60, 200)] < z_by_color[(40, 170, 60)] < z_by_color[(220, 30, 30)]
+
+
+def test_empty_contours_skipped_in_svg():
+    root = ET.fromstring(to_svg(_doc([Path(((),), RED, 0)])))
+    assert len(root) == 0
+
+
+def test_fit_params_validation():
+    from engine.presets import FitParams
+
+    FitParams()
+    for bad in ({"tolerance_px": 0}, {"complexity_weight": -1}, {"axis_snap_deg": 45},
+                {"smooth_sigma": -0.1}, {"corner_angle_deg": 0}, {"corner_angle_deg": 180},
+                {"enabled": 1}, {"tolerance_px": "a"}):
+        with pytest.raises(ValueError):
+            FitParams(**bad)
+    with pytest.raises(InputError):
+        apply_overrides(PRESETS["logo"], {"fit.tolerance_px": -1})
+
+
+def test_precision_must_be_int():
+    for bad in (2.5, True, "2"):
+        with pytest.raises(InputError):
+            apply_overrides(PRESETS["logo"], {"export.precision": bad})

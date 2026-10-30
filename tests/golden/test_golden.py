@@ -92,3 +92,15 @@ def test_transparent_ring_hole_stays_transparent():
     _, render = _roundtrip(px)
     assert alpha_agreement(px, render) >= 0.98
     assert render[16, 16, 3] == 0
+
+
+def test_nested_regions_keep_colors():
+    px = np.full((96, 96, 4), 255, np.uint8)
+    px[60:92, 60:92] = (30, 60, 200, 255)
+    px[64:88, 64:88] = (40, 170, 60, 255)
+    for x in (68, 74, 80):
+        px[64:88, x : x + 3] = (220, 30, 30, 255)
+    _, render = _roundtrip(px)
+    inner = (slice(64, 88), slice(64, 88))
+    assert mean_delta_e(px[inner], render[inner]) <= 3.0
+    assert tuple(render[85, 72, :3]) == (40, 170, 60)

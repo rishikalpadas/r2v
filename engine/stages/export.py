@@ -49,10 +49,10 @@ def _loop_segments(loop: LoopRef, fitted: dict[int, FittedCurve]) -> tuple[Segme
 
 
 def _loop_area(loop: LoopRef, curves: dict[int, tuple[Point, ...]]) -> float:
-    """Absolute shoelace area enclosed by a loop of boundary curves."""
+    """Enclosed area of a loop: signed shoelace walked in loop order (reversed curves flipped)."""
     total = 0.0
-    for curve_id, _ in loop:
-        pts = curves[curve_id]
+    for curve_id, is_reversed in loop:
+        pts = curves[curve_id][::-1] if is_reversed else curves[curve_id]
         total += sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(pts, pts[1:]))
     return abs(total) / 2.0
 
@@ -188,7 +188,11 @@ def _primitive_element(prim: Primitive, n: int) -> str:
 
 
 def to_svg(doc: VectorDoc) -> str:
-    items = [(p.z_order, _path_element(p, doc)) for p in doc.paths]
+    items = [
+        (p.z_order, _path_element(p, doc))
+        for p in doc.paths
+        if any(p.contours) and all(c for c in p.contours)
+    ]
     items += [(p.z_order, _primitive_element(p, doc.precision)) for p in doc.primitives]
     body = "".join(el for _, el in sorted(items, key=lambda item: item[0]))
     return (

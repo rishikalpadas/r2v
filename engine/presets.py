@@ -38,6 +38,24 @@ class FitParams:
     smooth_sigma: float = 1.0
     corner_angle_deg: float = 35.0
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled must be a bool")
+        numeric = (self.tolerance_px, self.complexity_weight, self.axis_snap_deg,
+                   self.smooth_sigma, self.corner_angle_deg)
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in numeric):
+            raise ValueError("fit parameters must be numbers")
+        if not self.tolerance_px > 0:
+            raise ValueError("tolerance_px must be > 0")
+        if not self.complexity_weight >= 0:
+            raise ValueError("complexity_weight must be >= 0")
+        if not 0 <= self.axis_snap_deg < 45:
+            raise ValueError("axis_snap_deg must be in [0, 45)")
+        if not self.smooth_sigma >= 0:
+            raise ValueError("smooth_sigma must be >= 0")
+        if not 0 < self.corner_angle_deg < 180:
+            raise ValueError("corner_angle_deg must be in (0, 180)")
+
 
 @dataclass(frozen=True)
 class ExportParams:
@@ -45,6 +63,8 @@ class ExportParams:
     precision: int = 2
 
     def __post_init__(self) -> None:
+        if not isinstance(self.precision, int) or isinstance(self.precision, bool):
+            raise ValueError("precision must be an integer")
         if self.layer_mode not in LAYER_MODES:
             raise ValueError(f"layer_mode must be one of {LAYER_MODES}")
         if not 0 <= self.precision <= 8:

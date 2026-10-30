@@ -73,6 +73,9 @@ class Line:
 
 @dataclass(frozen=True)
 class Arc:
+    """Circular arc p0 -> p1. `sweep` is the SVG sweep-flag in the y-down frame
+    (True = positive-angle direction, i.e. clockwise on screen)."""
+
     p0: Point
     p1: Point
     center: Point
@@ -125,6 +128,8 @@ class Ellipse:
 
 @dataclass(frozen=True)
 class Rect:
+    """Axis-aligned rect with top-left (x, y), size (w, h), rotated by `angle_deg` about (x, y)."""
+
     x: float
     y: float
     w: float
