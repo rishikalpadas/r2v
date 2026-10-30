@@ -82,3 +82,13 @@ def test_property_random_rects(rects):
         pixels[y : y + h, x : x + w] = (*_COLORS[c], 255)
     _, render = _roundtrip(pixels)
     assert ssim(pixels, render) >= 0.95
+
+
+def test_transparent_ring_hole_stays_transparent():
+    px = solid(32, (0, 0, 0, 0))
+    yy, xx = np.mgrid[0:32, 0:32]
+    d2 = (xx - 15.5) ** 2 + (yy - 15.5) ** 2
+    px[(d2 <= 12**2) & (d2 >= 6**2)] = (200, 30, 30, 255)
+    _, render = _roundtrip(px)
+    assert alpha_agreement(px, render) >= 0.98
+    assert render[16, 16, 3] == 0

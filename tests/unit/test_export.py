@@ -162,3 +162,28 @@ def test_override_reaches_vectorize():
     result = vectorize(to_png_bytes(ring_in_ring()), overrides={"export.layer_mode": "cutout"})
     assert result.doc.layer_mode == "cutout"
     assert re.search(r"fill-rule", to_svg(result.doc))
+
+
+def _transparent_ring() -> np.ndarray:
+    px = np.zeros((32, 32, 4), np.uint8)
+    yy, xx = np.mgrid[0:32, 0:32]
+    d2 = (xx - 15.5) ** 2 + (yy - 15.5) ** 2
+    px[(d2 <= 12**2) & (d2 >= 6**2)] = (200, 30, 30, 255)
+    return px
+
+
+def test_stacked_keeps_transparent_hole():
+    _, _, doc = _regions_graph(_transparent_ring(), "stacked")
+    root = ET.fromstring(to_svg(doc))
+    (ring,) = list(root)
+    assert ring.tag.endswith("path")
+    assert ring.attrib["d"].count("M") == 2
+    assert ring.attrib["fill-rule"] == "evenodd"
+    assert not doc.primitives
+
+
+def test_stacked_transparent_hole_blocks_primitive():
+    regions, graph, _ = _regions_graph(_transparent_ring())
+    fitted = tuple(FittedCurve(f.curve_id, f.segments, Circle(0, 0, 1)) for f in polyline_fit(graph))
+    doc = build_doc(regions, graph, fitted, ExportParams("stacked"))
+    assert len(doc.paths) == 1 and not doc.primitives

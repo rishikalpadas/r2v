@@ -7,6 +7,7 @@ from xml.sax.saxutils import quoteattr
 from engine.presets import ExportParams
 from engine.types import (
     Arc,
+    TRANSPARENT,
     BoundaryGraph,
     Circle,
     CubicBezier,
@@ -62,6 +63,21 @@ def _single_primitive(loop: LoopRef, fitted: dict[int, FittedCurve]) -> Primitiv
     return fitted[loop[0][0]].primitive
 
 
+def _borders_transparent(loop: LoopRef, sides: dict[int, int]) -> bool:
+    return any(sides[curve_id] == TRANSPARENT for curve_id, _ in loop)
+
+
+def _emitted_loops(
+    region: int, graph: BoundaryGraph, stacked: bool, sides: dict[int, int]
+) -> tuple[LoopRef, ...]:
+    """Loops to draw. Stacked keeps the outer loop plus holes open to transparency; holes that
+    border other regions are omitted because those regions paint over them."""
+    loops = graph.region_loops[region]
+    if not stacked:
+        return loops
+    return (loops[0], *(h for h in loops[1:] if _borders_transparent(h, sides)))
+
+
 def build_doc(
     regions: RegionMap,
     graph: BoundaryGraph,
@@ -71,6 +87,7 @@ def build_doc(
     h, w = regions.labels.shape
     by_id = {f.curve_id: f for f in fitted}
     points = {c.id: c.points for c in graph.curves}
+    sides = {c.id: c.right for c in graph.curves}
     stacked = params.layer_mode == "stacked"
 
     # Paint larger enclosed areas first so a nested region always lands on top of its container
@@ -82,7 +99,7 @@ def build_doc(
     paths: list[Path] = []
     primitives: list[Primitive] = []
     for z, region in enumerate(ordered):
-        loops = graph.region_loops[region][:1] if stacked else graph.region_loops[region]
+        loops = _emitted_loops(region, graph, stacked, sides)
         fill = SolidFill(tuple(int(c) for c in regions.palette_rgb[region]))
         shape = _single_primitive(loops[0], by_id) if len(loops) == 1 else None
         if shape is not None:
@@ -142,7 +159,8 @@ def _hex(fill: SolidFill) -> str:
 
 def _path_element(path: Path, doc: VectorDoc) -> str:
     d = "".join(_contour_d(c, doc.precision) for c in path.contours)
-    rule = ' fill-rule="evenodd"' if doc.layer_mode == "cutout" else ""
+    holed = doc.layer_mode == "cutout" or len(path.contours) > 1
+    rule = ' fill-rule="evenodd"' if holed else ""
     return f'<path d={quoteattr(d)} fill="{_hex(path.fill)}"{rule}/>'
 
 
