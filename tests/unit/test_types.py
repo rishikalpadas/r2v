@@ -20,3 +20,11 @@ def test_stage_error_message():
 
 def test_label_constants():
     assert TRANSPARENT == -1 and OUTSIDE == -2
+
+
+def test_stage_error_round_trips_pickle():
+    import pickle
+
+    err = pickle.loads(pickle.dumps(StageError("fit", "boom")))
+    assert isinstance(err, StageError)
+    assert (err.stage, err.reason, str(err)) == ("fit", "boom", "fit: boom")

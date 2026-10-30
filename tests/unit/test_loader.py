@@ -85,3 +85,10 @@ def test_original_size_and_scale():
     out = load_image(_encode(Image.new("RGB", (30, 20))))
     assert out.original_size == (30, 20)
     assert out.scale == 1.0
+
+
+def test_released_memoryview_is_input_error():
+    view = memoryview(b"abc")
+    view.release()
+    with pytest.raises(InputError):
+        load_image(view)

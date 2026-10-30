@@ -23,10 +23,17 @@ def _to_rgba(img: Image.Image) -> Image.Image:
     return img.convert("RGBA")
 
 
-def load_image(data: bytes) -> RasterImage:
-    if len(data) > MAX_BYTES:
+def load_image(data: bytes | bytearray | memoryview) -> RasterImage:
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise InputError("image data must be bytes")
+    try:
+        size = memoryview(data).nbytes
+    except ValueError:  # a released memoryview
+        raise InputError(_DECODE_MSG) from None
+    if size > MAX_BYTES:
         raise InputError("image is larger than the 50 MB limit")
     try:
+        data = bytes(data)
         with Image.open(BytesIO(data)) as probe:
             probe.verify()
         with Image.open(BytesIO(data)) as img:

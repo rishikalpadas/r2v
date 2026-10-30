@@ -12,3 +12,6 @@ class StageError(Exception):
         super().__init__(f"{stage}: {reason}")
         self.stage = stage
         self.reason = reason
+
+    def __reduce__(self):
+        return (type(self), (self.stage, self.reason))

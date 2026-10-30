@@ -286,3 +286,20 @@ def test_cutout_disc_on_transparency_may_be_a_primitive():
     regions, graph, _ = _regions_graph(px)
     doc = build_doc(regions, graph, _with_circle_primitives(graph), ExportParams("cutout"))
     assert len(doc.primitives) == 1 and not doc.paths
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"tolerance_px": float("inf")},
+        {"complexity_weight": float("inf")},
+        {"smooth_sigma": float("inf")},
+        {"smooth_sigma": float("nan")},
+        {"corner_angle_deg": float("nan")},
+    ],
+)
+def test_fit_params_reject_non_finite(bad):
+    from engine.presets import FitParams
+
+    with pytest.raises(ValueError):
+        FitParams(**bad)

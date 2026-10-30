@@ -1,6 +1,7 @@
 """Stage parameter dataclasses and the preset table."""
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, replace
 from typing import Literal
@@ -8,6 +9,14 @@ from typing import Literal
 from engine.errors import InputError
 
 LAYER_MODES = ("stacked", "cutout")
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 @dataclass(frozen=True)
@@ -19,6 +28,13 @@ class SegmentParams:
     seed: int = 0
 
     def __post_init__(self) -> None:
+        for name in ("max_colors", "min_region_px", "sample_px", "seed"):
+            if not _is_int(getattr(self, name)):
+                raise ValueError(f"{name} must be an integer")
+        if not _is_finite_number(self.merge_delta_e):
+            raise ValueError("merge_delta_e must be a finite number")
+        if self.seed < 0:
+            raise ValueError("seed must be >= 0")
         if self.max_colors < 1:
             raise ValueError("max_colors must be >= 1")
         if self.min_region_px < 0:
@@ -43,8 +59,8 @@ class FitParams:
             raise ValueError("enabled must be a bool")
         numeric = (self.tolerance_px, self.complexity_weight, self.axis_snap_deg,
                    self.smooth_sigma, self.corner_angle_deg)
-        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in numeric):
-            raise ValueError("fit parameters must be numbers")
+        if not all(_is_finite_number(v) for v in numeric):
+            raise ValueError("fit parameters must be finite numbers")
         if not self.tolerance_px > 0:
             raise ValueError("tolerance_px must be > 0")
         if not self.complexity_weight >= 0:
@@ -106,6 +122,8 @@ def apply_overrides(preset: Preset, overrides: Mapping[str, object]) -> Preset:
     """Return a new preset with `"<group>.<field>"` overrides applied; `preset` is untouched."""
     updated = {group: getattr(preset, group) for group in _OVERRIDE_GROUPS}
     for key, value in overrides.items():
+        if not isinstance(key, str):
+            raise InputError(f"override keys must be strings, got {type(key).__name__}")
         group, _, field = key.partition(".")
         if group not in updated or field not in {f.name for f in fields(updated[group])}:
             raise InputError(f"unknown override {key!r}")

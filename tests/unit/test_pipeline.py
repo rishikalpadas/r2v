@@ -70,3 +70,32 @@ def test_unknown_stage_is_stage_error(monkeypatch):
     with pytest.raises(StageError) as info:
         vectorize(to_png_bytes(circle()), preset="bad")
     assert info.value.stage == "warp"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"segment.max_colors": 2.5},
+        {"segment.seed": -1},
+        {"segment.max_colors": True},
+        {"segment.sample_px": 1.5},
+        {"fit.tolerance_px": float("inf")},
+        {1: 2},
+        {None: 2},
+    ],
+)
+def test_bad_override_values_raise_input_error(overrides):
+    with pytest.raises(InputError):
+        vectorize(to_png_bytes(circle()), overrides=overrides)
+
+
+@pytest.mark.parametrize("bad", [None, "abc", 12, [1, 2]])
+def test_non_bytes_input_raises_input_error(bad):
+    with pytest.raises(InputError):
+        vectorize(bad)
+
+
+def test_bytes_like_inputs_accepted():
+    data = to_png_bytes(circle(32, 16, 16, 8))
+    for wrapped in (bytearray(data), memoryview(data)):
+        assert vectorize(wrapped).doc.width == 32

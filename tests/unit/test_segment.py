@@ -186,3 +186,23 @@ def test_small_component_joins_longest_border_neighbour_in_any_direction():
     roots = _merge_small_components(comp, comp_cluster, 4)
     speck = comp[3, 4]
     assert comp_cluster[roots[speck]] == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_colors": 2.5},
+        {"max_colors": True},
+        {"min_region_px": 2.5},
+        {"sample_px": 1.5},
+        {"seed": -1},
+        {"seed": 1.0},
+        {"merge_delta_e": float("inf")},
+        {"merge_delta_e": float("nan")},
+        {"merge_delta_e": "8"},
+        {"merge_delta_e": True},
+    ],
+)
+def test_params_types_validated(kwargs):
+    with pytest.raises(ValueError):
+        SegmentParams(**kwargs)
