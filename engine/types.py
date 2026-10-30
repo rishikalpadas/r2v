@@ -13,7 +13,7 @@ TRANSPARENT = -1
 OUTSIDE = -2
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)  # holds ndarrays: compare by identity
 class RasterImage:
     pixels: np.ndarray  # HxWx4 uint8
     original_size: tuple[int, int]  # (w, h)
@@ -29,7 +29,7 @@ class ImageProfile:
     preset: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)  # holds ndarrays: compare by identity
 class RegionMap:
     labels: np.ndarray  # HxW int32
     palette_rgb: np.ndarray  # Kx3 uint8
@@ -171,7 +171,7 @@ class VectorDoc:
     precision: int = 2  # decimal places used when serialising numbers
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)  # holds ndarrays: compare by identity
 class StageReport:
     stage: str
     duration_s: float

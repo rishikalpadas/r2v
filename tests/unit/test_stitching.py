@@ -216,3 +216,14 @@ def test_many_small_regions_trace_fast():
         loops = graph.region_loops[r]
         areas = [_signed_area(graph, loop) for loop in loops]
         assert areas[0] - sum(abs(a) for a in areas[1:]) == counts[r]
+
+
+def test_trace_error_reason_is_user_safe(monkeypatch):
+    def boom(regions):
+        raise ValueError("secret detail")
+
+    monkeypatch.setattr("engine.stages.trace.build_boundary_graph", boom)
+    with pytest.raises(StageError) as info:
+        trace(None)
+    assert info.value.reason == "internal error (ValueError)"
+    assert isinstance(info.value.__cause__, ValueError)

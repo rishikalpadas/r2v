@@ -17,8 +17,11 @@ _DECODE_MSG = "could not decode image"
 
 
 def _to_rgba(img: Image.Image) -> Image.Image:
-    if img.mode == "I;16":
-        arr = np.asarray(img, dtype=np.uint16) >> 8
+    """Convert to RGBA. Integer modes ("I", "I;16", "I;16B", ...) hold 16-bit samples (Pillow
+    decodes 16-bit PNG/TIFF to them), so they are clipped to 0..65535 and scaled to 8 bits
+    instead of Pillow's default clipping to 0..255."""
+    if img.mode.startswith("I"):
+        arr = np.clip(np.asarray(img).astype(np.int64), 0, 0xFFFF) >> 8
         img = Image.fromarray(arr.astype(np.uint8), mode="L")
     return img.convert("RGBA")
 

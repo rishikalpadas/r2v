@@ -12,4 +12,4 @@ def trace(regions: RegionMap) -> BoundaryGraph:
     except StageError:
         raise
     except Exception as exc:  # noqa: BLE001 - any failure here is a trace-stage failure
-        raise StageError("trace", f"{type(exc).__name__}: {exc}") from exc
+        raise StageError("trace", f"internal error ({type(exc).__name__})") from exc

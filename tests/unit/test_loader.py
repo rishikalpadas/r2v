@@ -92,3 +92,10 @@ def test_released_memoryview_is_input_error():
     view.release()
     with pytest.raises(InputError):
         load_image(view)
+
+
+@pytest.mark.parametrize("mode", ["I;16", "I;16B", "I"])
+def test_wide_integer_modes_rescaled_from_16_bit(mode):
+    data = _encode(Image.new(mode, (5, 3), 0x8000), "TIFF")
+    out = load_image(data)
+    assert tuple(out.pixels[0, 0]) == (128, 128, 128, 255)
