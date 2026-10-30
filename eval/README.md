@@ -27,8 +27,17 @@ Deterministic: 20 `flat_shapes` (seeds 0-19), 3 circles, `ring_in_ring`, `transp
 
 ## Running
 
+Re-run the benchmark on every pipeline change and compare against the baseline below.
+
 ```
 python -m eval.run_benchmark --dataset eval/dataset_synthetic --out eval/reports/synthetic \
+    --engines ours,vtracer,potrace
+```
+
+Real images (once `eval/dataset/` is populated):
+
+```
+python -m eval.run_benchmark --dataset eval/dataset --out eval/reports/real \
     --engines ours,vtracer,potrace
 ```
 
@@ -58,9 +67,9 @@ rendered PNGs, and `report.html`. Output under `eval/reports/` is git-ignored.
 
 | engine  | ok | SSIM   | delta_e | edge_f1 | nodes | paths | runtime_s |
 |---------|----|--------|---------|---------|-------|-------|-----------|
-| ours    | 25 | 0.9893 | 0.1843  | 0.9962  | 45.52 | 7.32  | 0.3137    |
-| vtracer | 25 | 0.9784 | 0.4361  | 0.9828  | 79.44 | 4.72  | 0.0292    |
+| ours    | 25 | 0.9893 | 0.1843  | 0.9962  | 45.52 | 7.32  | 0.3205    |
+| vtracer | 25 | 0.9784 | 0.4361  | 0.9828  | 79.44 | 4.72  | 0.0258    |
 
-`ours` beats vtracer on SSIM, delta_e and edge F1 with about 43% fewer nodes, but is
-roughly 10x slower. This is synthetic flat art only; the real-image baseline is pending
+`ours` beats vtracer on SSIM, delta_e and edge F1 with about 43% fewer nodes, but emits
+more paths than vtracer (7.32 vs 4.72 per image) and is roughly 12x slower. This is synthetic flat art only; the real-image baseline is pending
 a licensed dataset in `eval/dataset/`.
