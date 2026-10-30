@@ -73,3 +73,9 @@ rendered PNGs, and `report.html`. Output under `eval/reports/` is git-ignored.
 `ours` beats vtracer on SSIM, delta_e and edge F1 with about 43% fewer nodes, but emits
 more paths than vtracer (7.32 vs 4.72 per image) and is roughly 12x slower. This is synthetic flat art only; the real-image baseline is pending
 a licensed dataset in `eval/dataset/`.
+
+## Trying the engine on your own images
+
+- **Preview page:** double-click `preview.bat` (or run `.venv\Scripts\python -m app.server`) and open http://127.0.0.1:8765. Drop an image to see the original next to the SVG, with similarity score, node count, timing, an outlines view and a download button.
+- **Command line:** `.venv\Scripts\python -m app.cli path\to\image.png` writes `image.svg` next to it. Options: `--max-colors N`, `--layer-mode stacked|cutout`, `--no-fit`, `--tolerance PX`, `-o out.svg`.
+- Sample inputs live in `samples/`.

@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>raster2vector preview</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #f4f2ee; --surface: #fffdf9; --ink: #1d1b18; --muted: #6d675e; --line: #ddd7cc;
+  --accent: #d2491d; --accent-ink: #fff; --good: #1f7a4d; --warn: #b26b00; --bad: #b42318;
+  --check-a: #ffffff; --check-b: #e9e5dd; --shadow: 0 1px 2px rgba(29,27,24,.06), 0 8px 24px rgba(29,27,24,.06);
+  --radius: 10px; --sans: "IBM Plex Sans", system-ui, sans-serif; --mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #161513; --surface: #1f1d1a; --ink: #f1ede6; --muted: #a39b8f; --line: #35312b;
+    --accent: #f06a3a; --check-a: #2a2723; --check-b: #221f1c; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25); }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--sans); }
+header { display: flex; align-items: baseline; gap: 14px; padding: 22px 28px 6px; flex-wrap: wrap; }
+h1 { font-size: 22px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+h1 b { color: var(--accent); font-weight: 600; }
+header p { margin: 0; color: var(--muted); font-size: 13px; }
+main { padding: 12px 28px 40px; display: grid; gap: 16px; }
+
+.toolbar { display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 16px; box-shadow: var(--shadow); }
+.toolbar label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+.toolbar output { font-family: var(--mono); color: var(--ink); min-width: 2.5ch; }
+input[type=range] { accent-color: var(--accent); width: 120px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.seg button { border: 0; background: transparent; color: var(--muted); padding: 5px 11px; font: 500 13px var(--sans); cursor: pointer; }
+.seg button[aria-pressed=true] { background: var(--ink); color: var(--bg); }
+.seg button:focus-visible, .btn:focus-visible, .drop:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.spacer { flex: 1; }
+.btn { border: 1px solid var(--ink); background: var(--ink); color: var(--bg); border-radius: 7px; padding: 7px 14px;
+  font: 500 13px var(--sans); cursor: pointer; transition: transform .12s ease, opacity .12s; }
+.btn:hover { transform: translateY(-1px); }
+.btn:active { transform: translateY(0); }
+.btn.ghost { background: transparent; color: var(--ink); }
+.btn[disabled] { opacity: .35; pointer-events: none; }
+
+.drop { border: 1.5px dashed var(--line); border-radius: var(--radius); padding: 44px 20px; text-align: center; color: var(--muted);
+  background: var(--surface); cursor: pointer; transition: border-color .15s, background .15s; }
+.drop strong { color: var(--ink); font-weight: 600; }
+.drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
+.drop.compact { padding: 12px; font-size: 13px; }
+
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 1px; background: var(--line);
+  border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.stat { background: var(--surface); padding: 10px 14px; }
+.stat span { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.stat b { font: 500 20px var(--mono); }
+.stat b.good { color: var(--good); } .stat b.warn { color: var(--warn); } .stat b.bad { color: var(--bad); }
+
+.panes { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.pane { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+.pane h2 { margin: 0; padding: 9px 14px; font: 600 12px var(--sans); text-transform: uppercase; letter-spacing: .07em;
+  color: var(--muted); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; }
+.view { height: min(68vh, 720px); overflow: auto; display: grid; place-items: center;
+  background: repeating-conic-gradient(var(--check-a) 0 25%, var(--check-b) 0 50%) 0 0 / 16px 16px; }
+.view img { width: calc(var(--w) * var(--zoom) * 1px); height: calc(var(--h) * var(--zoom) * 1px); max-width: none; display: block; }
+#orig { image-rendering: pixelated; }
+.empty { color: var(--muted); font-size: 13px; }
+.status { font-size: 13px; color: var(--muted); min-height: 1.5em; }
+.status.error { color: var(--bad); }
+.busy::after { content: ""; display: inline-block; width: 10px; height: 10px; margin-left: 8px; border-radius: 50%;
+  border: 2px solid var(--muted); border-top-color: transparent; animation: spin .7s linear infinite; vertical-align: -1px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .busy::after { animation: none; } .btn { transition: none; } }
+@media (max-width: 760px) { header, main { padding-left: 16px; padding-right: 16px; } .panes { grid-template-columns: 1fr; } .view { height: 50vh; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>raster<b>2</b>vector</h1>
+  <p>Local preview · flat-art engine (milestones 1–3). Works best on logos, icons and flat illustrations.</p>
+</header>
+<main>
+  <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose or drop an image">
+    <strong>Drop an image here</strong> or click to choose · PNG, JPEG, WebP, BMP, TIFF, GIF · up to 50 MB
+  </div>
+  <input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/bmp,image/tiff,image/gif" hidden>
+
+  <div class="toolbar" role="group" aria-label="Conversion settings">
+    <label>Max colors <input type="range" id="colors" min="2" max="64" value="16"><output id="colorsOut">16</output></label>
+    <label>Tolerance <input type="range" id="tol" min="0.25" max="3" step="0.25" value="0.75"><output id="tolOut">0.75</output>px</label>
+    <label>Layers <span class="seg" id="layers"><button aria-pressed="true" data-v="stacked">Stacked</button><button aria-pressed="false" data-v="cutout">Cutout</button></span></label>
+    <label>Curves <span class="seg" id="fit"><button aria-pressed="true" data-v="1">Fitted</button><button aria-pressed="false" data-v="0">Pixel outline</button></span></label>
+    <span class="spacer"></span>
+    <label>Zoom <input type="range" id="zoom" min="0.25" max="8" step="0.25" value="1"><output id="zoomOut">1×</output></label>
+    <label>Show <span class="seg" id="mode"><button aria-pressed="true" data-v="fill">Fill</button><button aria-pressed="false" data-v="outline">Outlines</button></span></label>
+    <button class="btn" id="download" disabled>Download SVG</button>
+  </div>
+
+  <div class="status" id="status" aria-live="polite">Choose an image to start.</div>
+
+  <div class="stats" id="stats" hidden>
+    <div class="stat"><span>Similarity (SSIM)</span><b id="sSsim">–</b></div>
+    <div class="stat"><span>Color error (ΔE)</span><b id="sDe">–</b></div>
+    <div class="stat"><span>Shapes</span><b id="sPaths">–</b></div>
+    <div class="stat"><span>Nodes</span><b id="sNodes">–</b></div>
+    <div class="stat"><span>Time</span><b id="sTime">–</b></div>
+    <div class="stat"><span>SVG size</span><b id="sSize">–</b></div>
+  </div>
+
+  <div class="panes">
+    <section class="pane"><h2>Original <span id="dims"></span></h2><div class="view" id="viewOrig"><span class="empty">No image yet</span></div></section>
+    <section class="pane"><h2>Vector (SVG) <span id="stages"></span></h2><div class="view" id="viewVec"><span class="empty">Output appears here</span></div></section>
+  </div>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const state = { file: null, svg: null, w: 0, h: 0, layer: "stacked", fit: "1", mode: "fill", urls: [], req: 0 };
+  const OUTLINE_STYLE = '<style>*{fill:none!important;stroke:#d2491d!important;stroke-width:1px!important;vector-effect:non-scaling-stroke}</style>';
+
+  function setStatus(text, kind) { const s = $("status"); s.textContent = text; s.className = "status" + (kind ? " " + kind : ""); }
+  function blobUrl(content, type) { const u = URL.createObjectURL(new Blob([content], { type })); state.urls.push(u); return u; }
+  function freeUrls() { state.urls.forEach(URL.revokeObjectURL); state.urls = []; }
+  function setZoom(z) { document.documentElement.style.setProperty("--zoom", z); $("zoomOut").textContent = z + "×"; }
+
+  function seg(id, key, onChange) {
+    $(id).addEventListener("click", e => {
+      const b = e.target.closest("button"); if (!b) return;
+      e.preventDefault();
+      $(id).querySelectorAll("button").forEach(x => x.setAttribute("aria-pressed", x === b));
+      state[key] = b.dataset.v; onChange();
+    });
+  }
+
+  function showImage(viewId, src, alt, imgId) {
+    const v = $(viewId); v.replaceChildren();
+    const img = new Image(); img.src = src; img.alt = alt; if (imgId) img.id = imgId; v.append(img);
+  }
+
+  function renderVector() {
+    if (!state.svg) return;
+    const svg = state.mode === "outline" ? state.svg.replace(/(<svg[^>]*>)/, "$1" + OUTLINE_STYLE) : state.svg;
+    showImage("viewVec", blobUrl(svg, "image/svg+xml"), "Vector output");
+  }
+
+  function grade(el, value, goodAt, warnAt, higherBetter) {
+    el.className = "";
+    if (value == null) { el.textContent = "n/a"; return; }
+    const ok = higherBetter ? value >= goodAt : value <= goodAt;
+    const meh = higherBetter ? value >= warnAt : value <= warnAt;
+    el.classList.add(ok ? "good" : meh ? "warn" : "bad");
+  }
+
+  async function run() {
+    if (!state.file) return;
+    const id = ++state.req;
+    const q = new URLSearchParams({ max_colors: $("colors").value, tolerance: $("tol").value, layer_mode: state.layer, fit: state.fit });
+    setStatus("Converting…"); $("status").classList.add("busy");
+    try {
+      const resp = await fetch("/api/vectorize?" + q, { method: "POST", body: state.file, headers: { "Content-Type": "application/octet-stream" } });
+      const data = await resp.json();
+      if (id !== state.req) return;
+      if (!resp.ok) throw new Error(data.error || resp.statusText);
+      state.svg = data.svg;
+      renderVector();
+      $("stats").hidden = false;
+      $("sSsim").textContent = data.ssim == null ? "n/a" : data.ssim.toFixed(4); grade($("sSsim"), data.ssim, 0.97, 0.93, true);
+      $("sDe").textContent = data.delta_e == null ? "n/a" : data.delta_e.toFixed(2); grade($("sDe"), data.delta_e, 2, 5, false);
+      $("sPaths").textContent = data.paths; $("sNodes").textContent = data.nodes;
+      $("sTime").textContent = data.seconds.toFixed(2) + "s";
+      $("sSize").textContent = (new Blob([data.svg]).size / 1024).toFixed(1) + " KB";
+      $("stages").textContent = Object.entries(data.stage_seconds).map(([k, v]) => `${k} ${(v * 1000).toFixed(0)}ms`).join(" · ");
+      $("download").disabled = false;
+      setStatus(`Done: ${state.file.name}`);
+    } catch (err) {
+      if (id === state.req) setStatus("Error: " + err.message, "error");
+    } finally {
+      if (id === state.req) $("status").classList.remove("busy");
+    }
+  }
+
+  function load(file) {
+    if (!file) return;
+    freeUrls(); state.file = file; state.svg = null; $("download").disabled = true;
+    const url = blobUrl(file, file.type);
+    const probe = new Image();
+    probe.onload = () => {
+      state.w = probe.naturalWidth; state.h = probe.naturalHeight;
+      document.documentElement.style.setProperty("--w", state.w); document.documentElement.style.setProperty("--h", state.h);
+      const z = Math.max(0.25, Math.min(8, Math.round((480 / Math.max(state.w, state.h)) * 4) / 4));
+      $("zoom").value = z; setZoom(z);
+      $("dims").textContent = `${state.w} × ${state.h}`;
+      showImage("viewOrig", url, "Original image", "orig");
+    };
+    probe.onerror = () => { $("dims").textContent = ""; $("viewOrig").replaceChildren(Object.assign(document.createElement("span"), { className: "empty", textContent: "Browser can't preview this format; converting anyway" })); };
+    probe.src = url;
+    $("drop").classList.add("compact");
+    const name = document.createElement("strong"); name.textContent = file.name;
+    $("drop").replaceChildren(name, " · drop or click to change");
+    run();
+  }
+
+  const drop = $("drop");
+  drop.addEventListener("click", () => $("file").click());
+  drop.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("file").click(); } });
+  $("file").addEventListener("change", e => load(e.target.files[0]));
+  ["dragenter", "dragover"].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.remove("over"); }));
+  document.addEventListener("drop", e => load(e.dataTransfer.files[0]));
+
+  let timer;
+  const debounced = () => { clearTimeout(timer); timer = setTimeout(run, 250); };
+  $("colors").addEventListener("input", e => { $("colorsOut").textContent = e.target.value; debounced(); });
+  $("tol").addEventListener("input", e => { $("tolOut").textContent = e.target.value; debounced(); });
+  $("zoom").addEventListener("input", e => setZoom(e.target.value));
+  seg("layers", "layer", run); seg("fit", "fit", run); seg("mode", "mode", renderVector);
+
+  $("download").addEventListener("click", () => {
+    const a = document.createElement("a");
+    a.href = blobUrl(state.svg, "image/svg+xml");
+    a.download = (state.file.name.replace(/\.[^.]+$/, "") || "image") + ".svg";
+    a.click();
+  });
+  setZoom(1);
+})();
+</script>
+</body>
+</html>
