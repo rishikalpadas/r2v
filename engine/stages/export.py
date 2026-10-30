@@ -58,10 +58,28 @@ def _loop_area(loop: LoopRef, curves: dict[int, tuple[Point, ...]]) -> float:
     return abs(total) / 2.0
 
 
-def _single_primitive(loop: LoopRef, fitted: dict[int, FittedCurve]) -> PrimitiveShape | None:
+def _single_primitive(
+    region: int,
+    loop: LoopRef,
+    fitted: dict[int, FittedCurve],
+    stacked: bool,
+    curves: dict[int, tuple[int, int]],
+) -> PrimitiveShape | None:
+    """The primitive replacing a one-curve loop, if allowed.
+
+    In cutout mode a neighbouring region's hole is drawn from the curve's fitted segments, so a
+    primitive (a different shape) would leave slivers; only allow it against transparency or the
+    canvas edge, where nothing else shares the edge.
+    """
     if len(loop) != 1:
         return None
-    return fitted[loop[0][0]].primitive
+    curve_id = loop[0][0]
+    if not stacked:
+        left, right = curves[curve_id]
+        other = right if left == region else left
+        if other not in (TRANSPARENT, OUTSIDE):
+            return None
+    return fitted[curve_id].primitive
 
 
 def _borders_transparent(loop: LoopRef, sides: dict[int, int]) -> bool:
@@ -108,6 +126,7 @@ def build_doc(
     by_id = {f.curve_id: f for f in fitted}
     points = {c.id: c.points for c in graph.curves}
     sides = {c.id: c.right for c in graph.curves}
+    curve_sides = {c.id: (c.left, c.right) for c in graph.curves}
     stacked = params.layer_mode == "stacked"
 
     # Paint larger enclosed areas first so a nested region always lands on top of its container
@@ -124,7 +143,11 @@ def build_doc(
         if stacked and z == 0 and _needs_canvas_underlay(loops[0], graph):
             paths.append(Path((_canvas_frame(w, h),), fill, z))
             continue
-        shape = _single_primitive(loops[0], by_id) if len(loops) == 1 else None
+        shape = (
+            _single_primitive(region, loops[0], by_id, stacked, curve_sides)
+            if len(loops) == 1
+            else None
+        )
         if shape is not None:
             primitives.append(Primitive(shape, fill, z))
             continue

@@ -261,3 +261,28 @@ def test_stacked_bottom_layer_not_widened_over_transparency():
     _, _, doc = _regions_graph(px, "stacked")
     bottom = min(doc.paths, key=lambda p: p.z_order)
     assert bottom.contours[0] != _canvas_frame(32, 32)
+
+
+def _with_circle_primitives(graph):
+    return tuple(FittedCurve(f.curve_id, f.segments, Circle(0, 0, 1)) for f in polyline_fit(graph))
+
+
+def test_cutout_disc_on_region_stays_a_path_sharing_the_neighbours_edge():
+    regions, graph, _ = _regions_graph(circle())
+    doc = build_doc(regions, graph, _with_circle_primitives(graph), ExportParams("cutout"))
+    assert not doc.primitives
+    disc, background = sorted(doc.paths, key=lambda p: len(p.contours))
+    assert len(background.contours) == 2
+    def undirected(contour):
+        return {frozenset((s.p0, s.p1)) for s in contour}
+
+    assert undirected(disc.contours[0]) == undirected(background.contours[1])
+
+
+def test_cutout_disc_on_transparency_may_be_a_primitive():
+    px = np.zeros((32, 32, 4), np.uint8)
+    yy, xx = np.mgrid[0:32, 0:32]
+    px[(xx - 15.5) ** 2 + (yy - 15.5) ** 2 <= 10**2] = (200, 30, 30, 255)
+    regions, graph, _ = _regions_graph(px)
+    doc = build_doc(regions, graph, _with_circle_primitives(graph), ExportParams("cutout"))
+    assert len(doc.primitives) == 1 and not doc.paths
