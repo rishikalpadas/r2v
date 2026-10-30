@@ -292,7 +292,9 @@ def segment(image: RasterImage, params: SegmentParams) -> RegionMap:
     labels = _majority_cleanup(labels, palette, noisy)
 
     comp, comp_cluster = _components(labels)
-    merged = _merge_small_components(comp, comp_cluster, params.min_region_px)[comp]
+    # min_region_px is an area in original pixels; one original pixel covers scale^2 here.
+    min_px = round(params.min_region_px * image.scale**2)
+    merged = _merge_small_components(comp, comp_cluster, min_px)[comp]
     survivors, region = np.unique(merged[comp > 0], return_inverse=True)
     out = np.full((h, w), TRANSPARENT, dtype=np.int32)
     out[comp > 0] = region.ravel().astype(np.int32)

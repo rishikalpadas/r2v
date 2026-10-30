@@ -19,7 +19,7 @@ from engine.types import Circle, Ellipse, Point, PrimitiveShape, Polygon, Rect
 
 RIGHT_ANGLE_TOL_DEG = 5.0
 AXIS_ALIGNED_TOL_DEG = 3.0
-SIDE_TOL_PX = 1.0
+SIDE_TOL_PX = 1.0  # *_TOL_PX are original-image pixels; detect_primitive scales them
 CIRCLE_TOL_PX = 1.0
 CIRCLE_TOL_FRAC = 0.03
 ELLIPSE_TOL_PX = 1.0
@@ -74,14 +74,14 @@ def _rect_angle(directions: list[np.ndarray]) -> float:
     return math.degrees(mean)
 
 
-def _detect_rect(arr: np.ndarray, corners: tuple[int, ...]) -> Rect | None:
+def _detect_rect(arr: np.ndarray, corners: tuple[int, ...], scale: float) -> Rect | None:
     if len(corners) != 4:
         return None
     sides = _sides(arr, corners)
     if sides is None:
         return None
     fits = [_fit_line(s) for s in sides]
-    if any(dev > SIDE_TOL_PX for _, _, dev in fits):
+    if any(dev > SIDE_TOL_PX * scale for _, _, dev in fits):
         return None
     dirs = [d for _, d, _ in fits]
     for i in range(4):
@@ -101,7 +101,7 @@ def _detect_rect(arr: np.ndarray, corners: tuple[int, ...]) -> Rect | None:
     return Rect(float(x0), float(y0), xs[1] - xs[0], ys[1] - ys[0], theta)
 
 
-def _detect_circle(arr: np.ndarray) -> Circle | None:
+def _detect_circle(arr: np.ndarray, scale: float) -> Circle | None:
     x, y = arr[:, 0], arr[:, 1]
     design = np.column_stack([2 * x, 2 * y, np.ones(len(arr))])
     sol, *_ = np.linalg.lstsq(design, x * x + y * y, rcond=None)
@@ -111,7 +111,7 @@ def _detect_circle(arr: np.ndarray) -> Circle | None:
         return None
     r = math.sqrt(r_sq)
     dev = np.abs(np.hypot(x - cx, y - cy) - r).max()
-    return Circle(cx, cy, r) if dev <= max(CIRCLE_TOL_PX, CIRCLE_TOL_FRAC * r) else None
+    return Circle(cx, cy, r) if dev <= max(CIRCLE_TOL_PX * scale, CIRCLE_TOL_FRAC * r) else None
 
 
 def _conic_fit(arr: np.ndarray) -> np.ndarray | None:
@@ -161,7 +161,7 @@ def _ellipse_max_deviation(arr: np.ndarray, ell: tuple[float, float, float, floa
     return float(cKDTree(curve).query(arr)[0].max())
 
 
-def _detect_ellipse(arr: np.ndarray) -> Ellipse | None:
+def _detect_ellipse(arr: np.ndarray, scale: float) -> Ellipse | None:
     # skimage's EllipseModel is unusable here (it raises on exact ellipses with numpy 2), so the
     # conic fit is done directly; the geometric deviation check below is what gates acceptance.
     centre = arr.mean(axis=0)
@@ -170,7 +170,7 @@ def _detect_ellipse(arr: np.ndarray) -> Ellipse | None:
     if ell is None:
         return None
     ell = (ell[0] + float(centre[0]), ell[1] + float(centre[1]), *ell[2:])
-    if _ellipse_max_deviation(arr, ell) > ELLIPSE_TOL_PX:
+    if _ellipse_max_deviation(arr, ell) > ELLIPSE_TOL_PX * scale:
         return None
     return Ellipse(*ell)
 
@@ -184,14 +184,14 @@ def _line_intersection(f1: tuple, f2: tuple) -> np.ndarray | None:
     return p1 + t * d1
 
 
-def _detect_polygon(arr: np.ndarray, corners: tuple[int, ...]) -> Polygon | None:
+def _detect_polygon(arr: np.ndarray, corners: tuple[int, ...], scale: float) -> Polygon | None:
     if not MIN_POLY_CORNERS <= len(corners) <= MAX_POLY_CORNERS:
         return None
     sides = _sides(arr, corners)
     if sides is None:
         return None
     fits = [_fit_line(s) for s in sides]
-    if any(dev > SIDE_TOL_PX for _, _, dev in fits):
+    if any(dev > SIDE_TOL_PX * scale for _, _, dev in fits):
         return None
     ordered = sorted(corners)
     verts: list[Point] = []
@@ -202,16 +202,21 @@ def _detect_polygon(arr: np.ndarray, corners: tuple[int, ...]) -> Polygon | None
     return Polygon(tuple(verts))
 
 
-def detect_primitive(points: tuple[Point, ...], corners: tuple[int, ...]) -> PrimitiveShape | None:
-    """Return the first matching primitive (rect, circle, ellipse, polygon) or None."""
+def detect_primitive(
+    points: tuple[Point, ...], corners: tuple[int, ...], scale: float = 1.0
+) -> PrimitiveShape | None:
+    """Return the first matching primitive (rect, circle, ellipse, polygon) or None.
+
+    `points` are in processing pixels (original pixels x `scale`).
+    """
     if len(points) < MIN_LOOP_POINTS:
         return None
     arr = np.asarray(points, np.float64)
-    rect = _detect_rect(arr, corners)
+    rect = _detect_rect(arr, corners, scale)
     if rect is not None:
         return rect
     if len(corners) < MIN_POLY_CORNERS:
         # Up to two corners are tolerated: the tips of a pixelated ellipse can read as corners.
         # The fit tolerances below reject lenses, half-discs and other genuinely cornered shapes.
-        return _detect_circle(arr) or _detect_ellipse(arr)
-    return _detect_polygon(arr, corners)
+        return _detect_circle(arr, scale) or _detect_ellipse(arr, scale)
+    return _detect_polygon(arr, corners, scale)

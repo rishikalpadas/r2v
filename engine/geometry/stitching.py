@@ -6,8 +6,9 @@ identical geometry along their common border and the output can never have gaps 
 
 Conventions
 -----------
-* Coordinates are pixel-corner grid points in original-image pixel units, x right, y down:
-  pixel (x, y) covers [x, x+1] x [y, y+1].
+* Coordinates are pixel-corner grid points in processing-pixel units (the RegionMap's grid,
+  i.e. original pixels x `RasterImage.scale`), x right, y down: pixel (x, y) covers
+  [x, x+1] x [y, y+1]. Export maps them back to original pixels.
 * Orientation: "left" of a walking direction (dx, dy) is (-dy, dx), with coordinates used as-is
   (no y flip). Every curve keeps its larger label on the left, so `left` is always a region id
   and `right` may be a region id, `TRANSPARENT` or `OUTSIDE`. A region's loops are walked with the

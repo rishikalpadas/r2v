@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import replace
 
 from engine.geometry.corners import find_corners, smooth_polyline
 from engine.geometry.primitives import detect_primitive
@@ -11,8 +12,9 @@ from engine.presets import FitParams
 from engine.types import OUTSIDE, BoundaryCurve, BoundaryGraph, FittedCurve, Line, Point, Segment
 
 _COLLINEAR_EPS = 1e-9
-# Curves shorter than this are kept as exact polylines: smoothing shrinks tiny closed regions
-# and rounds away the true corners of thin features.
+# Lengths below are in original-image pixels and are multiplied by the processing scale where
+# used. Curves shorter than this are kept as exact polylines: smoothing shrinks tiny closed
+# regions and rounds away the true corners of thin features.
 MIN_CLOSED_LENGTH_PX = 12.0
 MIN_OPEN_LENGTH_PX = 4.0
 CORNER_SNAP_PX = 1.5  # a corner moves to the nearest original vertex within this distance
@@ -62,7 +64,7 @@ def _length(points: Sequence[Point]) -> float:
 
 
 def _snap_corners(
-    dense: Sequence[Point], corners: Sequence[int], original: Sequence[Point]
+    dense: Sequence[Point], corners: Sequence[int], original: Sequence[Point], scale: float
 ) -> list[Point]:
     """Replace each corner sample by the nearest original crack-grid vertex, if close.
 
@@ -73,7 +75,7 @@ def _snap_corners(
     for c in corners:
         x, y = dense[c]
         best = min(original, key=lambda p: (p[0] - x) ** 2 + (p[1] - y) ** 2)
-        if math.hypot(best[0] - x, best[1] - y) <= CORNER_SNAP_PX:
+        if math.hypot(best[0] - x, best[1] - y) <= CORNER_SNAP_PX * scale:
             out[c] = best
     return out
 
@@ -86,46 +88,62 @@ def _fit_spans(points: Sequence[Point], breaks: Sequence[int], params: FitParams
     return snap_axis(chain, params)
 
 
-def _fit_open(curve: BoundaryCurve, params: FitParams) -> FittedCurve:
+def _fit_open(curve: BoundaryCurve, params: FitParams, scale: float) -> FittedCurve:
     dense = smooth_polyline(curve.points, closed=False, sigma=params.smooth_sigma)
     corners = find_corners(dense, closed=False, angle_deg=params.corner_angle_deg, window=CORNER_WINDOW)
     inner = corners[1:-1]  # the end points are already the exact junctions
-    snapped = _snap_corners(dense, inner, curve.points)
+    snapped = _snap_corners(dense, inner, curve.points, scale)
     return FittedCurve(curve.id, _fit_spans(snapped, corners, params), primitive=None)
 
 
-def _fit_closed(curve: BoundaryCurve, params: FitParams) -> FittedCurve:
+def _fit_closed(curve: BoundaryCurve, params: FitParams, scale: float) -> FittedCurve:
     ring = smooth_polyline(curve.points, closed=True, sigma=params.smooth_sigma)
     n = len(ring)
     corners = find_corners(ring, closed=True, angle_deg=params.corner_angle_deg, window=CORNER_WINDOW)
     start = corners[0] if corners else 0
     # Rotate so the chain starts (and, by repeating the start sample, ends) at a corner.
-    snapped = _snap_corners(ring, corners, curve.points)
+    snapped = _snap_corners(ring, corners, curve.points, scale)
     seq = (*snapped[start:], *snapped[:start], snapped[start])
     if corners:
         breaks = sorted((c - start) % n for c in corners) + [n]
     else:
         breaks = [n * k // CORNERLESS_SPANS for k in range(CORNERLESS_SPANS + 1)]
     segments = _fit_spans(seq, breaks, params)
-    return FittedCurve(curve.id, segments, primitive=detect_primitive(ring, corners))
+    return FittedCurve(curve.id, segments, primitive=detect_primitive(ring, corners, scale))
 
 
-def _fit_smooth(curve: BoundaryCurve, params: FitParams) -> FittedCurve:
+def _fit_smooth(curve: BoundaryCurve, params: FitParams, scale: float) -> FittedCurve:
     if OUTSIDE in (curve.left, curve.right):
         return _fit_curve(curve)  # the canvas edge is exact already; smoothing would round it
     min_length = MIN_CLOSED_LENGTH_PX if curve.closed else MIN_OPEN_LENGTH_PX
-    if _length(curve.points) < min_length:
+    if _length(curve.points) < min_length * scale:
         return _fit_curve(curve)
-    return _fit_closed(curve, params) if curve.closed else _fit_open(curve, params)
+    return _fit_closed(curve, params, scale) if curve.closed else _fit_open(curve, params, scale)
 
 
-def fit_geometry(graph: BoundaryGraph, params: FitParams) -> tuple[FittedCurve, ...]:
+def _processing_params(params: FitParams, scale: float) -> FitParams:
+    """`params` with its lengths converted from original pixels to processing pixels.
+
+    Smoothing runs on one sample per processing pixel, so sigma (in samples) scales too.
+    """
+    return replace(
+        params, tolerance_px=params.tolerance_px * scale, smooth_sigma=params.smooth_sigma * scale
+    )
+
+
+def fit_geometry(
+    graph: BoundaryGraph, params: FitParams, scale: float = 1.0
+) -> tuple[FittedCurve, ...]:
     """Fit lines, arcs and Bezier chains (and whole-shape primitives for closed curves).
 
     Per curve: smooth -> corners -> `fit_span` between consecutive corners -> `snap_axis`.
     Curve endpoints are never moved, so curves shared by two regions stay stitched. With
     `params.enabled` False this is `polyline_fit`.
+
+    `graph` is in processing pixels (original pixels x `scale`); every length threshold in
+    `params` and in this module is in original pixels and is converted here.
     """
     if not params.enabled:
         return polyline_fit(graph)
-    return tuple(_fit_smooth(c, params) for c in graph.curves)
+    scaled = _processing_params(params, scale)
+    return tuple(_fit_smooth(c, scaled, scale) for c in graph.curves)

@@ -49,7 +49,7 @@ def _run_trace(state: PipelineState) -> PipelineState:
 
 def _run_fit(state: PipelineState) -> PipelineState:
     graph = _need(state.graph, "boundary graph", "fit")
-    return replace(state, fitted=fit_geometry(graph, state.preset.fit))
+    return replace(state, fitted=fit_geometry(graph, state.preset.fit, state.image.scale))
 
 
 def _run_export(state: PipelineState) -> PipelineState:
@@ -58,6 +58,8 @@ def _run_export(state: PipelineState) -> PipelineState:
         _need(state.graph, "boundary graph", "export"),
         _need(state.fitted, "fitted curves", "export"),
         state.preset.export,
+        scale=state.image.scale,
+        original_size=state.image.original_size,
     )
     return replace(state, doc=doc)
 
@@ -96,16 +98,21 @@ def vectorize(
     resolved = resolve_preset(preset)
     if overrides:
         resolved = apply_overrides(resolved, overrides)
-    state = PipelineState(image=load_image(image_bytes), preset=resolved)
+    return run_pipeline(load_image(image_bytes), resolved)
+
+
+def run_pipeline(image: RasterImage, preset: Preset) -> VectorizeResult:
+    """Run `preset`'s stages on an already loaded image."""
+    state = PipelineState(image=image, preset=preset)
     reports: list[StageReport] = []
-    for name in resolved.stages:
+    for name in preset.stages:
         start = time.perf_counter()
         state = _run_stage(name, state)
         reports.append(
             StageReport(
                 stage=name,
                 duration_s=time.perf_counter() - start,
-                params=_stage_params(name, resolved),
+                params=_stage_params(name, preset),
                 debug_images={},
             )
         )

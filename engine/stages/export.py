@@ -18,6 +18,7 @@ from engine.types import (
     LoopRef,
     Path,
     Point,
+    Polygon,
     Primitive,
     PrimitiveShape,
     Rect,
@@ -116,13 +117,62 @@ def _needs_canvas_underlay(loop: LoopRef, graph: BoundaryGraph) -> bool:
     return any(OUTSIDE not in sides[curve_id] for curve_id, _ in loop)
 
 
+def _scale_point(p: Point, k: float) -> Point:
+    return (p[0] * k, p[1] * k)
+
+
+def _scale_segment(seg: Segment, k: float) -> Segment:
+    if isinstance(seg, Line):
+        return Line(_scale_point(seg.p0, k), _scale_point(seg.p1, k))
+    if isinstance(seg, Arc):
+        return replace(
+            seg,
+            p0=_scale_point(seg.p0, k),
+            p1=_scale_point(seg.p1, k),
+            center=_scale_point(seg.center, k),
+            radius=seg.radius * k,
+        )
+    return CubicBezier(*(_scale_point(p, k) for p in (seg.p0, seg.c1, seg.c2, seg.p1)))
+
+
+def _scale_shape(shape: PrimitiveShape, k: float) -> PrimitiveShape:
+    if isinstance(shape, Circle):
+        return Circle(shape.cx * k, shape.cy * k, shape.r * k)
+    if isinstance(shape, Ellipse):
+        return replace(shape, cx=shape.cx * k, cy=shape.cy * k, rx=shape.rx * k, ry=shape.ry * k)
+    if isinstance(shape, Rect):
+        return replace(shape, x=shape.x * k, y=shape.y * k, w=shape.w * k, h=shape.h * k)
+    return Polygon(tuple(_scale_point(p, k) for p in shape.points))
+
+
+def _to_original_units(
+    paths: list[Path], primitives: list[Primitive], scale: float
+) -> tuple[tuple[Path, ...], tuple[Primitive, ...]]:
+    """The single place where processing-pixel geometry is divided by `scale`."""
+    if scale == 1.0:
+        return tuple(paths), tuple(primitives)
+    k = 1.0 / scale
+    return (
+        tuple(
+            replace(p, contours=tuple(tuple(_scale_segment(s, k) for s in c) for c in p.contours))
+            for p in paths
+        ),
+        tuple(replace(p, shape=_scale_shape(p.shape, k)) for p in primitives),
+    )
+
+
 def build_doc(
     regions: RegionMap,
     graph: BoundaryGraph,
     fitted: tuple[FittedCurve, ...],
     params: ExportParams,
+    scale: float = 1.0,
+    original_size: tuple[int, int] | None = None,
 ) -> VectorDoc:
-    h, w = regions.labels.shape
+    """Assemble the document. Inputs are in processing pixels (original pixels x `scale`); the
+    document is in original pixels with size `original_size` (w, h), which defaults to the label
+    grid's size."""
+    w, h = original_size or (regions.labels.shape[1], regions.labels.shape[0])
     by_id = {f.curve_id: f for f in fitted}
     points = {c.id: c.points for c in graph.curves}
     sides = {c.id: c.right for c in graph.curves}
@@ -141,7 +191,7 @@ def build_doc(
         loops = _emitted_loops(region, graph, stacked, sides)
         fill = SolidFill(tuple(int(c) for c in regions.palette_rgb[region]))
         if stacked and z == 0 and _needs_canvas_underlay(loops[0], graph):
-            paths.append(Path((_canvas_frame(w, h),), fill, z))
+            paths.append(Path((_canvas_frame(w * scale, h * scale),), fill, z))
             continue
         shape = (
             _single_primitive(region, loops[0], by_id, stacked, curve_sides)
@@ -153,11 +203,12 @@ def build_doc(
             continue
         contours = tuple(_loop_segments(loop, by_id) for loop in loops)
         paths.append(Path(contours, fill, z))
+    out_paths, out_primitives = _to_original_units(paths, primitives, scale)
     return VectorDoc(
         width=w,
         height=h,
-        paths=tuple(paths),
-        primitives=tuple(primitives),
+        paths=out_paths,
+        primitives=out_primitives,
         layer_mode=params.layer_mode,
         precision=params.precision,
     )
