@@ -24,3 +24,4 @@ include = ["engine*", "eval*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: takes more than a few seconds (large-image performance checks)"]

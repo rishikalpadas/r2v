@@ -39,6 +39,33 @@ class RegionMap:
 
 
 @dataclass(frozen=True)
+class BoundaryCurve:
+    """Polyline on the pixel-corner grid separating exactly two labels.
+
+    Walking `points` in order, `left` is on the left and `right` on the right, where "left" of
+    direction (dx, dy) is (-dy, dx) with coordinates taken as-is (x right, y down). Closed curves
+    repeat their first point as their last.
+    """
+
+    id: int
+    points: tuple[Point, ...]
+    left: int
+    right: int
+    closed: bool
+
+
+LoopRef = tuple[tuple[int, bool], ...]  # (curve_id, reversed) in walking order
+
+
+@dataclass(frozen=True)
+class BoundaryGraph:
+    """Shared boundary curves plus, per region, its loops (loops[0] outer, rest holes)."""
+
+    curves: tuple[BoundaryCurve, ...]
+    region_loops: Mapping[int, tuple[LoopRef, ...]]
+
+
+@dataclass(frozen=True)
 class Line:
     p0: Point
     p1: Point
