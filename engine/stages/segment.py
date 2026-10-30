@@ -217,7 +217,8 @@ def _merge_small_components(comp: np.ndarray, comp_cluster: np.ndarray, min_px: 
     a, b = _edge_pairs(comp)
     borders: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     n_ids = len(comp_cluster)
-    keys, cnts = np.unique(a * n_ids + b, return_counts=True)
+    # Each edge counts for both components: a small one must see its left/up neighbours too.
+    keys, cnts = np.unique(np.concatenate([a * n_ids + b, b * n_ids + a]), return_counts=True)
     for key, cnt in zip(keys.tolist(), cnts.tolist()):
         borders[key // n_ids][key % n_ids] = cnt
     per_cluster = np.bincount(comp_cluster[1:], minlength=int(comp_cluster.max()) + 1)

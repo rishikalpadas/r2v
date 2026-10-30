@@ -7,7 +7,12 @@ from scipy import ndimage
 from PIL import Image
 
 from engine.presets import SegmentParams
-from engine.stages.segment import _drop_blend_clusters, segment
+from engine.stages.segment import (
+    _components,
+    _drop_blend_clusters,
+    _merge_small_components,
+    segment,
+)
 from engine.types import TRANSPARENT, RasterImage
 from eval.synthetic import flat_shapes, solid, transparent_logo
 
@@ -159,3 +164,25 @@ def test_large_noisy_image_is_fast():
 def test_params_validated(kwargs):
     with pytest.raises(ValueError):
         SegmentParams(**kwargs)
+
+
+def test_speck_with_only_up_left_neighbours_is_merged():
+    px = np.zeros((10, 10, 4), np.uint8)
+    px[..., 3] = 255
+    px[..., :3] = (255, 0, 0)
+    px[:5, :, :3] = (0, 255, 0)
+    px[9, 9, :3] = (0, 255, 0)  # 1 px green speck: neighbours only above and to the left
+    rm = segment(_img(px), SegmentParams(min_region_px=4))
+    assert rm.labels.max() + 1 == 2
+    assert rm.labels[9, 9] == rm.labels[8, 9]
+
+
+def test_small_component_joins_longest_border_neighbour_in_any_direction():
+    lab = np.ones((10, 10), np.int32)
+    lab[:, 5:] = 2
+    lab[8:, :] = 0
+    lab[3:5, 4] = 0  # 2 px speck: 4 edges to colour 1 (left/up/down), 2 edges to colour 2
+    comp, comp_cluster = _components(lab)
+    roots = _merge_small_components(comp, comp_cluster, 4)
+    speck = comp[3, 4]
+    assert comp_cluster[roots[speck]] == 1
