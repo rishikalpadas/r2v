@@ -6,8 +6,8 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from engine import to_svg, vectorize
-from eval.metrics import alpha_agreement, mean_delta_e, render_svg, ssim
-from eval.synthetic import flat_shapes, solid, to_png_bytes, transparent_logo
+from eval.metrics import alpha_agreement, count_nodes, mean_delta_e, render_svg, ssim
+from eval.synthetic import circle, flat_shapes, solid, to_png_bytes, transparent_logo
 
 
 def _roundtrip(pixels: np.ndarray, **kwargs):
@@ -104,3 +104,35 @@ def test_nested_regions_keep_colors():
     inner = (slice(64, 88), slice(64, 88))
     assert mean_delta_e(px[inner], render[inner]) <= 3.0
     assert tuple(render[85, 72, :3]) == (40, 170, 60)
+
+
+def test_circle_emitted_as_primitive():
+    svg = to_svg(vectorize(to_png_bytes(circle())).doc)
+    circles = [el for el in ET.fromstring(svg) if el.tag.endswith("circle")]
+    assert any(
+        abs(float(c.get("cx")) - 64) <= 1.0
+        and abs(float(c.get("cy")) - 64) <= 1.0
+        and abs(float(c.get("r")) - 40) <= 1.0
+        for c in circles
+    )
+
+
+def _mean_nodes(overrides=None) -> float:
+    counts = [
+        count_nodes(to_svg(vectorize(to_png_bytes(flat_shapes(seed)), overrides=overrides).doc))[0]
+        for seed in range(10)
+    ]
+    return sum(counts) / len(counts)
+
+
+def test_fit_reduces_nodes():
+    assert _mean_nodes() <= 0.5 * _mean_nodes({"fit.enabled": False})
+
+
+def test_regression_narrow_rects_stay_rects():
+    # Hypothesis-found case: 4 px wide rects were fitted as a circle and an ellipse (SSIM 0.9496).
+    pixels = solid(64, (255, 255, 255, 255))
+    pixels[1:6, 1:5] = (*_COLORS[0], 255)
+    pixels[12:51, 11:15] = (*_COLORS[1], 255)
+    _, render = _roundtrip(pixels)
+    assert ssim(pixels, render) >= 0.95

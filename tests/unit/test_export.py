@@ -228,3 +228,36 @@ def test_precision_must_be_int():
     for bad in (2.5, True, "2"):
         with pytest.raises(InputError):
             apply_overrides(PRESETS["logo"], {"export.precision": bad})
+
+
+def _border_touching() -> np.ndarray:
+    px = np.full((32, 32, 4), 255, np.uint8)
+    px[0:12, 4:14] = (220, 30, 30, 255)  # touches the top edge, so the background is not a frame
+    px[18:26, 18:26] = (30, 60, 200, 255)
+    return px
+
+
+def _canvas_frame(w: int, h: int) -> tuple[Line, ...]:
+    return (Line((0, 0), (w, 0)), Line((w, 0), (w, h)), Line((w, h), (0, h)), Line((0, h), (0, 0)))
+
+
+def test_stacked_bottom_layer_covers_canvas_when_opaque():
+    regions, graph, doc = _regions_graph(_border_touching(), "stacked")
+    bottom = min((*doc.paths, *doc.primitives), key=lambda item: item.z_order)
+    assert bottom.z_order == 0
+    assert isinstance(bottom, Path) and bottom.contours == (_canvas_frame(32, 32),)
+    assert bottom.fill == SolidFill((255, 255, 255))
+
+
+def test_cutout_bottom_layer_keeps_its_loops():
+    _, _, doc = _regions_graph(_border_touching(), "cutout")
+    bottom = min(doc.paths, key=lambda p: p.z_order)
+    assert bottom.contours[0] != _canvas_frame(32, 32)
+
+
+def test_stacked_bottom_layer_not_widened_over_transparency():
+    px = _border_touching()
+    px[28:, :] = (0, 0, 0, 0)
+    _, _, doc = _regions_graph(px, "stacked")
+    bottom = min(doc.paths, key=lambda p: p.z_order)
+    assert bottom.contours[0] != _canvas_frame(32, 32)

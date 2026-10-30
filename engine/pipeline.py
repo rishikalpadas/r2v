@@ -9,7 +9,7 @@ from engine.errors import InputError, StageError
 from engine.loader import load_image
 from engine.presets import Preset, apply_overrides, resolve_preset
 from engine.stages.export import build_doc
-from engine.stages.fit_geometry import polyline_fit
+from engine.stages.fit_geometry import fit_geometry
 from engine.stages.segment import segment
 from engine.stages.trace import trace
 from engine.types import (
@@ -48,7 +48,8 @@ def _run_trace(state: PipelineState) -> PipelineState:
 
 
 def _run_fit(state: PipelineState) -> PipelineState:
-    return replace(state, fitted=polyline_fit(_need(state.graph, "boundary graph", "fit")))
+    graph = _need(state.graph, "boundary graph", "fit")
+    return replace(state, fitted=fit_geometry(graph, state.preset.fit))
 
 
 def _run_export(state: PipelineState) -> PipelineState:

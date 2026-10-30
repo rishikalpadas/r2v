@@ -6,8 +6,9 @@ from xml.sax.saxutils import quoteattr
 
 from engine.presets import ExportParams
 from engine.types import (
-    Arc,
+    OUTSIDE,
     TRANSPARENT,
+    Arc,
     BoundaryGraph,
     Circle,
     CubicBezier,
@@ -78,6 +79,25 @@ def _emitted_loops(
     return (loops[0], *(h for h in loops[1:] if _borders_transparent(h, sides)))
 
 
+def _canvas_frame(w: int, h: int) -> tuple[Segment, ...]:
+    return (Line((0, 0), (w, 0)), Line((w, 0), (w, h)), Line((w, h), (0, h)), Line((0, h), (0, 0)))
+
+
+def _needs_canvas_underlay(loop: LoopRef, graph: BoundaryGraph) -> bool:
+    """True when the bottom layer must be widened to the canvas: its outer loop is not the
+    canvas frame and nothing is transparent.
+
+    A shape touching the canvas edge makes the bottom region's outer loop walk around it, so no
+    layer lies under that shape. Fitted (non pixel-aligned) shared edges would then be
+    anti-aliased from both sides and leave partly transparent seams. Every other region is
+    painted on top, so covering the whole canvas is exact.
+    """
+    if any(TRANSPARENT in (c.left, c.right) for c in graph.curves):
+        return False
+    sides = {c.id: (c.left, c.right) for c in graph.curves}
+    return any(OUTSIDE not in sides[curve_id] for curve_id, _ in loop)
+
+
 def build_doc(
     regions: RegionMap,
     graph: BoundaryGraph,
@@ -101,6 +121,9 @@ def build_doc(
     for z, region in enumerate(ordered):
         loops = _emitted_loops(region, graph, stacked, sides)
         fill = SolidFill(tuple(int(c) for c in regions.palette_rgb[region]))
+        if stacked and z == 0 and _needs_canvas_underlay(loops[0], graph):
+            paths.append(Path((_canvas_frame(w, h),), fill, z))
+            continue
         shape = _single_primitive(loops[0], by_id) if len(loops) == 1 else None
         if shape is not None:
             primitives.append(Primitive(shape, fill, z))
