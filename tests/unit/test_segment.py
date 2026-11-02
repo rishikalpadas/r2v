@@ -350,3 +350,25 @@ def test_fringe_specks_merged_but_dots_and_lines_survive():
     assert (colour[60, 12:52] == c["orange"]).all()
     assert (colour[40:43, 45:47] == 0).all()  # 4-px white speck absorbed by black
     assert (colour[20:30, 31] == 255).all()  # sliver joins its longest border (white)
+
+
+def test_pixels_diagonally_touching_a_solid_block_are_specks():
+    px = solid(40, (255, 255, 255, 255))
+    px[0, :, :3] = np.arange(40)[:, None] + 100  # grey ramp row: > max_colors, the noisy path
+    px[10:30, 10:30, :3] = (200, 30, 90)  # solid block: its 8-connected reach has interior
+    px[9, 9, :3] = (200, 30, 90)  # 1 px touching the top-left corner diagonally
+    px[30:32, 30, :3] = (200, 30, 90)  # 2 px touching the bottom-right corner diagonally
+    rm = segment(_img(px), SegmentParams())
+    colour = rm.palette_rgb[rm.labels]
+    assert (colour[9, 9] == 255).all()
+    assert (colour[30:32, 30] == 255).all()
+    assert (colour[10:30, 10:30] == (200, 30, 90)).all()
+
+
+def test_exact_colour_tips_diagonally_touching_a_shape_survive():
+    # Exact flat art (<= max_colors colors): a 1-px tip is part of the aliased shape, not noise.
+    px = solid(40, (255, 255, 255, 255))
+    px[10:30, 10:30, :3] = (200, 30, 90)
+    px[9, 9, :3] = (200, 30, 90)
+    rm = segment(_img(px), SegmentParams())
+    assert tuple(rm.palette_rgb[rm.labels[9, 9]]) == (200, 30, 90)

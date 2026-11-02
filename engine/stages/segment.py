@@ -110,35 +110,49 @@ def _components(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return comp, np.array(comp_cluster)
 
 
-def _diagonal_reach(comp: np.ndarray, comp_cluster: np.ndarray) -> np.ndarray:
-    """Pixel count of each component's 8-connected same-color group.
+def _diagonal_reach(
+    comp: np.ndarray, comp_cluster: np.ndarray, interior: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per component: pixel count of its 8-connected same-color group, and whether that group
+    has any interior pixel (`interior`: per-pixel mask).
 
     Staircase pieces of a thin diagonal line are tiny 4-connected components but belong to
     one long feature; judging smallness on the 8-connected group keeps them.
     """
     reach = np.zeros(len(comp_cluster), dtype=np.int64)
+    group_interior = np.zeros(len(comp_cluster), dtype=bool)
     eight = np.ones((3, 3), dtype=int)
     cluster_map = comp_cluster[comp]
     for c in np.unique(comp_cluster[1:]):
         mask = cluster_map == c
         lab, n = ndimage.label(mask, structure=eight)
         group_sizes = np.bincount(lab.ravel(), minlength=n + 1)
+        solid = np.bincount(lab[interior & mask], minlength=n + 1) > 0
         ids, first = np.unique(comp[mask], return_index=True)
-        reach[ids] = group_sizes[lab[mask][first]]
-    return reach
+        groups = lab[mask][first]
+        reach[ids] = group_sizes[groups]
+        group_interior[ids] = solid[groups]
+    return reach, group_interior
 
 
 def _merge_small_components(
-    comp: np.ndarray, comp_cluster: np.ndarray, min_px: int, speck_px: int = 0
+    comp: np.ndarray,
+    comp_cluster: np.ndarray,
+    min_px: int,
+    speck_px: int = 0,
+    noisy: bool = False,
 ) -> np.ndarray:
     """Root id per component id; small ones join their longest-border neighbor.
 
     Small = 8-connected same-color group under min_px (kept if it is the only component of its
-    color), or under speck_px with no interior pixel (merged even if last of its color).
+    color), or a speck: no interior pixel and under speck_px (merged even if last of its
+    color). On noisy input a speck diagonally attached to a solid same-color area is sized by
+    its own 4-connected area; otherwise (and always for thin lines) by its 8-connected group.
     """
     sizes = np.bincount(comp.ravel(), minlength=len(comp_cluster)).astype(np.int64)
-    reach = _diagonal_reach(comp, comp_cluster)
-    has_interior = np.bincount(comp[_interior_mask(comp)], minlength=len(comp_cluster)) > 0
+    interior = _interior_mask(comp)
+    reach, group_interior = _diagonal_reach(comp, comp_cluster, interior)
+    has_interior = np.bincount(comp[interior], minlength=len(comp_cluster)) > 0
     a, b = _edge_pairs(comp)
     borders: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     n_ids = len(comp_cluster)
@@ -155,7 +169,11 @@ def _merge_small_components(
             i = parent[i]
         return int(i)
 
-    speck = (reach < speck_px) & ~has_interior
+    # An interior-less piece of an interior-less 8-group (thin line, staircase) is judged by the
+    # group. On noisy input a stray pixel diagonally touching a solid area is JPEG/AA residue and
+    # is judged by its own 4-conn size; on exact-color input it is a real aliased shape tip.
+    speck_size = np.where(group_interior & noisy, sizes, reach)
+    speck = (speck_size < speck_px) & ~has_interior
     small = [
         i for i in range(1, len(sizes))
         if speck[i] or (reach[i] < min_px and per_cluster[comp_cluster[i]] > 1)
@@ -224,7 +242,7 @@ def segment(image: RasterImage, params: SegmentParams) -> RegionMap:
     # min_region_px is an area in original pixels; one original pixel covers scale^2 here.
     min_px = round(params.min_region_px * image.scale**2)
     speck_px = round(SPECK_MAX_PX * image.scale**2)
-    merged = _merge_small_components(comp, comp_cluster, min_px, speck_px)[comp]
+    merged = _merge_small_components(comp, comp_cluster, min_px, speck_px, noisy)[comp]
     survivors, region = np.unique(merged[comp > 0], return_inverse=True)
     out = np.full((h, w), TRANSPARENT, dtype=np.int32)
     out[comp > 0] = region.ravel().astype(np.int32)
