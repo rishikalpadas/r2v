@@ -197,7 +197,7 @@ def test_square_corners_found_at_scale4():
 
 
 def test_subpixel_corner_side_samples_scale():
-    from engine.stages.fit_geometry import _subpixel_corner
+    from engine.geometry.corner_placement import _subpixel_corner
 
     # Two samples on each side past the gap: enough at scale 1, too few at scale 2.
     raw = [(x + 0.5, 0.2) for x in range(4)] + [(4.2, y + 0.5) for y in range(4)]
