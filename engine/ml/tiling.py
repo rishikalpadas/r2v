@@ -64,20 +64,26 @@ def _run_once(model_fn: ModelFn, rgb: np.ndarray, scale: int, tile: int, overlap
     ys, xs = _starts(h, win_h, stride), _starts(w, win_w, stride)
     wy, wx = _ramps(ys, win_h, scale), _ramps(xs, win_w, scale)
 
-    acc = np.zeros((h * scale, w * scale, 3), dtype=np.float64)
-    wsum = np.zeros((h * scale, w * scale, 1), dtype=np.float64)
+    # float32 accumulator; the weights are separable, so their sum is sy x sx
+    acc = np.zeros((h * scale, w * scale, 3), dtype=np.float32)
+    sy = np.zeros(h * scale, dtype=np.float32)
+    sx = np.zeros(w * scale, dtype=np.float32)
+    for y, ry in zip(ys, wy):
+        sy[y * scale:(y + win_h) * scale] += ry
+    for x, rx in zip(xs, wx):
+        sx[x * scale:(x + win_w) * scale] += rx
+    expected = (win_h * scale, win_w * scale, 3)
     for y, ry in zip(ys, wy):
         for x, rx in zip(xs, wx):
             part = model_fn(np.ascontiguousarray(rgb[y:y + win_h, x:x + win_w]))
-            expected = (win_h * scale, win_w * scale, 3)
             if getattr(part, "shape", None) != expected:
                 raise ValueError(f"model output shape {getattr(part, 'shape', None)} != {expected}")
-            weight = (ry[:, None] * rx[None, :])[..., None]
+            weight = (ry[:, None] * rx[None, :]).astype(np.float32)[..., None]
             oy, ox = y * scale, x * scale
             acc[oy:oy + expected[0], ox:ox + expected[1]] += part * weight
-            wsum[oy:oy + expected[0], ox:ox + expected[1]] += weight
-    # float64 accumulation keeps identical overlapping values exact after the float32 cast
-    return (acc / wsum).astype(np.float32)
+    acc /= sy[:, None, None]
+    acc /= sx[None, :, None]
+    return acc
 
 
 def run_tiled(
@@ -90,27 +96,35 @@ def run_tiled(
 ) -> TiledResult:
     """Run `model_fn` over `rgb` (HxWx3 float32 0..1) in feather-blended tiles.
 
-    `tile` is the model input window (context included); windows overlap by `overlap` px
-    of context per side (capped at tile // 4) and stay inside the image. On GPU OOM the
-    tile is halved and the whole image restarted; below `min_tile` raises MemoryError.
-    Returns TiledResult(image, final_tile); unpacks as a tuple.
+    `tile` is the model input window (context included), clamped at the start to
+    max(min_tile, min(tile, long side)). Windows are evenly spaced, stay inside the image
+    and overlap by at least `overlap` px of context per side (capped at tile // 4); up to
+    three windows can overlap along one axis. Each window's output is weighted by linear
+    ramps across its overlaps and the blend is normalized by the summed weights. On GPU
+    OOM the tile is halved and the whole image restarted; below `min_tile` raises
+    MemoryError. Returns TiledResult(image, final_tile); unpacks as a tuple.
     """
     if not isinstance(rgb, np.ndarray) or rgb.ndim != 3 or rgb.shape[2] != 3 or 0 in rgb.shape:
         raise ValueError(f"rgb must be HxWx3, got shape {getattr(rgb, 'shape', None)}")
     if isinstance(scale, bool) or not isinstance(scale, int) or scale < 1:
         raise ValueError(f"scale must be an int >= 1, got {scale!r}")
+    for name, value in (("tile", tile), ("overlap", overlap), ("min_tile", min_tile)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an int, got {value!r}")
     if min_tile < 1 or tile < min_tile:
         raise ValueError(f"need 1 <= min_tile <= tile, got min_tile={min_tile}, tile={tile}")
     if overlap < 0:
         raise ValueError(f"overlap must be >= 0, got {overlap}")
     rgb = rgb.astype(np.float32, copy=False)
+    tile = max(min_tile, min(tile, max(rgb.shape[:2])))  # no identical retries on small images
     while True:
         try:
             return TiledResult(_run_once(model_fn, rgb, scale, tile, overlap), tile)
         except Exception as exc:
             if not _is_oom(exc):
                 raise
-            _free_cuda_cache()
             if tile // 2 < min_tile:
                 raise MemoryError(f"out of memory at tile {tile}, floor is {min_tile}") from exc
-            tile //= 2
+        # outside the except block, so the traceback no longer pins GPU tensors
+        _free_cuda_cache()
+        tile //= 2

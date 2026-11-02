@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import sys
+import tracemalloc
 import types
 
 import numpy as np
 import pytest
 
-from engine.ml.tiling import TiledResult, run_tiled
+from engine.ml.tiling import TiledResult, _ramps, _starts, run_tiled
 
 
 class OutOfMemoryError(RuntimeError):
@@ -19,6 +20,10 @@ def _nearest(scale):
     return model
 
 
+def _close(actual, expected):
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-6)
+
+
 def _rand(h, w, seed=0):
     return np.random.default_rng(seed).random((h, w, 3), dtype=np.float32)
 
@@ -29,24 +34,36 @@ def test_identity_matches_whole_image():
     assert isinstance(res, TiledResult)
     assert res.image.dtype == np.float32
     assert res.image.shape == (600, 400, 3)
-    np.testing.assert_array_equal(res.image, _nearest(2)(rgb))
+    _close(res.image, _nearest(2)(rgb))
     assert res.final_tile == 64
 
 
 def test_no_seam_on_flat_color():
-    rgb = np.full((300, 200, 3), 0.5, dtype=np.float32)
+    h, w, tile, overlap = 300, 200, 64, 16
+    rgb = np.full((h, w, 3), 0.5, dtype=np.float32)
+    nx = len(_starts(w, tile, tile - 2 * overlap))
     calls = []
 
     def model(x):
+        k = len(calls)
         calls.append(x.shape)
-        offset = (1 if len(calls) % 2 else -1) / 255
+        offset = (1 if (k // nx + k % nx) % 2 == 0 else -1) / 255  # checkerboard
         return _nearest(2)(x) + np.float32(offset)
 
-    out = run_tiled(model, rgb, 2, tile=64, overlap=16).image
-    assert len(calls) > 4
-    step = max(np.abs(np.diff(out, axis=0)).max(), np.abs(np.diff(out, axis=1)).max())
-    assert step <= 2 / 255
-    assert step < 0.5 / 255  # feathered, not a hard 2-level step
+    out = run_tiled(model, rgb, 2, tile=tile, overlap=overlap).image[..., 0]
+    assert len(calls) > nx * 2
+    dy, dx = np.abs(np.diff(out, axis=0)).max(), np.abs(np.diff(out, axis=1)).max()
+    assert max(dy, dx) <= 2 / 255
+    assert dy < 0.5 / 255 and dx < 0.5 / 255  # feathered, not a hard 2-level step
+    # vertical neighbours really differ: column 0 swings between +1 and -1 down the image
+    col = out[:, 0]
+    assert col.max() == pytest.approx(0.5 + 1 / 255, abs=1e-6)
+    assert col.min() < 0.5 - 0.5 / 255  # interior rows always blend, so -1 is not hit exactly
+    # 4-way corner of windows (0,0),(0,1),(1,0),(1,1): centre of the shared block blends to 0.5
+    ys, xs = _starts(h, tile, tile - 2 * overlap), _starts(w, tile, tile - 2 * overlap)
+    cy, cx = ys[1] + tile, xs[1] + tile  # overlap centre in output px: (start1 + tile) * 2 / 2
+    block = out[cy - 4:cy + 4, cx - 4:cx + 4]
+    assert np.abs(block - 0.5).max() < 0.25 / 255
 
 
 def test_oom_backoff():
@@ -60,9 +77,9 @@ def test_oom_backoff():
         return _nearest(4)(x)
 
     res = run_tiled(model, rgb, 4, tile=512)
-    assert res.final_tile == 64
-    assert all(max(s) <= 64 for s in sizes[-10:])
-    np.testing.assert_array_equal(res.image, _nearest(4)(rgb))
+    assert res.final_tile == 75  # clamped 300 -> 150 -> 75
+    assert sizes[:2] == [(300, 200), (150, 150)] and all(max(s) <= 75 for s in sizes[2:])
+    _close(res.image, _nearest(4)(rgb))
 
 
 def test_oom_message_variant():
@@ -74,8 +91,8 @@ def test_oom_message_variant():
         return _nearest(1)(x)
 
     res = run_tiled(model, rgb, 1, tile=256, overlap=8)
-    assert res.final_tile == 64
-    np.testing.assert_array_equal(res.image, rgb)
+    assert res.final_tile == 75  # 150 -> 75
+    _close(res.image, rgb)
 
 
 def test_oom_empties_cuda_cache_when_torch_loaded(monkeypatch):
@@ -88,7 +105,7 @@ def test_oom_empties_cuda_cache_when_torch_loaded(monkeypatch):
             raise OutOfMemoryError("boom")
         return x
 
-    res = run_tiled(model, _rand(100, 100), 1, tile=128)
+    res = run_tiled(model, _rand(150, 150), 1, tile=128)
     assert res.final_tile == 64
     assert emptied == [1]
 
@@ -105,7 +122,21 @@ def test_oom_survives_empty_cache_failure(monkeypatch):
             raise OutOfMemoryError("boom")
         return x
 
-    assert run_tiled(model, _rand(100, 100), 1, tile=128).final_tile == 64
+    assert run_tiled(model, _rand(150, 150), 1, tile=128).final_tile == 64
+
+
+def test_cache_freed_outside_except_block(monkeypatch):
+    seen = []
+    fake = types.SimpleNamespace(cuda=types.SimpleNamespace(empty_cache=lambda: seen.append(sys.exc_info()[1])))
+    monkeypatch.setitem(sys.modules, "torch", fake)
+
+    def model(x):
+        if max(x.shape[:2]) > 64:
+            raise OutOfMemoryError("boom")
+        return x
+
+    run_tiled(model, _rand(150, 150), 1, tile=128)
+    assert seen == [None]  # traceback (and the tensors it pins) already released
 
 
 def test_oom_without_torch_does_not_import_it(monkeypatch):
@@ -116,7 +147,7 @@ def test_oom_without_torch_does_not_import_it(monkeypatch):
             raise OutOfMemoryError("boom")
         return x
 
-    run_tiled(model, _rand(100, 100), 1, tile=128)
+    run_tiled(model, _rand(150, 150), 1, tile=128)
     assert "torch" not in sys.modules
 
 
@@ -150,8 +181,23 @@ def test_image_smaller_than_tile():
 
     res = run_tiled(model, rgb, 4, tile=512)
     assert calls == [(40, 30, 3)]
-    np.testing.assert_array_equal(res.image, _nearest(4)(rgb))
-    assert res.final_tile == 512
+    _close(res.image, _nearest(4)(rgb))
+    assert res.final_tile == 64  # clamped to max(min_tile, long side)
+
+
+def test_start_tile_clamped_to_image():
+    sizes = []
+
+    def model(x):
+        sizes.append(x.shape[:2])
+        raise OutOfMemoryError("always")
+
+    with pytest.raises(MemoryError):
+        run_tiled(model, _rand(100, 80), 1, tile=512)
+    assert sizes == [(100, 80)]  # no identical retries at 512, 256, 128
+
+    res = run_tiled(_nearest(1), _rand(100, 80), 1, tile=512)
+    assert res.final_tile == 100
 
 
 def test_tiles_are_full_size_when_image_allows():
@@ -172,7 +218,7 @@ def test_tiles_are_full_size_when_image_allows():
 def test_odd_sizes(h, w, tile, overlap):
     rgb = _rand(h, w)
     res = run_tiled(_nearest(3), rgb, 3, tile=tile, overlap=overlap)
-    np.testing.assert_array_equal(res.image, _nearest(3)(rgb))
+    _close(res.image, _nearest(3)(rgb))
 
 
 @pytest.mark.parametrize(
@@ -194,6 +240,11 @@ def test_rejects_bad_input_shape(rgb):
         {"scale": 2, "overlap": -1},
         {"scale": 2, "min_tile": 0},
         {"scale": 2, "tile": 32, "min_tile": 64},
+        {"scale": 2, "tile": 128.0},
+        {"scale": 2, "tile": True, "min_tile": 1},
+        {"scale": 2, "overlap": 8.5},
+        {"scale": 2, "overlap": False},
+        {"scale": 2, "min_tile": 64.0},
     ],
 )
 def test_rejects_bad_params(kwargs):
@@ -204,3 +255,33 @@ def test_rejects_bad_params(kwargs):
 def test_rejects_bad_model_output_shape():
     with pytest.raises(ValueError):
         run_tiled(_nearest(1), _rand(10, 10), 2)
+
+
+@pytest.mark.parametrize(
+    ("length", "tile", "overlap", "scale"),
+    [(300, 64, 16, 2), (200, 64, 16, 1), (130, 64, 16, 3), (65, 64, 16, 4), (1000, 512, 32, 4), (97, 32, 8, 1)],
+)
+def test_ramps_partition_unity(length, tile, overlap, scale):
+    win = min(tile, length)
+    starts = _starts(length, win, tile - 2 * overlap)
+    total = np.zeros(length * scale)
+    cover = np.zeros(length * scale, dtype=int)
+    for s, r in zip(starts, _ramps(starts, win, scale)):
+        total[s * scale:(s + win) * scale] += r
+        cover[s * scale:(s + win) * scale] += 1
+    assert (total > 0).all()
+    assert starts[-1] + win == length
+    np.testing.assert_allclose(total[cover == 1], 1.0)
+    np.testing.assert_allclose(total[cover == 2], 1.0)
+
+
+def test_host_memory_peak_near_output_size():
+    rgb = _rand(512, 512)
+    out_bytes = 512 * 4 * 512 * 4 * 3 * 4
+    tracemalloc.start()
+    try:
+        run_tiled(_nearest(4), rgb, 4, tile=128, overlap=16)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1.5 * out_bytes
