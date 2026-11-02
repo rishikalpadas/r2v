@@ -240,13 +240,13 @@ def test_open_curve_corners_land_on_true_corners():
 
 
 def test_corner_line_intersection_rejects_near_parallel_lines():
-    from engine.geometry.corner_placement import _line_intersection
+    from engine.geometry.corner_placement import line_intersection
 
     a = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
     shallow = np.array([[3.0, 0.0], [4.0, 0.2], [5.0, 0.4]])  # ~11 degrees
     steep = np.array([[3.0, 1.0], [3.0, 2.0], [3.0, 3.0]])
-    assert _line_intersection(a, shallow) is None
-    assert _line_intersection(a, steep) == pytest.approx((3.0, 0.0))
+    assert line_intersection(a, shallow) is None
+    assert line_intersection(a, steep) == pytest.approx((3.0, 0.0))
 
 
 def test_subpixel_corner_needs_samples_on_both_sides_and_a_near_hit():
@@ -343,3 +343,30 @@ def test_collapse_behind_pulls_overshooting_samples_onto_the_corner():
     assert out[8] == (10.0, 0.0)
     assert out[7] == seq[7] and out[10:] == seq[10:]
     assert collapse_behind(seq, [9], [0, 9, 11], False, 4)[10:] == seq[10:]  # short side: skipped
+
+
+def test_side_lines_can_reject_an_intersection_inside_the_raw_corner():
+    from engine.geometry.corner_placement import SideLines, _subpixel_corner
+
+    # A tip between sides that curve outward away from it: lines through the far samples meet
+    # below the raw tip sample at (6, 0.3), inside the shape.
+    raw = [(6.0 - 0.05 * (6 - x) ** 2 - (6 - x), 0.3 + (6 - x)) for x in range(6)]
+    raw += [(6.0, 0.3)] + [(6.0 + d + 0.05 * d**2, 0.3 + d) for d in range(1, 7)]
+    dense = list(raw)
+    lines = SideLines(gap=1, samples=4, allow_behind=True)
+    hit = _subpixel_corner(dense, raw, 6, (-1, 13), 1.0, lines)
+    assert hit is not None and hit[1] > 0.3  # the plain fit accepts the inner hit
+    strict = SideLines(gap=1, samples=4, allow_behind=True, outward_only=True)
+    assert _subpixel_corner(dense, raw, 6, (-1, 13), 1.0, strict) is None
+
+
+def test_grid_snap_can_refuse_a_vertex_inside_the_corner():
+    from engine.geometry.corner_placement import place_corners
+
+    # A tip pointing +x whose sample sits at (5.0, 0.0); the nearest grid vertex (4, 0) is inside.
+    raw = [(float(x), x - 5.0) for x in range(6)] + [(4.0 - x, float(x) + 1.0) for x in range(5)]
+    original = [(0.0, -5.0), (4.0, 0.0), (0.0, 5.0)]
+    default = place_corners(raw, [5], [0, 5, 10], (raw, raw), original, False, 1.0)
+    assert default[5] == (4.0, 0.0)
+    strict = place_corners(raw, [5], [0, 5, 10], (raw, raw), original, False, 1.0, outward_snap=True)
+    assert strict[5] == raw[5]
