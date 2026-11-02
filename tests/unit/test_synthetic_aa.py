@@ -5,6 +5,8 @@ import pytest
 from eval.make_synthetic_dataset import make_dataset
 from eval.synthetic import aa_disc, aa_half_plane, aa_shapes, flat_shapes, solid, supersample
 
+WHITE_PX = (255, 255, 255, 255)
+
 
 def test_supersample_box_filters_each_block():
     def draw(n):
@@ -45,6 +47,11 @@ def test_aa_disc_area_matches_radius():
     coverage = 1.0 - px[..., 0].astype(float) / 255.0
     assert abs(coverage.sum() - np.pi * 40.4**2) <= 0.002 * np.pi * 40.4**2
     assert 0 < ((coverage > 0.02) & (coverage < 0.98)).sum()  # it is anti-aliased
+
+
+def test_supersample_rejects_bad_factor():
+    with pytest.raises(ValueError):
+        supersample(lambda n: solid(n, WHITE_PX), 4, factor=0)
 
 
 def test_aa_shapes_is_box_filtered_flat_shapes():
