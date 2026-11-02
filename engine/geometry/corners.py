@@ -160,6 +160,26 @@ def _coarse_response(angles: np.ndarray, i: int, n: int, closed: bool) -> float:
     return float(np.nanmax(window)) if np.isfinite(window).any() else math.nan
 
 
+def _track_to_fine(fine_angles: np.ndarray, i: int, n: int, closed: bool) -> int:
+    """Index of the strongest fine-scale turn within TRACK_RADIUS of coarse corner i."""
+    idx = np.arange(i - TRACK_RADIUS, i + TRACK_RADIUS + 1)
+    idx = idx % n if closed else idx[(idx > 0) & (idx < n - 1)]
+    window = fine_angles[idx]
+    return int(idx[int(np.nanargmax(window))]) if np.isfinite(window).any() else i
+
+
+def _dedupe_close(found: Sequence[int], fine_angles: np.ndarray, gap: int) -> list[int]:
+    """Sorted unique indices; of two closer than `gap` samples the weaker fine turn is dropped."""
+    out: list[int] = []
+    for i in sorted(set(found)):
+        if out and i - out[-1] < gap:
+            if fine_angles[i] > fine_angles[out[-1]]:
+                out[-1] = i
+            continue
+        out.append(i)
+    return out
+
+
 def find_corners_multiscale(
     raw: Sequence[Point],
     closed: bool,
@@ -170,32 +190,46 @@ def find_corners_multiscale(
 ) -> MultiscaleCorners:
     """Corners that persist from the fine scale up to the coarse scale.
 
-    `raw` is an unsmoothed dense sequence (see `dense_samples`). Candidates are the fine-scale
-    corners (`find_corners` on `raw` smoothed at `fine_sigma`, window `fine_window`). One is kept
-    only if, smoothed at `coarse_sigma` with a window of WINDOW_PER_SIGMA * coarse_sigma samples,
-    the curve still turns by more than `angle_deg` within TRACK_RADIUS samples of it. Real corners
-    keep their turn under heavy smoothing; jitter bumps flatten out. Each kept corner stays at its
-    fine-scale index, so two corners closer than the coarse window (a narrow end) both survive.
+    `raw` is an unsmoothed dense sequence (see `dense_samples`). At the coarse scale (`raw`
+    smoothed at `coarse_sigma`, turning angles over WINDOW_PER_SIGMA * coarse_sigma samples)
+    jitter bumps flatten out while real corners keep their turn. A corner is
+
+    * a coarse-scale corner (a local maximum turning by more than `angle_deg`), tracked down to
+      the strongest fine-scale turn within TRACK_RADIUS samples, or
+    * a fine-scale corner (`find_corners` at `fine_sigma`, window `fine_window`) whose coarse turn
+      within TRACK_RADIUS also exceeds `angle_deg` -- so the two corners of a narrow end, which
+      the coarse scale sees as one, both survive.
+
+    Indices are fine-scale positions; corners closer than `fine_window` collapse into one.
     """
     pts = tuple((float(x), float(y)) for x, y in raw)
     n = len(pts)
-    fine = find_corners(smooth_dense(pts, closed, fine_sigma), closed, angle_deg, fine_window)
     window = max(fine_window, math.ceil(WINDOW_PER_SIGMA * coarse_sigma))
     if closed and n < 2 * window + 1:
         return MultiscaleCorners((), ())  # too short to show a coarse-scale turn
-    angles = np.full(n, math.nan)
-    if n > 1:
-        coarse = np.asarray(smooth_dense(pts, closed, coarse_sigma), np.float64)
-        angles = _turning_angles(coarse, closed, window)
-    kept: list[tuple[int, float]] = []
-    for i in fine:
-        if not closed and i in (0, n - 1):
-            kept.append((i, math.nan))
-            continue
-        response = _coarse_response(angles, i, n, closed)
-        if response > angle_deg:
-            kept.append((i, response))
-    return MultiscaleCorners(tuple(i for i, _ in kept), tuple(a for _, a in kept))
+    fine_pts = smooth_dense(pts, closed, fine_sigma)
+    fine = find_corners(fine_pts, closed, angle_deg, fine_window)
+    ends = [i for i in fine if not closed and i in (0, n - 1)]
+    if n < 3:
+        return MultiscaleCorners(tuple(ends), tuple(math.nan for _ in ends))
+    fine_angles = _turning_angles(np.asarray(fine_pts, np.float64), closed, fine_window)
+    coarse_pts = smooth_dense(pts, closed, coarse_sigma)
+    coarse_angles = _turning_angles(np.asarray(coarse_pts, np.float64), closed, window)
+    tracked = [
+        _track_to_fine(fine_angles, i, n, closed)
+        for i in find_corners(coarse_pts, closed, angle_deg, window)
+        if closed or 0 < i < n - 1
+    ]
+    confirmed = [
+        i for i in fine
+        if i not in ends and _coarse_response(coarse_angles, i, n, closed) > angle_deg
+    ]
+    inner = _dedupe_close(tracked + confirmed, fine_angles, fine_window)
+    corners = sorted(ends + inner)
+    responses = [
+        math.nan if i in ends else _coarse_response(coarse_angles, i, n, closed) for i in corners
+    ]
+    return MultiscaleCorners(tuple(corners), tuple(responses))
 
 
 def smooth_between(
