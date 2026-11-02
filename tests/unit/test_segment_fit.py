@@ -314,3 +314,27 @@ def test_align_joins_wraps_round_a_closed_chain_and_skips_rigid_pairs():
     out = align_joins((a, b), [0])  # the wrap join: b ends where a starts
     assert _turn_deg(np.subtract(out[0].c1, out[0].p0), np.subtract(b.p1, b.p0)) < 1e-9
     assert align_joins((b, c), [1]) == (b, c)
+
+
+# ---------------------------------------------------------------- chain cost against data
+
+
+def test_chain_cost_counts_parameters_and_squared_distances():
+    from engine.geometry.segment_fit import chain_cost
+
+    chain = (Line((0.0, 0.0), (10.0, 0.0)), Line((10.0, 0.0), (10.0, 10.0)))
+    pts = [(2.0, 0.5), (5.0, -0.5), (10.3, 4.0)]
+    cost = chain_cost(chain, pts, PARAMS, noise=0.5)
+    sse = 0.25 + 0.25 + 0.09
+    assert cost == pytest.approx(sse / 0.25 + PARAMS.complexity_weight * 8, abs=1e-3)
+
+
+def test_chain_cost_measures_arcs_and_beziers_by_true_distance():
+    from engine.geometry.segment_fit import chain_cost
+
+    arc = fit_arc(_circle_pts(0.0, 0.0, 10.0, 0.0, math.pi / 2))[0]
+    on_circle = _circle_pts(0.0, 0.0, 10.4, 0.1, 1.4, n=7)
+    expected = 7 * 0.4**2 / 0.25 + PARAMS.complexity_weight * 7
+    assert chain_cost((arc,), on_circle, PARAMS, noise=0.5) == pytest.approx(expected, rel=1e-3)
+    bez = CubicBezier((0.0, 0.0), (3.0, 0.0), (7.0, 0.0), (10.0, 0.0))
+    assert chain_cost((bez,), [(5.0, 1.0)], PARAMS, noise=1.0) == pytest.approx(1.0 + 2 * 8, abs=1e-3)
