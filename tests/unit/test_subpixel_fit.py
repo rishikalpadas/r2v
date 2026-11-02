@@ -319,3 +319,27 @@ def test_no_bezier_loops_at_subpixel_corners_on_jpeg():
     graph = trace(regions)
     ctx = make_edge_context(image, regions)
     assert _corner_loops(fit_geometry(graph, FitParams(), context=ctx)) == 0
+
+
+def test_side_lines_can_accept_an_intersection_behind_the_nearest_samples():
+    from engine.geometry.corner_placement import SideLines, _subpixel_corner
+
+    # The corner sample (index 6) and its neighbours sit 0.6 px past the true corner (6.2, 0.2).
+    raw = [(x + 0.5, 0.2) for x in range(6)] + [(6.2, y + 0.5) for y in range(6)]
+    dense = list(raw)
+    dense[5], dense[6], dense[7] = (6.8, 0.2), (6.8, 0.8), (6.2, -0.4)
+    assert _subpixel_corner(dense, raw, 6, (-1, 12), 1.0) is None
+    lenient = SideLines(allow_behind=True)
+    assert _subpixel_corner(dense, raw, 6, (-1, 12), 1.0, lenient) == pytest.approx((6.2, 0.2))
+
+
+def test_collapse_behind_pulls_overshooting_samples_onto_the_corner():
+    from engine.geometry.corner_placement import collapse_behind
+
+    seq = [(float(x), 0.0) for x in range(10)] + [(10.0, float(y)) for y in range(1, 10)]
+    seq[8] = (10.4, 0.0)  # past the corner at (10, 0) along the run toward it
+    seq[9] = (10.0, 0.0)
+    out = collapse_behind(seq, [9], [0, 9, 18], False, 4)
+    assert out[8] == (10.0, 0.0)
+    assert out[7] == seq[7] and out[10:] == seq[10:]
+    assert collapse_behind(seq, [9], [0, 9, 11], False, 4)[10:] == seq[10:]  # short side: skipped

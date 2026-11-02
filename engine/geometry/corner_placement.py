@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -20,6 +21,24 @@ CORNER_LINE_SAMPLES = 4  # samples per side for each line fit
 CORNER_LINE_GAP = 1  # samples skipped on each side of the corner index
 MIN_CORNER_LINE_SAMPLES = 2
 MIN_CORNER_LINE_ANGLE_DEG = 20.0  # flatter corners make the intersection ill-conditioned
+
+
+@dataclass(frozen=True)
+class SideLines:
+    """How the side lines of a sub-pixel corner are fitted.
+
+    `gap` samples next to the corner are skipped (their pixels blend both sides) and up to
+    `samples` per side are used. With `allow_behind` an intersection behind the smoothed samples
+    next to the corner is accepted; the caller must then pull those samples onto the corner
+    (see `collapse_behind`) or the fitted span doubles back.
+    """
+
+    gap: int = CORNER_LINE_GAP
+    samples: int = CORNER_LINE_SAMPLES
+    allow_behind: bool = False
+
+
+DEFAULT_SIDE_LINES = (SideLines(),)
 
 
 def _snap_corners(
@@ -77,21 +96,28 @@ def _corner_neighbours(corners: Sequence[int], k: int, n: int, closed: bool) -> 
     return prev, nxt
 
 
+def line_intersection(side_a: np.ndarray, side_b: np.ndarray) -> Point | None:
+    """Where total-least-squares lines through two point runs cross (None if near-parallel)."""
+    return _line_intersection(side_a, side_b)
+
+
 def _subpixel_corner(
-    dense: Sequence[Point], raw: Sequence[Point], c: int, neighbours: tuple[int, int], scale: float
+    dense: Sequence[Point], raw: Sequence[Point], c: int, neighbours: tuple[int, int], scale: float,
+    lines: SideLines = SideLines(),
 ) -> Point | None:
     """Intersection of lines fitted to the raw sub-pixel samples on each side of corner `c`.
 
-    Uses up to CORNER_LINE_SAMPLES samples per side, stopping short of the neighbouring corners
-    (and so of an open curve's junction endpoints). None if a side is too short, the lines are
-    near-parallel, the intersection lies behind the samples of either side (the span would have
-    to double back to reach it), or it is farther than CORNER_SNAP_PX from the smoothed corner.
+    Uses up to `lines.samples` samples per side after `lines.gap`, stopping short of the
+    neighbouring corners (and so of an open curve's junction endpoints). None if a side is too
+    short, the lines are near-parallel, the intersection lies behind the samples of either side
+    (the span would have to double back to reach it; see `SideLines.allow_behind`), or it is
+    farther than CORNER_SNAP_PX from the smoothed corner.
     """
     n = len(raw)
     prev, nxt = neighbours
-    reach = CORNER_LINE_GAP + CORNER_LINE_SAMPLES
-    before = range(max(prev + 1, c - reach), c - CORNER_LINE_GAP)
-    after = range(c + CORNER_LINE_GAP + 1, min(nxt, c + reach + 1))
+    reach = lines.gap + lines.samples
+    before = range(max(prev + 1, c - reach), c - lines.gap)
+    after = range(c + lines.gap + 1, min(nxt, c + reach + 1))
     if min(len(before), len(after)) < MIN_CORNER_LINE_SAMPLES:
         return None
     side_a = np.asarray([raw[i % n] for i in before], np.float64)
@@ -99,19 +125,23 @@ def _subpixel_corner(
     hit = _line_intersection(side_a, side_b)
     if hit is None:
         return None
+    if _behind(hit, side_a, side_a[-1]) or _behind(hit, side_b[::-1], side_b[0]):
+        return None
     before_corner, after_corner = dense[(c - 1) % n], dense[(c + 1) % n]
-    if _behind(hit, side_a, before_corner) or _behind(hit, side_b[::-1], after_corner):
+    if not lines.allow_behind and (
+        _behind(hit, side_a, before_corner) or _behind(hit, side_b[::-1], after_corner)
+    ):
         return None
     x, y = dense[c]
     return hit if math.hypot(hit[0] - x, hit[1] - y) <= CORNER_SNAP_PX * scale else None
 
 
 def _has_subpixel_samples(
-    raw: Sequence[Point], plain: Sequence[Point], c: int, closed: bool
+    raw: Sequence[Point], plain: Sequence[Point], c: int, closed: bool,
+    reach: int = CORNER_LINE_GAP + CORNER_LINE_SAMPLES,
 ) -> bool:
-    """True when any raw sample within reach of corner `c` was moved off the crack grid."""
+    """True when any raw sample within `reach` of corner `c` was moved off the crack grid."""
     n = len(raw)
-    reach = CORNER_LINE_GAP + CORNER_LINE_SAMPLES
     window = range(c - reach, c + reach + 1)
     if closed:
         return any(raw[i % n] != plain[i % n] for i in window)
@@ -126,25 +156,58 @@ def place_corners(
     original: Sequence[Point],
     closed: bool,
     scale: float,
+    lines: Sequence[SideLines] = DEFAULT_SIDE_LINES,
 ) -> list[Point]:
     """Move each of `corners` (a subset of `all_corners`) from its smoothed sample to the corner.
 
     `samples` is (raw, plain): the unsmoothed sub-pixel samples and their crack-grid originals.
     Near sub-pixel samples the corner is `_subpixel_corner`. Elsewhere, and wherever that finds
     no usable intersection, it is grid-snapped by `_snap_corners` exactly as without sub-pixel
-    input (leaving the smoothed sample would keep the corner rounded in).
+    input (leaving the smoothed sample would keep the corner rounded in). Each entry of `lines`
+    is tried in turn until one gives an intersection.
     """
     raw, plain = samples
     order = list(all_corners)
     hits: dict[int, Point] = {}
     for c in corners:
-        if not _has_subpixel_samples(raw, plain, c, closed):
-            continue
         neighbours = _corner_neighbours(order, order.index(c), len(dense), closed)
-        hit = _subpixel_corner(dense, raw, c, neighbours, scale)
-        if hit is not None:
-            hits[c] = hit
+        for side_lines in lines:
+            if not _has_subpixel_samples(raw, plain, c, closed, side_lines.gap + side_lines.samples):
+                continue
+            hit = _subpixel_corner(dense, raw, c, neighbours, scale, side_lines)
+            if hit is not None:
+                hits[c] = hit
+                break
     out = _snap_corners(dense, [c for c in corners if c not in hits], original, scale)
     for c, hit in hits.items():
         out[c] = hit
+    return out
+
+
+def collapse_behind(
+    seq: Sequence[Point], corners: Sequence[int], all_corners: Sequence[int], closed: bool,
+    reach: int,
+) -> list[Point]:
+    """Pull samples next to each of `corners` that lie past it onto the corner.
+
+    `corners` is a subset of `all_corners` (an open curve's end points must not be in it). A
+    sample within `reach` of corner c is past it when it is ahead of c along the direction from
+    the sample `reach` away on its side toward c; it becomes a duplicate of the corner, which
+    the fitters drop, so the span does not double back.
+    """
+    out = list(seq)
+    n = len(out)
+    order = list(all_corners)
+    for c in corners:
+        neighbours = _corner_neighbours(order, order.index(c), n, closed)
+        corner = np.asarray(out[c])
+        for step, limit in zip((-1, 1), neighbours):
+            far = c + step * reach
+            if (limit - far) * step <= 0:
+                continue  # the run to the next corner is too short to give a direction
+            direction = corner - np.asarray(out[far % n])
+            for i in range(c + step, far, step):
+                if (np.asarray(out[i % n]) - corner) @ direction <= 0.0:
+                    break
+                out[i % n] = out[c]
     return out
