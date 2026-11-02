@@ -66,3 +66,51 @@ def test_dataset_writes_aa_logos(tmp_path):
     files = sorted(p.name for p in (root / "aa_logos").glob("*.png"))
     assert "aa_disc.png" in files and "aa_shapes_00.png" in files
     assert len(files) == 6
+
+
+# ---------------------------------------------------------------- noisy variants
+
+
+def test_add_noise_is_seeded_and_keeps_alpha():
+    from eval.synthetic import add_noise
+
+    px = aa_disc()
+    a, b = add_noise(px, 6.0, seed=3), add_noise(px, 6.0, seed=3)
+    np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(a[..., 3], px[..., 3])
+    diff = a[..., :3].astype(float) - px[..., :3]
+    assert 4.0 < diff[16:112, 16:112].std() < 8.0  # interior away from clipped white
+    assert not np.array_equal(add_noise(px, 6.0, seed=4), a)
+    np.testing.assert_array_equal(add_noise(px, 0.0, seed=3), px)
+
+
+def test_jpeg_roundtrip_is_lossy_opaque_rgba():
+    from eval.synthetic import jpeg_roundtrip
+
+    px = aa_disc()
+    out = jpeg_roundtrip(px, quality=50)
+    assert out.shape == px.shape and out.dtype == np.uint8
+    assert (out[..., 3] == 255).all()
+    assert not np.array_equal(out, px)
+    assert np.abs(out[..., :3].astype(int) - px[..., :3]).mean() < 4.0
+
+
+def test_aa_polygon_area_matches_shoelace():
+    from eval.synthetic import aa_polygon
+
+    verts = ((20.3, 30.1), (100.2, 22.7), (90.6, 95.4), (30.5, 80.2))
+    px = aa_polygon(verts, size=128, fg=(0, 0, 0, 255), bg=WHITE_PX)
+    coverage = 1.0 - px[..., 0].astype(float) / 255.0
+    x, y = np.array(verts).T
+    area = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    assert coverage.sum() == pytest.approx(area, rel=0.005)
+
+
+def test_aa_mask_draws_any_predicate():
+    from eval.synthetic import aa_mask
+
+    px = aa_mask(lambda x, y: x < 10.25, size=16, fg=(0, 0, 0, 255), bg=WHITE_PX)
+    coverage = 1.0 - px[3, :, 0].astype(float) / 255.0
+    np.testing.assert_allclose(coverage[:10], 1.0)
+    assert coverage[10] == pytest.approx(0.25, abs=0.01)
+    np.testing.assert_allclose(coverage[11:], 0.0)
