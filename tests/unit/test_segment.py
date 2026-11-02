@@ -14,7 +14,11 @@ from engine.stages.segment import (
     _merge_small_components,
     segment,
 )
-from engine.stages.segment_palette import _complete_linkage_groups, _drop_blend_clusters
+from engine.stages.segment_palette import (
+    _complete_linkage_groups,
+    _drop_blend_clusters,
+    _merge_intermixed,
+)
 from engine.types import TRANSPARENT, RasterImage
 from eval.synthetic import _circle_mask, flat_shapes, solid, supersample, transparent_logo
 
@@ -438,3 +442,48 @@ def test_noisy_diagonal_hairline_attached_to_solid_block_survives():
     rm = segment(_img(_with_ramp_row(px)), SegmentParams())
     colour = rm.palette_rgb[rm.labels]
     assert all((colour[y, x] == (200, 30, 90)).all() for y, x in line)
+
+
+OUTLINE_WHITE = (252, 252, 253)
+
+
+def _outlined_disc(pink: tuple[int, int, int], width: int, quality: int | None) -> np.ndarray:
+    """Pink disc with a thin white outline on a dark page, 4x supersampled, +-3 noise."""
+    factor, size = 4, 200
+    yy, xx = np.mgrid[0:size * factor, 0:size * factor] / factor
+    r = np.hypot(yy - 100, xx - 100)
+    hi = np.empty((size * factor, size * factor, 3))
+    hi[:] = (60, 40, 80)
+    hi[r < 70 + width] = OUTLINE_WHITE
+    hi[r < 70] = pink
+    rgb = np.rint(hi.reshape(size, factor, size, factor, 3).mean((1, 3)))
+    return _noisy(rgb, 3, quality)
+
+
+# JPEG q85 smears a 2-3 px white ring (chroma subsampling) before clustering: its colour lands
+# > dE 3 from the source before any re-merge (commit 0bf95b3) too, so q85 checks 4 px only.
+OUTLINE_CASES = [(w, None) for w in (2, 3, 4)] + [(4, 85)]
+
+
+@pytest.mark.parametrize("pink", [(251, 238, 241), (250, 232, 236)])  # dE 6.5 / 8.7 from white
+@pytest.mark.parametrize(("width", "quality"), OUTLINE_CASES)
+def test_thin_outline_next_to_near_colour_stays_distinct(width, quality, pink):
+    rm = segment(_img(_outlined_disc(pink, width, quality)), SegmentParams())
+    palette = np.unique(rm.palette_rgb, axis=0)
+    white = min(range(len(palette)), key=lambda i: _de(OUTLINE_WHITE, palette[i]))
+    near_pink = min(range(len(palette)), key=lambda i: _de(pink, palette[i]))
+    assert white != near_pink, palette.tolist()
+    assert _de(OUTLINE_WHITE, palette[white]) < 3 and _de(pink, palette[near_pink]) < 3
+
+
+def test_intermixed_merge_uses_max_linkage_on_original_colours():
+    # Pixel-interleaved greys: A-B and B-C under the bound (4 x 5 = 20 dE), A-C over it.
+    palette = np.array([[90] * 3, [125] * 3, [160] * 3], np.uint8)
+    assert _de(palette[0], palette[1]) < 20 and _de(palette[1], palette[2]) < 20
+    assert _de(palette[0], palette[2]) > 20
+    yy, xx = np.mgrid[0:40, 0:80]
+    checker = (xx + yy) % 2 == 0
+    labels = np.where(checker, 1, np.where(xx < 40, 0, 2)).astype(np.int32)  # A/B | B/C
+    cluster, merged = _merge_intermixed(np.arange(3), palette, lambda c: c[labels], 5.0)
+    assert len(merged) == 2  # A+B (or B+C) merge; the merged mean must not then absorb C
+    assert cluster[0] != cluster[2]
