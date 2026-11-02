@@ -17,6 +17,7 @@ from engine.stages.segment import (
 from engine.stages.segment_palette import (
     _complete_linkage_groups,
     _drop_blend_clusters,
+    _core_share,
     _merge_intermixed,
 )
 from engine.types import TRANSPARENT, RasterImage
@@ -477,13 +478,87 @@ def test_thin_outline_next_to_near_colour_stays_distinct(width, quality, pink):
 
 
 def test_intermixed_merge_uses_max_linkage_on_original_colours():
-    # Pixel-interleaved greys: A-B and B-C under the bound (4 x 5 = 20 dE), A-C over it.
-    palette = np.array([[90] * 3, [125] * 3, [160] * 3], np.uint8)
+    # Pixel-interleaved noisy greys: A-B and B-C under the bound (4 x 5 = 20 dE), A-C over it.
+    centres = np.array([90, 125, 160])
+    palette = np.repeat(centres[:, None], 3, axis=1).astype(np.uint8)
     assert _de(palette[0], palette[1]) < 20 and _de(palette[1], palette[2]) < 20
     assert _de(palette[0], palette[2]) > 20
+    offsets = np.arange(-15, 16)
+    colors = np.repeat((centres[:, None] + offsets).ravel()[:, None], 3, axis=1).astype(np.uint8)
+    colour_cluster = np.repeat(np.arange(3), len(offsets))
     yy, xx = np.mgrid[0:40, 0:80]
-    checker = (xx + yy) % 2 == 0
-    labels = np.where(checker, 1, np.where(xx < 40, 0, 2)).astype(np.int32)  # A/B | B/C
-    cluster, merged = _merge_intermixed(np.arange(3), palette, lambda c: c[labels], 5.0)
+    region = np.where((xx + yy) % 2 == 0, 1, np.where(xx < 40, 0, 2))  # A/B | B/C checker
+    rng = np.random.default_rng(0)
+    pixel_colour = region * len(offsets) + rng.integers(0, len(offsets), region.shape)
+    counts = np.bincount(pixel_colour.ravel(), minlength=len(colors))
+    cluster, merged = _merge_intermixed(
+        colour_cluster, palette, colors, counts, lambda c: c[pixel_colour], 5.0
+    )
     assert len(merged) == 2  # A+B (or B+C) merge; the merged mean must not then absorb C
-    assert cluster[0] != cluster[2]
+    assert cluster[0] != cluster[-1]
+
+
+PATTERN_A = (70, 120, 200)
+
+
+def _pattern_partner(target_de: float) -> tuple[int, int, int]:
+    """Lighter blue at about `target_de` from PATTERN_A."""
+    a, light = np.array(PATTERN_A, float), np.array([200, 220, 245], float)
+    for t in np.linspace(0, 1, 400):
+        c = tuple(int(v) for v in np.rint(a + t * (light - a)))
+        if _de(PATTERN_A, c) >= target_de:
+            return c
+    raise AssertionError("no partner colour")
+
+
+def _pattern(kind: str, n: int = 160) -> np.ndarray:
+    yy, xx = np.mgrid[0:n, 0:n]
+    if kind == "stripes3":
+        return (xx // 3) % 2 == 1
+    if kind == "checker6":
+        return ((xx // 6) + (yy // 6)) % 2 == 1
+    return ((xx % 10) < 5) & ((yy % 10) < 5)  # dots5/p10
+
+
+@pytest.mark.parametrize("quality", [None, 85])
+@pytest.mark.parametrize("target_de", [12, 19])
+@pytest.mark.parametrize("kind", ["stripes3", "checker6", "dots5"])
+def test_real_two_colour_pattern_is_not_remerged(kind, target_de, quality):
+    b = _pattern_partner(target_de)
+    rgb = np.full((200, 200, 3), 250)
+    rgb[20:180, 20:180] = np.where(_pattern(kind)[..., None], b, PATTERN_A)
+    rm = segment(_img(_noisy(rgb, 3, quality)), SegmentParams())
+    palette = np.unique(rm.palette_rgb, axis=0)
+    ia = min(range(len(palette)), key=lambda i: _de(PATTERN_A, palette[i]))
+    ib = min(range(len(palette)), key=lambda i: _de(b, palette[i]))
+    assert ia != ib, palette.tolist()
+    assert _de(PATTERN_A, palette[ia]) < 3 and _de(b, palette[ib]) < 3, palette.tolist()
+
+
+@pytest.mark.parametrize("pink", [(251, 238, 241), (250, 235, 238)])  # dE 6.5 / 7.4 from white
+def test_thin_frame_along_canvas_edge_stays_distinct(pink):
+    factor, size, width = 4, 200, 2
+    yy, xx = np.mgrid[0:size * factor, 0:size * factor] / factor
+    hi = np.empty((size * factor, size * factor, 3))
+    hi[:] = OUTLINE_WHITE
+    inner = (yy >= width) & (yy < size - width) & (xx >= width) & (xx < size - width)
+    hi[inner] = pink
+    hi[np.hypot(yy - 100, xx - 100) < 40] = (60, 40, 80)
+    rgb = np.rint(hi.reshape(size, factor, size, factor, 3).mean((1, 3)))
+    rm = segment(_img(_noisy(rgb, 3, 85)), SegmentParams())
+    palette = np.unique(rm.palette_rgb, axis=0)
+    white = min(range(len(palette)), key=lambda i: _de(OUTLINE_WHITE, palette[i]))
+    near_pink = min(range(len(palette)), key=lambda i: _de(pink, palette[i]))
+    assert white != near_pink, palette.tolist()
+    assert _de(OUTLINE_WHITE, palette[white]) < 3 and _de(pink, palette[near_pink]) < 3
+
+
+def test_band_along_canvas_edge_has_no_core():
+    labels = np.ones((60, 60), np.int32)
+    labels[:2, :] = 0  # 2-px band along the top canvas edge
+    labels[:, :2] = 0
+    band_core, rest_core = _core_share(labels, 0, 1)
+    assert band_core == 0.0 and rest_core > 0.5
+    noise = (np.add.outer(np.arange(60), np.arange(60)) % 2).astype(np.int32)
+    a, b = _core_share(noise, 0, 1)
+    assert a > 0.5 and abs(a - b) < 0.05  # interleaved halves reach the core equally

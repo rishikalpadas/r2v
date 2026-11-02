@@ -22,14 +22,18 @@ KMEANS_N_INIT = 4
 # the core of the union. Measured: noise splits share >= 0.85 4-neighbour edges per pixel of
 # the smaller half and its sparser half has interior <= 0.29; real near colours on a JPEG logo
 # <= 0.39 edges/px and interior >= 0.54; a 2-4 px outline beside a near colour shares 0.8
-# edges/px with interior 0.05, but has no pixel REMERGE_CORE_RADIUS px inside the union,
-# while noise halves have ~0.96 there. A +-10 noise cloud spans dE ~15, so the colour bound
+# edges/px with interior 0.05, but has no pixel REMERGE_CORE_RADIUS px inside the union, while
+# a noise half reaches the core as often as its partner (share ratio ~1; outline ratio 0). A +-10 noise cloud spans dE ~15, so the colour bound
 # (max linkage over the original colours, so merged groups cannot chain) is 4 x merge_delta_e.
 REMERGE_MIN_SHARED_EDGES = 0.5
 REMERGE_MAX_INTERIOR = 0.5
 REMERGE_CORE_RADIUS = 4
-REMERGE_MIN_CORE_SHARE = 0.5
+REMERGE_MIN_CORE_RATIO = 0.5
 REMERGE_DELTA_E_FACTOR = 4.0
+# Noise-split halves overlap: their centroid gap is about their own spread. Measured centroid
+# dE / pooled RMS within-cluster dE: noise splits 1.5-2.5 (page splits under JPEG up to 4.1);
+# real two-colour patterns (stripes, checkers, dots at dE 9-19, raw and JPEG q85) >= 5.9.
+REMERGE_MAX_SEPARATION = 5.0
 
 
 def _to_lab(rgb: np.ndarray) -> np.ndarray:
@@ -176,29 +180,54 @@ def _shared_edges(labels: np.ndarray, n: int) -> np.ndarray:
     return edges + edges.T
 
 
-def _core_share(labels: np.ndarray, small: int, other: int) -> float:
-    """Share of `small`'s pixels lying REMERGE_CORE_RADIUS px inside the union with `other`.
+def _core_share(labels: np.ndarray, small: int, other: int) -> tuple[float, float]:
+    """Shares of `small`'s and `other`'s pixels lying REMERGE_CORE_RADIUS px inside their union.
 
-    Pin holes left by further noise splits are closed first, so a noise half spread over an
-    area scores ~1, while a thin band along the union's border scores ~0.
+    Pin holes left by further noise splits are closed first. Outside the canvas is not part
+    of the union, so a band along the canvas edge has no core either.
     """
-    union = ndimage.binary_closing((labels == small) | (labels == other), np.ones((3, 3), bool),
-                                   border_value=1)
+    union = (labels == small) | (labels == other)
+    union = ndimage.binary_closing(union, np.ones((3, 3), bool), border_value=0)
     size = 2 * REMERGE_CORE_RADIUS + 1
-    core = ndimage.binary_erosion(union, np.ones((size, size), bool), border_value=1)
-    own = labels == small
-    return float((core & own).sum()) / max(int(own.sum()), 1)
+    core = ndimage.binary_erosion(union, np.ones((size, size), bool), border_value=0)
+    shares = []
+    for c in (small, other):
+        own = labels == c
+        shares.append(float((core & own).sum()) / max(int(own.sum()), 1))
+    return shares[0], shares[1]
+
+
+def _spread(colors_lab: np.ndarray, weights: np.ndarray, cluster: np.ndarray,
+            palette_lab: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per cluster: pixel count and RMS dE2000 of its pixels to its own palette colour."""
+    n = len(palette_lab)
+    d2 = deltaE_ciede2000(colors_lab, palette_lab[cluster]) ** 2
+    count = np.bincount(cluster, weights, n)
+    msq = np.bincount(cluster, weights * d2, n) / np.maximum(count, 1)
+    return count, msq
+
+
+def _separation(palette_lab: np.ndarray, count: np.ndarray, msq: np.ndarray, i: int, j: int
+                ) -> float:
+    """Centroid dE2000 of clusters i, j over their pooled RMS within-cluster spread."""
+    pooled = np.sqrt((count[i] * msq[i] + count[j] * msq[j]) / max(count[i] + count[j], 1))
+    return float(deltaE_ciede2000(palette_lab[i], palette_lab[j])) / max(float(pooled), 1e-6)
 
 
 def _closest_co_located_pair(
-    labels: np.ndarray, area: np.ndarray, candidate: np.ndarray, link: np.ndarray
+    labels: np.ndarray, area: np.ndarray, candidate: np.ndarray, link: np.ndarray,
+    separable: Callable[[int, int], bool],
 ) -> tuple[int, int] | None:
-    """Closest candidate pair (i < j) whose smaller cluster is spread through their union."""
+    """Closest candidate pair (i < j) whose colours overlap (not `separable`) and whose smaller
+    cluster is spread through their union."""
     ii, jj = np.nonzero(np.triu(candidate, 1))
     for k in np.argsort(link[ii, jj], kind="stable"):
         i, j = int(ii[k]), int(jj[k])
+        if separable(i, j):
+            continue
         small, other = (i, j) if area[i] <= area[j] else (j, i)
-        if _core_share(labels, small, other) >= REMERGE_MIN_CORE_SHARE:
+        small_core, other_core = _core_share(labels, small, other)
+        if other_core > 0 and small_core >= REMERGE_MIN_CORE_RATIO * other_core:
             return i, j
     return None
 
@@ -206,6 +235,8 @@ def _closest_co_located_pair(
 def _merge_intermixed(
     cluster: np.ndarray,
     palette: np.ndarray,
+    colors: np.ndarray,
+    counts: np.ndarray,
     labels_of: Callable[[np.ndarray], np.ndarray],
     delta_e: float,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -213,12 +244,16 @@ def _merge_intermixed(
 
     Greedy: merge the closest pair whose original colours are all within
     REMERGE_DELTA_E_FACTOR * delta_e (max linkage), that shares many edges relative to the
-    smaller cluster's area, where one has little solid interior, and whose smaller cluster
+    smaller cluster's area, where one has little solid interior, whose pixel colours overlap
+    (centroid gap <= REMERGE_MAX_SEPARATION x pooled spread), and whose smaller cluster
     reaches the core of their union (not only one border); repeat. The merged
     colour is the area-weighted mean; unmerged colours are unchanged.
+    `colors`/`counts`: the unique pixel colours `cluster` indexes, with pixel counts.
     `labels_of(cluster)` builds the label map. Returns (cluster ids, palette).
     """
     palette = palette.copy()
+    colors_lab = _to_lab(colors)
+    weights = counts.astype(np.float64)
     lab = _to_lab(palette)
     link = deltaE_ciede2000(lab[:, None, :], lab[None, :, :])  # max over original members
     np.fill_diagonal(link, np.inf)
@@ -234,7 +269,13 @@ def _merge_intermixed(
             & (mixed >= REMERGE_MIN_SHARED_EDGES)
             & (np.minimum.outer(interior, interior) < REMERGE_MAX_INTERIOR)
         )
-        pair = _closest_co_located_pair(labels, area, candidate, link)
+        palette_lab = _to_lab(palette)
+        count, msq = _spread(colors_lab, weights, cluster, palette_lab)
+
+        def separable(i: int, j: int) -> bool:
+            return _separation(palette_lab, count, msq, i, j) > REMERGE_MAX_SEPARATION
+
+        pair = _closest_co_located_pair(labels, area, candidate, link, separable)
         if pair is None:
             break
         i, j = pair

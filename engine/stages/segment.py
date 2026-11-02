@@ -235,7 +235,9 @@ def segment(image: RasterImage, params: SegmentParams) -> RegionMap:
         per_cluster = np.bincount(cluster[pixel_colors], minlength=len(palette))
         cluster, palette = _drop_blend_clusters(cluster, palette, per_cluster, labels)
     if noisy:
-        cluster, palette = _merge_intermixed(cluster, palette, labels_of, params.merge_delta_e)
+        cluster, palette = _merge_intermixed(
+            cluster, palette, colors, counts, labels_of, params.merge_delta_e
+        )
     labels = labels_of(cluster)
     labels = _majority_cleanup(labels, palette, noisy)
 
