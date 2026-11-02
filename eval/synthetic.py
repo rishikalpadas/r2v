@@ -196,3 +196,63 @@ def aa_half_plane(
         return px
 
     return supersample(draw, size, HALF_PLANE_FACTOR)
+
+
+def aa_mask(
+    inside: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    size: int = 128,
+    fg: tuple[int, int, int, int] = (220, 40, 40, 255),
+    bg: tuple[int, int, int, int] = (255, 255, 255, 255),
+    factor: int = AA_FACTOR,
+) -> np.ndarray:
+    """Anti-aliased `fg` shape on `bg`: `inside(x, y)` is evaluated in output-pixel coordinates."""
+
+    def draw(n: int) -> np.ndarray:
+        k = n / size
+        xs, ys = _grid(n)
+        px = solid(n, bg)
+        px[inside(xs / k, ys / k)] = fg
+        return px
+
+    return supersample(draw, size, factor)
+
+
+def _polygon_inside(vertices: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    """Even-odd point-in-polygon test."""
+    inside = np.zeros(xs.shape, bool)
+    for (x0, y0), (x1, y1) in zip(vertices, np.roll(vertices, -1, axis=0)):
+        if y0 == y1:
+            continue
+        crosses = (y0 > ys) != (y1 > ys)
+        x_at = x0 + (ys - y0) * (x1 - x0) / (y1 - y0)
+        inside ^= crosses & (xs < x_at)
+    return inside
+
+
+def aa_polygon(
+    vertices: tuple[tuple[float, float], ...],
+    size: int = 128,
+    fg: tuple[int, int, int, int] = (220, 40, 40, 255),
+    bg: tuple[int, int, int, int] = (255, 255, 255, 255),
+    factor: int = AA_FACTOR,
+) -> np.ndarray:
+    """Anti-aliased simple polygon with sub-pixel vertices."""
+    verts = np.asarray(vertices, np.float64)
+    return aa_mask(lambda x, y: _polygon_inside(verts, x, y), size, fg, bg, factor)
+
+
+def add_noise(pixels: np.ndarray, sigma: float, seed: int = 0) -> np.ndarray:
+    """Gaussian noise (std `sigma`, 8-bit units) added to RGB and clipped; alpha unchanged."""
+    rng = np.random.default_rng(seed)
+    out = pixels.copy()
+    noisy = pixels[..., :3] + rng.normal(0.0, sigma, pixels[..., :3].shape)
+    out[..., :3] = np.clip(np.rint(noisy), 0, 255).astype(np.uint8)
+    return out
+
+
+def jpeg_roundtrip(pixels: np.ndarray, quality: int = 75) -> np.ndarray:
+    """Encode the RGB channels as JPEG and decode again (opaque RGBA)."""
+    buf = io.BytesIO()
+    Image.fromarray(pixels[..., :3], "RGB").save(buf, format="JPEG", quality=quality)
+    buf.seek(0)
+    return np.asarray(Image.open(buf).convert("RGBA")).copy()
