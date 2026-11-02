@@ -14,7 +14,15 @@ from engine.stages.segment import _to_lab, segment
 from engine.stages.trace import trace
 from engine.types import OUTSIDE, Arc, Circle, CubicBezier, Line, RasterImage, Rect, RegionMap
 from eval.metrics import count_nodes
-from eval.synthetic import aa_disc, flat_shapes, ring_in_ring, solid, supersample, transparent_logo
+from eval.synthetic import (
+    aa_disc,
+    aa_shapes,
+    flat_shapes,
+    ring_in_ring,
+    solid,
+    supersample,
+    transparent_logo,
+)
 
 WHITE = (255, 255, 255, 255)
 BLUE = (30, 60, 200, 255)
@@ -250,3 +258,64 @@ def test_subpixel_corner_needs_samples_on_both_sides_and_a_near_hit():
     assert _subpixel_corner(dense, raw, 6, (5, 12), 1.0) is None  # no samples before
     far = [(p[0] + 3.0, p[1]) for p in dense]  # smoothed corner 3 px away from the hit
     assert _subpixel_corner(far, raw, 6, (-1, 12), 1.0) is None
+
+
+def _aa_boxes(boxes, size=48):
+    def draw(n):
+        k = n / size
+        c = (np.arange(n) + 0.5) / k
+        px = solid(n, WHITE)
+        for x0, y0, x1, y1 in boxes:
+            px[((c >= y0) & (c < y1))[:, None] & ((c >= x0) & (c < x1))[None, :]] = BLUE
+        return px
+
+    return supersample(draw, size, factor=16)
+
+
+def test_corner_without_subpixel_intersection_falls_back_to_grid_snap():
+    # A 3.4 px wide stub on a rect: its top corners have too few samples per side for the line
+    # fits. They must snap to the crack-grid vertex (0.5 px off), not stay rounded in (0.82).
+    stub = (20.3, 14.6, 23.7, 20.6)
+    pixels = _aa_boxes([(10.3, 20.6, 40.7, 40.2), stub])
+    graph, fitted = _fit(pixels, _ideal_regions(pixels, (WHITE, BLUE)))
+    (shape,) = _inner_closed(graph, fitted)
+    ends = np.array([s.p0 for s in shape.segments])
+    for corner in ((stub[0], stub[1]), (stub[2], stub[1])):
+        assert np.hypot(*(ends - corner).T).min() <= 0.5 + 1e-6, corner
+
+
+def test_subpixel_corner_rejects_intersection_behind_the_side_samples():
+    from engine.stages.fit_geometry import _subpixel_corner
+
+    # Side A runs +x and ends at x = 3.5; side B is the line x = 2, which meets A behind it.
+    raw = [(x + 0.5, 0.0) for x in range(5)] + [(2.0, y + 0.5) for y in range(1, 7)]
+    dense = [(2.5, 0.5)] * len(raw)  # the hit (2, 0) is within the snap distance
+    assert _subpixel_corner(dense, raw, 5, (-1, 11), 1.0) is None
+
+
+def _corner_loops(fitted, tolerance=FitParams().tolerance_px, max_chord=3.0) -> int:
+    """Short Beziers with a control point projecting past their chord: a loop at a corner."""
+    count = 0
+    for f in fitted:
+        for s in f.segments:
+            if not isinstance(s, CubicBezier):
+                continue
+            p0, chord = np.array(s.p0), np.array(s.p1) - np.array(s.p0)
+            length = float(np.hypot(*chord))
+            if length == 0 or length > max_chord:
+                continue
+            proj = [float((np.array(c) - p0) @ chord) / length for c in (s.c1, s.c2)]
+            count += sum(p < -tolerance or p > length + tolerance for p in proj)
+    return count
+
+
+def test_no_bezier_loops_at_subpixel_corners_on_jpeg():
+    # Noisy JPEG samples can put a line intersection behind the smoothed sample next to the
+    # corner; the span then has to double back and the Bezier loops.
+    from engine.loader import load_image
+
+    image = load_image(_jpeg(aa_shapes(28), quality=50))
+    regions = segment(image, SegmentParams())
+    graph = trace(regions)
+    ctx = make_edge_context(image, regions)
+    assert _corner_loops(fit_geometry(graph, FitParams(), context=ctx)) == 0

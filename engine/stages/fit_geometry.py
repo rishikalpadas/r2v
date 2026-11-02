@@ -107,6 +107,17 @@ def _line_intersection(side_a: np.ndarray, side_b: np.ndarray) -> Point | None:
     return float(pa[0] + s * da[0]), float(pa[1] + s * da[1])
 
 
+def _behind(hit: Point, run: np.ndarray, nearest: Point) -> bool:
+    """True when `hit` is not ahead of `run`'s last point or of `nearest` along the run.
+
+    `run` is ordered toward the corner; `nearest` is the smoothed sample next to the corner on
+    that side, which the fitted span also has to pass through before reaching the corner.
+    """
+    direction = run[-1] - run[0]
+    h = np.asarray(hit)
+    return bool((h - run[-1]) @ direction < 0.0 or (h - np.asarray(nearest)) @ direction < 0.0)
+
+
 def _corner_neighbours(corners: Sequence[int], k: int, n: int, closed: bool) -> tuple[int, int]:
     """Indices of the corners before and after corners[k], unwrapped around a closed ring."""
     if not closed:
@@ -123,7 +134,8 @@ def _subpixel_corner(
 
     Uses up to CORNER_LINE_SAMPLES samples per side, stopping short of the neighbouring corners
     (and so of an open curve's junction endpoints). None if a side is too short, the lines are
-    near-parallel, or the intersection is farther than CORNER_SNAP_PX from the smoothed corner.
+    near-parallel, the intersection lies behind the samples of either side (the span would have
+    to double back to reach it), or it is farther than CORNER_SNAP_PX from the smoothed corner.
     """
     n = len(raw)
     prev, nxt = neighbours
@@ -136,6 +148,9 @@ def _subpixel_corner(
     side_b = np.asarray([raw[i % n] for i in after], np.float64)
     hit = _line_intersection(side_a, side_b)
     if hit is None:
+        return None
+    before_corner, after_corner = dense[(c - 1) % n], dense[(c + 1) % n]
+    if _behind(hit, side_a, before_corner) or _behind(hit, side_b[::-1], after_corner):
         return None
     x, y = dense[c]
     return hit if math.hypot(hit[0] - x, hit[1] - y) <= CORNER_SNAP_PX * scale else None
@@ -165,20 +180,23 @@ def _place_corners(
     """Move each of `corners` (a subset of `all_corners`) from its smoothed sample to the corner.
 
     `samples` is (raw, plain): the unsmoothed sub-pixel samples and their crack-grid originals.
-    Near sub-pixel samples the corner is `_subpixel_corner`; elsewhere it is grid-snapped by
-    `_snap_corners` exactly as without sub-pixel input.
+    Near sub-pixel samples the corner is `_subpixel_corner`. Elsewhere, and wherever that finds
+    no usable intersection, it is grid-snapped by `_snap_corners` exactly as without sub-pixel
+    input (leaving the smoothed sample would keep the corner rounded in).
     """
     raw, plain = samples
-    on_grid = [c for c in corners if not _has_subpixel_samples(raw, plain, c, closed)]
-    out = _snap_corners(dense, on_grid, original, scale)
     order = list(all_corners)
+    hits: dict[int, Point] = {}
     for c in corners:
-        if c in on_grid:
+        if not _has_subpixel_samples(raw, plain, c, closed):
             continue
         neighbours = _corner_neighbours(order, order.index(c), len(dense), closed)
         hit = _subpixel_corner(dense, raw, c, neighbours, scale)
         if hit is not None:
-            out[c] = hit
+            hits[c] = hit
+    out = _snap_corners(dense, [c for c in corners if c not in hits], original, scale)
+    for c, hit in hits.items():
+        out[c] = hit
     return out
 
 
