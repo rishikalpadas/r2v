@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from engine.geometry.corners import find_corners, smooth_polyline
+from engine.geometry.corners import dense_samples, find_corners, smooth_dense, smooth_polyline
 from engine.geometry.stitching import build_boundary_graph
 from engine.presets import SegmentParams
 from engine.stages.segment import segment
@@ -90,3 +90,28 @@ def test_degenerate_inputs():
     assert find_corners(((0.0, 0.0),), closed=False) == (0,)
     with pytest.raises(ValueError):
         smooth_polyline(((0.0, 0.0), (1.0, 0.0)), closed=False, sigma=-1.0)
+
+
+def test_dense_samples_layout():
+    open_pts = ((0.0, 0.0), (2.0, 0.0), (2.0, 1.0))
+    assert dense_samples(open_pts, closed=False) == (
+        (0.0, 0.0), (0.5, 0.0), (1.5, 0.0), (2.0, 0.5), (2.0, 1.0)
+    )
+    square = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0))
+    assert dense_samples(square, closed=True) == ((0.5, 0.0), (1.0, 0.5), (0.5, 1.0), (0.0, 0.5))
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_smooth_polyline_composes_dense_and_smooth(closed):
+    pts = ((0.0, 0.0), (6.0, 0.0), (6.0, 3.0), (2.0, 5.0), (0.0, 0.0))
+    for sigma in (0.0, 1.0, 2.5):
+        expected = smooth_dense(dense_samples(pts, closed), closed, sigma)
+        assert smooth_polyline(pts, closed, sigma) == expected
+
+
+def test_smooth_dense_keeps_open_endpoints_and_rejects_negative_sigma():
+    dense = ((0.0, 0.0), (0.5, 0.3), (1.5, -0.2), (2.0, 0.0))
+    out = smooth_dense(dense, closed=False, sigma=1.0)
+    assert out[0] == dense[0] and out[-1] == dense[-1]
+    with pytest.raises(ValueError):
+        smooth_dense(dense, closed=False, sigma=-0.5)

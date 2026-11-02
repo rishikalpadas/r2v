@@ -12,7 +12,7 @@ from PIL import Image
 from eval.baselines import RUNNERS
 from eval.metrics import count_nodes, edge_f1, mean_delta_e, render_svg, ssim
 
-CATEGORIES = ("logos", "line_art", "scans", "photos", "degraded")
+CATEGORIES = ("logos", "aa_logos", "line_art", "scans", "photos", "degraded")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".gif"}
 COLUMNS = ["category", "image", "engine", "status", "ssim", "delta_e",
            "edge_f1", "nodes", "paths", "runtime_s"]

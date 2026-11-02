@@ -1,7 +1,14 @@
-"""Deterministic, non-anti-aliased synthetic test images (HxWx4 uint8)."""
+"""Deterministic synthetic test images (HxWx4 uint8).
+
+The plain generators are non-anti-aliased (every pixel is exactly one palette color). The `aa_*`
+generators draw the same kind of geometry at `factor`x resolution and box-filter it down, so edge
+pixels carry the true sub-pixel edge position as a color (or alpha) blend.
+"""
 from __future__ import annotations
 
 import io
+import math
+from collections.abc import Callable
 
 import numpy as np
 from PIL import Image
@@ -113,3 +120,79 @@ def transparent_logo(size: int = 128) -> np.ndarray:
     px = solid(size, (0, 0, 0, 0))
     px[_circle_mask(size, size / 2, size / 2, size * 0.3)] = (30, 90, 200, 255)
     return px
+
+
+# ---------------------------------------------------------------- anti-aliased images
+
+AA_FACTOR = 8  # default supersampling: coverage resolves to 1/64 of a pixel
+HALF_PLANE_FACTOR = 32  # straight-edge tests need ~0.01 px coverage resolution
+
+
+def supersample(
+    draw_fn: Callable[[int], np.ndarray], size: int, factor: int = AA_FACTOR
+) -> np.ndarray:
+    """Box-filter `draw_fn(size * factor)` (an RGBA image) down to size x size.
+
+    Colors are averaged premultiplied by alpha, so a half-covered pixel over a transparent
+    background keeps the shape color with alpha ~128.
+    """
+    if factor < 1:
+        raise ValueError(f"factor must be >= 1, got {factor}")
+    hi = draw_fn(size * factor).astype(np.float64)
+    alpha = hi[..., 3:4] / 255.0
+    blocks = np.concatenate([hi[..., :3] * alpha, alpha], axis=2)
+    mean = blocks.reshape(size, factor, size, factor, 4).mean(axis=(1, 3))
+    a = mean[..., 3:4]
+    rgb = np.divide(mean[..., :3], a, out=np.zeros_like(mean[..., :3]), where=a > 0)
+    out = np.concatenate([rgb, a * 255.0], axis=2)
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
+def aa_disc(
+    size: int = 128,
+    cx: float = 64.3,
+    cy: float = 63.7,
+    r: float = 40.4,
+    fg: tuple[int, int, int, int] = (220, 40, 40, 255),
+    bg: tuple[int, int, int, int] = (255, 255, 255, 255),
+    factor: int = AA_FACTOR,
+) -> np.ndarray:
+    """Anti-aliased disc at a sub-pixel centre and radius."""
+
+    def draw(n: int) -> np.ndarray:
+        k = n / size
+        px = solid(n, bg)
+        px[_circle_mask(n, cx * k, cy * k, r * k)] = fg
+        return px
+
+    return supersample(draw, size, factor)
+
+
+def aa_shapes(seed: int, size: int = 128, factor: int = AA_FACTOR) -> np.ndarray:
+    """`flat_shapes(seed)` drawn at `factor`x and box-filtered down (same shapes, scaled)."""
+    return supersample(lambda n: flat_shapes(seed, size=n), size, factor)
+
+
+def aa_half_plane(
+    size: int = 32,
+    x0: float = 10.3,
+    angle_deg: float = 0.0,
+    left: tuple[int, int, int, int] = (255, 255, 255, 255),
+    right: tuple[int, int, int, int] = (30, 60, 200, 255),
+) -> np.ndarray:
+    """Straight edge through (x0, size / 2), tilted `angle_deg` from vertical.
+
+    Points with (x - x0) cos(a) - (y - size / 2) sin(a) >= 0 get `right`, the rest `left`; at
+    angle 0 that is the vertical edge x = x0.
+    """
+    t = math.radians(angle_deg)
+
+    def draw(n: int) -> np.ndarray:
+        k = n / size
+        xs, ys = _grid(n)
+        side = (xs / k - x0) * math.cos(t) - (ys / k - size / 2) * math.sin(t) >= 0
+        px = solid(n, left)
+        px[side] = right
+        return px
+
+    return supersample(draw, size, HALF_PLANE_FACTOR)

@@ -6,7 +6,7 @@ Benchmarks the raster-to-vector engine (`ours`) against baselines (`vtracer`, `p
 
 ```
 <dataset>/
-  logos/  line_art/  scans/  photos/  degraded/
+  logos/  aa_logos/  line_art/  scans/  photos/  degraded/
     <name>.png            # input raster
     reference/<name>.svg  # optional Vectorizer.AI output, collected manually
 ```
@@ -20,10 +20,12 @@ outputs are collected by hand and placed in `<category>/reference/<name>.svg`.
 ## Synthetic dataset
 
 ```
-python -m eval.make_synthetic_dataset            # -> eval/dataset_synthetic/logos/ (25 PNGs, 256 px)
+python -m eval.make_synthetic_dataset            # -> eval/dataset_synthetic/{logos,aa_logos}/ (256 px)
 ```
 
-Deterministic: 20 `flat_shapes` (seeds 0-19), 3 circles, `ring_in_ring`, `transparent_logo`.
+Deterministic: `logos/` holds 20 `flat_shapes` (seeds 0-19), 3 circles, `ring_in_ring`,
+`transparent_logo` (no anti-aliasing). `aa_logos/` holds anti-aliased (box-filtered
+supersampled) images: 4 `aa_shapes`, an `aa_disc` and an `aa_disc` on a transparent background.
 
 ## Running
 

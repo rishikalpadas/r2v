@@ -4,10 +4,20 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from eval.synthetic import circle, flat_shapes, ring_in_ring, to_png_bytes, transparent_logo
+from eval.synthetic import (
+    aa_disc,
+    aa_shapes,
+    circle,
+    flat_shapes,
+    ring_in_ring,
+    to_png_bytes,
+    transparent_logo,
+)
 
 SIZE = 256
 N_FLAT = 20
+N_AA = 4
+AA_DATASET_FACTOR = 4  # coarser than the unit-test default: keeps dataset generation fast
 
 
 def make_dataset(root: Path, size: int = SIZE) -> Path:
@@ -21,7 +31,22 @@ def make_dataset(root: Path, size: int = SIZE) -> Path:
     images["transparent_logo.png"] = transparent_logo(size)
     for name, pixels in images.items():
         (logos / name).write_bytes(to_png_bytes(pixels))
+    _write_aa_logos(Path(root) / "aa_logos", size)
     return Path(root)
+
+
+def _write_aa_logos(folder: Path, size: int) -> None:
+    """Anti-aliased counterparts: edge pixels blend their two neighbouring colors."""
+    folder.mkdir(parents=True, exist_ok=True)
+    c = size / 2
+    f = AA_DATASET_FACTOR
+    images = {f"aa_shapes_{seed:02d}.png": aa_shapes(seed, size, f) for seed in range(N_AA)}
+    images["aa_disc.png"] = aa_disc(size, c + 0.3, c - 0.3, size * 0.315, factor=f)
+    images["aa_disc_transparent.png"] = aa_disc(
+        size, c + 0.3, c - 0.3, size * 0.315, fg=(30, 90, 200, 255), bg=(0, 0, 0, 0), factor=f
+    )
+    for name, pixels in images.items():
+        (folder / name).write_bytes(to_png_bytes(pixels))
 
 
 def main(argv: list[str] | None = None) -> None:
