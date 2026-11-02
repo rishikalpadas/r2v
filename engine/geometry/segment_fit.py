@@ -140,9 +140,12 @@ def _model_cost(sse: float, n_params: int, params: FitParams, noise: float | Non
 
 
 def fit_span_scored(
-    points: Sequence[Point], params: FitParams, noise: float | None = None
+    points: Sequence[Point], params: FitParams, noise: float | None = None, tangent_samples: int = 1
 ) -> tuple[tuple[Segment, ...], float]:
-    """The cheapest of line / arc / Bezier chain within tolerance, and its `_model_cost`."""
+    """The cheapest of line / arc / Bezier chain within tolerance, and its `_model_cost`.
+
+    `tangent_samples` is passed to `fit_cubic` for the Bezier chain's end tangents.
+    """
     if len(points) < 2:
         return (), 0.0
     if len(points) == 2:
@@ -160,7 +163,7 @@ def fit_span_scored(
     if arc_fit is not None and _arc_max_error(arc_fit[0], pts) <= tol:
         candidates.append((_model_cost(arc_fit[1], _ARC_PARAMS, params, noise), (arc_fit[0],)))
 
-    chain = fit_cubic(points, tol)
+    chain = fit_cubic(points, tol, tangent_samples)
     sse = float(np.sum(_bezier_distances(chain, pts) ** 2))
     candidates.append((_model_cost(sse, _BEZIER_PARAMS * len(chain), params, noise), tuple(chain)))
     cost, segments = min(candidates, key=lambda c: c[0])
@@ -168,10 +171,10 @@ def fit_span_scored(
 
 
 def fit_span(
-    points: Sequence[Point], params: FitParams, noise: float | None = None
+    points: Sequence[Point], params: FitParams, noise: float | None = None, tangent_samples: int = 1
 ) -> tuple[Segment, ...]:
-    """Pick the cheapest of line / arc / Bezier chain by `_model_cost`."""
-    return fit_span_scored(points, params, noise)[0]
+    """Pick the cheapest of line / arc / Bezier chain by `_model_cost` (see `fit_span_scored`)."""
+    return fit_span_scored(points, params, noise, tangent_samples)[0]
 
 
 _CHAIN_SAMPLES_PER_PX = 10  # chain_cost samples the chain this densely (0.05 px max error)

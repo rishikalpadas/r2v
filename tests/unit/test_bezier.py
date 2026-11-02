@@ -66,3 +66,15 @@ def test_evaluate_public_matches_endpoints_and_midpoint():
     assert evaluate(seg, 0.0) == (0.0, 0.0)
     assert evaluate(seg, 1.0) == (8.0, 0.0)
     assert evaluate(seg, 0.5) == (4.0, 3.0)
+
+
+def test_end_tangents_can_be_read_over_several_samples():
+    # A straight run toward +x whose first and last inner samples are knocked off the line (the
+    # blended samples next to a corner): one-sample end tangents would point along the knocks.
+    pts = [(0.0, 0.0), (0.5, 0.6)] + [(float(x), 0.0) for x in range(2, 12)] + [(11.5, -0.6), (12.0, 0.0)]
+    chain = fit_cubic(pts, 2.0, tangent_samples=3)
+    start = np.subtract(chain[0].c1, chain[0].p0)
+    end = np.subtract(chain[-1].p1, chain[-1].c2)
+    assert abs(math.degrees(math.atan2(start[1], start[0]))) < 20.0
+    assert abs(math.degrees(math.atan2(end[1], end[0]))) < 20.0
+    assert fit_cubic(pts, 2.0) == fit_cubic(pts, 2.0, tangent_samples=1)
