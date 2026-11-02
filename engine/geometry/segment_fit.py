@@ -9,6 +9,7 @@ import numpy as np
 from scipy.optimize import minimize_scalar
 
 from engine.geometry.bezier import fit_cubic, sample
+from engine.geometry.noise import NOISE_FLOOR_PX
 from engine.presets import FitParams
 from engine.types import Arc, CubicBezier, Line, Point, Segment
 
@@ -124,30 +125,52 @@ def _bezier_distances(chain: Sequence[CubicBezier], pts: np.ndarray) -> np.ndarr
     return np.sqrt((diff**2).sum(axis=2)).min(axis=1)
 
 
-def fit_span(points: Sequence[Point], params: FitParams) -> tuple[Segment, ...]:
-    """Pick the cheapest of line / arc / Bezier chain by sse + complexity_weight * n_params."""
+def _model_cost(sse: float, n_params: int, params: FitParams, noise: float | None) -> float:
+    """MDL cost: sse + w * n_params, or sse / sigma^2 + w * n_params when the noise is known.
+
+    Dividing by the noise variance makes the cost scale-free (sse grows with scale squared, the
+    parameter count does not) and lets noisier curves trade residual for fewer parameters.
+    """
+    w = params.complexity_weight
+    if noise is None:
+        return sse + w * n_params
+    sigma = max(noise, NOISE_FLOOR_PX)
+    return sse / (sigma * sigma) + w * n_params
+
+
+def fit_span_scored(
+    points: Sequence[Point], params: FitParams, noise: float | None = None
+) -> tuple[tuple[Segment, ...], float]:
+    """The cheapest of line / arc / Bezier chain within tolerance, and its `_model_cost`."""
     if len(points) < 2:
-        return ()
+        return (), 0.0
     if len(points) == 2:
-        return (Line(_exact(points[0]), _exact(points[-1])),)
+        line = Line(_exact(points[0]), _exact(points[-1]))
+        return (line,), _model_cost(0.0, _LINE_PARAMS, params, noise)
     pts = _as_array(points)
     tol = params.tolerance_px
-    w = params.complexity_weight
     candidates: list[tuple[float, tuple[Segment, ...]]] = []
 
     line, line_sse = fit_line(points)
     if float(np.max(_dist_to_segment(pts, pts[0], pts[-1]))) <= tol:
-        candidates.append((line_sse + w * _LINE_PARAMS, (line,)))
+        candidates.append((_model_cost(line_sse, _LINE_PARAMS, params, noise), (line,)))
 
     arc_fit = fit_arc(points)
     if arc_fit is not None and _arc_max_error(arc_fit[0], pts) <= tol:
-        candidates.append((arc_fit[1] + w * _ARC_PARAMS, (arc_fit[0],)))
+        candidates.append((_model_cost(arc_fit[1], _ARC_PARAMS, params, noise), (arc_fit[0],)))
 
     chain = fit_cubic(points, tol)
-    dists = _bezier_distances(chain, pts)
-    bez_cost = float(np.sum(dists**2)) + w * _BEZIER_PARAMS * len(chain)
-    candidates.append((bez_cost, tuple(chain)))
-    return min(candidates, key=lambda c: c[0])[1]
+    sse = float(np.sum(_bezier_distances(chain, pts) ** 2))
+    candidates.append((_model_cost(sse, _BEZIER_PARAMS * len(chain), params, noise), tuple(chain)))
+    cost, segments = min(candidates, key=lambda c: c[0])
+    return segments, cost
+
+
+def fit_span(
+    points: Sequence[Point], params: FitParams, noise: float | None = None
+) -> tuple[Segment, ...]:
+    """Pick the cheapest of line / arc / Bezier chain by `_model_cost`."""
+    return fit_span_scored(points, params, noise)[0]
 
 
 def _shift(p: Point, delta: Point) -> Point:
