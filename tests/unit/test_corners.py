@@ -115,3 +115,88 @@ def test_smooth_dense_keeps_open_endpoints_and_rejects_negative_sigma():
     assert out[0] == dense[0] and out[-1] == dense[-1]
     with pytest.raises(ValueError):
         smooth_dense(dense, closed=False, sigma=-0.5)
+
+
+# ---------------------------------------------------------------- scale-space corners
+
+
+def _jittered_ring(points, sigma, seed):
+    """Unit-spaced samples of a closed polyline with Gaussian jitter along the edge normal."""
+    rng = np.random.default_rng(seed)
+    dense = np.asarray(dense_samples(tuple(points), closed=True), float)
+    tangent = np.roll(dense, -1, axis=0) - np.roll(dense, 1, axis=0)
+    normal = np.column_stack([-tangent[:, 1], tangent[:, 0]])
+    normal /= np.hypot(*normal.T)[:, None]
+    return tuple(map(tuple, dense + rng.normal(0.0, sigma, len(dense))[:, None] * normal))
+
+
+def _circle_ring(r=30.0, n=96):
+    t = np.linspace(0.0, 2 * np.pi, n, endpoint=False)
+    return [(64 + r * np.cos(a), 64 + r * np.sin(a)) for a in t] + [(64 + r, 64.0)]
+
+
+SQUARE = [(10.0, 10.0), (50.0, 10.0), (50.0, 50.0), (10.0, 50.0), (10.0, 10.0)]
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_multiscale_drops_noise_corners_on_a_circle(seed):
+    from engine.geometry.corners import find_corners_multiscale
+
+    raw = _jittered_ring(_circle_ring(), 0.8, seed)
+    assert find_corners(smooth_dense(raw, True, 1.0), True, 35.0, 2)  # fine scale alone is fooled
+    found = find_corners_multiscale(raw, True, 35.0, fine_sigma=1.0, coarse_sigma=2.4)
+    assert found.indices == ()
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_multiscale_keeps_real_corners_at_their_fine_position(seed):
+    from engine.geometry.corners import find_corners_multiscale
+
+    raw = _jittered_ring(SQUARE, 0.3, seed)
+    found = find_corners_multiscale(raw, True, 35.0, fine_sigma=1.0, coarse_sigma=2.0)
+    assert len(found.indices) == 4
+    truth = [(10.0, 10.0), (50.0, 10.0), (50.0, 50.0), (10.0, 50.0)]
+    for t in truth:
+        # midpoint samples sit 0.5 px from the vertex; allow one sample of index slack plus jitter
+        assert min(np.hypot(raw[i][0] - t[0], raw[i][1] - t[1]) for i in found.indices) <= 2.0
+    assert all(a > 35.0 for a in found.coarse_angles)
+
+
+def test_multiscale_keeps_both_corners_of_a_narrow_end():
+    from engine.geometry.corners import find_corners_multiscale
+
+    bar = [(10.0, 10.0), (40.0, 10.0), (40.0, 14.0), (10.0, 14.0), (10.0, 10.0)]
+    raw = dense_samples(tuple(bar), closed=True)
+    found = find_corners_multiscale(raw, True, 35.0, fine_sigma=1.0, coarse_sigma=2.0)
+    assert len(found.indices) == 4
+
+
+def test_multiscale_open_curve_keeps_its_end_points():
+    from engine.geometry.corners import find_corners_multiscale
+
+    raw = dense_samples(((0.0, 0.0), (20.0, 0.0), (20.0, 20.0)), closed=False)
+    found = find_corners_multiscale(raw, False, 35.0, fine_sigma=1.0, coarse_sigma=2.0)
+    assert found.indices[0] == 0 and found.indices[-1] == len(raw) - 1
+    assert len(found.indices) == 3
+    assert len(found.coarse_angles) == 3 and np.isnan(found.coarse_angles[0])
+
+
+def test_smooth_between_pins_corners_and_keeps_straight_sides_straight():
+    from engine.geometry.corners import smooth_between
+
+    raw = [(float(x), 10.0) for x in range(10, 50)] + [(50.0, float(y)) for y in range(10, 50)]
+    raw += [(float(x), 50.0) for x in range(50, 10, -1)] + [(10.0, float(y)) for y in range(50, 10, -1)]
+    corners = [0, 40, 80, 120]  # the four vertices
+    out = smooth_between(raw, corners, True, sigma=3.0)
+    assert len(out) == len(raw)
+    for c in corners:
+        assert out[c] == raw[c]
+    top = [out[i] for i in range(corners[0], corners[1] + 1)]
+    assert all(y == pytest.approx(10.0) for _, y in top)  # nothing pulled round the corner
+
+
+def test_smooth_between_without_corners_is_smooth_dense():
+    from engine.geometry.corners import smooth_between
+
+    raw = _jittered_ring(_circle_ring(), 0.5, 0)
+    assert smooth_between(raw, [], True, 2.0) == smooth_dense(raw, True, 2.0)
