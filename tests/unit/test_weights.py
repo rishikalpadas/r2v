@@ -40,7 +40,10 @@ def _serve(payload, calls=None):
     def download(url, dest):
         if calls is not None:
             calls.append(url)
-        Path(dest).write_bytes(payload)
+        dest = Path(dest)
+        assert dest.parent == weights.weights_dir()
+        assert dest not in {weights.weight_path(n) for n in MANIFEST}
+        dest.write_bytes(payload)
 
     return download
 
@@ -58,6 +61,18 @@ def test_weights_dir_env_override(monkeypatch, tmp_path):
     assert weights.weights_dir() == tmp_path / "w"
     assert weights.weight_path("realesrgan_x4plus") == tmp_path / "w" / "realesrgan_x4plus.pth"
     assert not (tmp_path / "w").exists()
+
+
+def test_weights_dir_whitespace_env_is_unset(monkeypatch, tmp_path):
+    monkeypatch.setenv("R2V_WEIGHTS_DIR", "   ")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.setattr(weights.sys, "platform", "win32")
+    assert weights.weights_dir() == tmp_path / "local" / "raster2vector" / "weights"
+
+
+def test_weights_dir_env_is_stripped(monkeypatch, tmp_path):
+    monkeypatch.setenv("R2V_WEIGHTS_DIR", f"  {tmp_path / 'w'}  ")
+    assert weights.weights_dir() == tmp_path / "w"
 
 
 def test_weights_dir_defaults(monkeypatch, tmp_path):
@@ -145,6 +160,41 @@ def test_fetch_download_error_leaves_no_temp(wdir, fake_spec, monkeypatch):
     assert list(wdir.iterdir()) == []
 
 
+def test_fetch_download_error_keeps_corrupt_file(wdir, fake_spec, monkeypatch):
+    wdir.mkdir()
+    (wdir / "fake.pth").write_bytes(b"corrupt")
+
+    def broken(url, dest):
+        assert Path(dest) != wdir / "fake.pth"
+        Path(dest).write_bytes(b"partial")
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(weights, "_download", broken)
+    with pytest.raises(OSError):
+        weights.fetch("fake")
+    assert (wdir / "fake.pth").read_bytes() == b"corrupt"
+    assert [p.name for p in wdir.iterdir()] == ["fake.pth"]
+
+
+def test_fetch_removes_stale_parts(wdir, fake_spec, monkeypatch):
+    wdir.mkdir()
+    (wdir / ".fake.abc123.part").write_bytes(b"stale")
+    (wdir / ".other.abc123.part").write_bytes(b"not ours")
+    monkeypatch.setattr(weights, "_download", _serve(PAYLOAD))
+    weights.fetch("fake")
+    assert sorted(p.name for p in wdir.iterdir()) == [".other.abc123.part", "fake.pth"]
+
+
+def test_fetch_sets_readable_mode_before_replace(wdir, fake_spec, monkeypatch):
+    events = []
+    real_chmod, real_replace = os.chmod, os.replace
+    monkeypatch.setattr(weights.os, "chmod", lambda p, m: events.append(("chmod", m)) or real_chmod(p, m))
+    monkeypatch.setattr(weights.os, "replace", lambda a, b: events.append(("replace",)) or real_replace(a, b))
+    monkeypatch.setattr(weights, "_download", _serve(PAYLOAD))
+    weights.fetch("fake")
+    assert events == [("chmod", 0o644), ("replace",)]
+
+
 def test_fetch_atomic(wdir, fake_spec, monkeypatch):
     wdir.mkdir()
     path = wdir / "fake.pth"
@@ -165,6 +215,21 @@ def test_download_writes_dest(tmp_path):
     dest = tmp_path / "dest.bin"
     weights._download(src.as_uri(), dest)
     assert dest.read_bytes() == PAYLOAD
+
+
+def test_download_uses_timeout(tmp_path, monkeypatch):
+    seen = {}
+    real = weights.urllib.request.urlopen
+
+    def fake_urlopen(url, *args, **kwargs):
+        seen.update(kwargs)
+        return real(url)
+
+    monkeypatch.setattr(weights.urllib.request, "urlopen", fake_urlopen)
+    src = tmp_path / "src.bin"
+    src.write_bytes(PAYLOAD)
+    weights._download(src.as_uri(), tmp_path / "dest.bin")
+    assert seen.get("timeout") == 60
 
 
 def test_pick_device_cpu_when_no_cuda(monkeypatch):
@@ -196,6 +261,24 @@ def test_ml_available_false_without_spandrel(monkeypatch):
     from engine import ml
 
     monkeypatch.setitem(sys.modules, "spandrel", None)
+    assert ml.ml_available() is False
+
+
+def _raise_oserror(name):
+    raise OSError("[WinError 126] The specified module could not be found")
+
+
+def test_cuda_available_false_on_broken_torch(monkeypatch):
+    monkeypatch.setattr(device.importlib, "import_module", _raise_oserror)
+    assert device._cuda_available() is False
+    assert device.pick_device("auto") == "cpu"
+    assert device.pick_device("cuda") == "cpu"
+
+
+def test_ml_available_false_on_broken_torch(monkeypatch):
+    from engine import ml
+
+    monkeypatch.setattr(ml.importlib, "import_module", _raise_oserror)
     assert ml.ml_available() is False
 
 
@@ -237,17 +320,20 @@ def test_cli_failure_exit_code(wdir, fake_spec, monkeypatch, capsys):
     out = capsys.readouterr().out
     lines = out.strip().splitlines()
     assert len(lines) == 2
-    assert lines[0].startswith("fake") and "failed" in lines[0] and "sha256" in lines[0]
-    assert lines[1].startswith("nope") and "failed" in lines[1]
+    assert lines[0].startswith("fake: failed [MIT] sha256 mismatch")
+    assert lines[1].startswith("nope: failed unknown weight 'nope'")
 
 
 def test_cli_all_covers_manifest(wdir, monkeypatch, capsys):
-    seen = []
-    monkeypatch.setattr(fetch_weights, "fetch", lambda name: seen.append(name) or wdir / name)
-    monkeypatch.setattr(fetch_weights, "verify", lambda name: True)
+    fetched, verified = [], []
+    monkeypatch.setattr(fetch_weights, "fetch", lambda name: fetched.append(name) or wdir / name)
+    monkeypatch.setattr(fetch_weights, "verify", lambda name: verified.append(name) or name != "fbcnn_color")
     assert fetch_weights.main(["--all"]) == 0
-    assert seen == list(MANIFEST)
-    assert len(capsys.readouterr().out.strip().splitlines()) == len(MANIFEST)
+    assert verified == list(MANIFEST)
+    assert fetched == ["fbcnn_color"]
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == len(MANIFEST)
+    assert sum("verified" in line for line in lines) == len(MANIFEST) - 1
 
 
 def test_engine_import_does_not_load_torch():

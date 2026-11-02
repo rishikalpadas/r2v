@@ -9,6 +9,6 @@ def ml_available() -> bool:
     try:
         importlib.import_module("torch")
         importlib.import_module("spandrel")
-    except ImportError:
+    except (ImportError, OSError):  # OSError: broken install, e.g. WinError 126 on a missing DLL
         return False
     return True

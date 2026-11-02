@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from engine.ml.weights import MANIFEST, fetch, verify
+from engine.ml.weights import MANIFEST, fetch, verify, weight_path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -24,11 +24,14 @@ def main(argv: list[str] | None = None) -> int:
         spec = MANIFEST.get(name)
         license_ = f" [{spec.license}]" if spec else ""
         try:
-            status = "verified" if verify(name) else "downloaded"
-            path = fetch(name)
+            if verify(name):
+                status, path = "verified", weight_path(name)
+            else:
+                status, path = "downloaded", fetch(name)
         except Exception as exc:  # report every weight, then exit non-zero
             failed += 1
-            print(f"{name}: failed{license_}: {exc}")
+            reason = exc.args[0] if isinstance(exc, KeyError) and exc.args else exc
+            print(f"{name}: failed{license_} {reason}")
         else:
             print(f"{name}: {status}{license_} {path}")
     return 1 if failed else 0

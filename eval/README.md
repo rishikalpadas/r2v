@@ -85,7 +85,7 @@ the dev laptop (RTX 4050 Laptop GPU, driver 616.64, CUDA 13.4), in order:
 ```
 py -3.12 -m venv .venv
 .venv\Scripts\python -m pip install -e .[dev]
-.venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cu134
+.venv\Scripts\python -m pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cu134
 .venv\Scripts\python -m pip install torchvision==0.29.2 --index-url https://download.pytorch.org/whl/cu134
 .venv\Scripts\python -m pip install -e .[dev,gpu]
 .venv\Scripts\python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"

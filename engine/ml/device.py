@@ -10,7 +10,7 @@ DEVICE_PREFS = ("auto", "cuda", "cpu")
 def _cuda_available() -> bool:
     try:
         torch = importlib.import_module("torch")
-    except ImportError:
+    except (ImportError, OSError):  # OSError: broken install, e.g. WinError 126 on a missing DLL
         return False
     return bool(torch.cuda.is_available())  # pragma: no cover
 

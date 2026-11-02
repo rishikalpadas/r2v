@@ -60,7 +60,7 @@ MANIFEST: dict[str, WeightSpec] = {
 
 def weights_dir() -> Path:
     """Weights cache directory (not created here)."""
-    override = os.environ.get("R2V_WEIGHTS_DIR")
+    override = os.environ.get("R2V_WEIGHTS_DIR", "").strip()
     if override:
         return Path(override)
     if sys.platform == "win32":
@@ -95,7 +95,7 @@ def verify(name: str) -> bool:
 
 
 def _download(url: str, dest: Path) -> None:
-    with urllib.request.urlopen(url) as resp, open(dest, "wb") as out:
+    with urllib.request.urlopen(url, timeout=60) as resp, open(dest, "wb") as out:
         shutil.copyfileobj(resp, out, _CHUNK)
 
 
@@ -106,6 +106,8 @@ def fetch(name: str) -> Path:
     if verify(name):
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
+    for stale in path.parent.glob(f".{spec.name}.*.part"):  # left behind by a hard kill
+        stale.unlink(missing_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{spec.name}.", suffix=".part", dir=path.parent)
     os.close(fd)
     tmp = Path(tmp_name)
@@ -114,7 +116,8 @@ def fetch(name: str) -> Path:
         actual = _sha256(tmp)
         if actual != spec.sha256:
             raise ValueError(f"sha256 mismatch for {spec.name}: expected {spec.sha256}, got {actual}")
-        os.replace(tmp, path)
+        os.chmod(tmp, 0o644)  # mkstemp creates 0600 on POSIX
+        os.replace(tmp, path)  # on Windows this fails if another process holds the file open
     finally:
         tmp.unlink(missing_ok=True)
     return path
