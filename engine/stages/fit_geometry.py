@@ -7,7 +7,13 @@ from dataclasses import replace
 
 from engine.geometry.adaptive_fit import fit_curve_adaptive
 from engine.geometry.corner_placement import place_corners
-from engine.geometry.corners import dense_samples, find_corners, samples_at_scale, smooth_dense
+from engine.geometry.corners import (
+    dense_samples,
+    even_breaks,
+    find_corners,
+    samples_at_scale,
+    smooth_dense,
+)
 from engine.geometry.primitives import detect_primitive
 from engine.geometry.segment_fit import fit_span, snap_axis
 from engine.geometry.subpixel import EdgeContext, subpixel_dense
@@ -120,7 +126,7 @@ def _fit_closed(
     if corners:
         breaks = sorted((c - start) % n for c in corners) + [n]
     else:
-        breaks = [n * k // CORNERLESS_SPANS for k in range(CORNERLESS_SPANS + 1)]
+        breaks = even_breaks(n, CORNERLESS_SPANS)
     segments = _fit_spans(seq, breaks, params)
     return FittedCurve(curve.id, segments, primitive=detect_primitive(ring, corners, scale))
 
