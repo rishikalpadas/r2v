@@ -210,7 +210,8 @@ LEGACY_SCENES = {
     **{f"aa_shapes_{s}": (lambda s=s: aa_shapes(s)) for s in range(4)},
     "aa_disc": aa_disc,
 }
-# Fingerprints of `fit_geometry(..., FitParams())` before adaptive fitting existed (d1f3181).
+# Fingerprints of `fit_geometry(..., FitParams())` before adaptive fitting existed (master 2f293c9,
+# i.e. with fix-3 segmentation; flat_shapes are unchanged from d1f3181).
 LEGACY_FINGERPRINTS = {
     "flat_shapes_0": "c319cabe2c17ef50",
     "flat_shapes_1": "f4f6a10d441d486b",
@@ -222,11 +223,11 @@ LEGACY_FINGERPRINTS = {
     "flat_shapes_7": "92f6b40b56d2b81f",
     "flat_shapes_8": "5c1291687cf08695",
     "flat_shapes_9": "38e3018e7ef2de6b",
-    "aa_shapes_0": "e1bb15d8ca12900a",
-    "aa_shapes_1": "e547578a1e5b258d",
-    "aa_shapes_2": "20eae3c82748b354",
-    "aa_shapes_3": "666d8b8d90521f83",
-    "aa_disc": "024bb97525fb9d14",
+    "aa_shapes_0": "746534025274d358",
+    "aa_shapes_1": "566cd5310ac89655",
+    "aa_shapes_2": "16f14b497adb4022",
+    "aa_shapes_3": "6b7e8d6f74cfee8d",
+    "aa_disc": "522f2717b4fb6d45",
 }
 
 
