@@ -9,6 +9,9 @@ from engine.presets import SegmentParams
 
 BLEND_CLUSTER_TOLERANCE = 1.05
 BLEND_MAX_SHARE = 0.05
+# Fraction of a cluster's pixels whose whole 3x3 is that cluster. Measured on a real JPEG logo:
+# anti-alias blend clusters 0.00 (<= 0.03 at k=32), every real colour >= 0.43.
+BLEND_MAX_INTERIOR = 0.10
 KMEANS_N_INIT = 4
 
 
@@ -90,13 +93,36 @@ def _merge_clusters(
     return new_id, palette
 
 
-def _drop_blend_clusters(
-    cluster: np.ndarray, palette: np.ndarray, counts: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Remove minor clusters whose color lies between two larger clusters (JPEG/AA blends).
+def interior_mask(labels: np.ndarray) -> np.ndarray:
+    """Pixels whose whole 3x3 neighbourhood has their label (image edges replicate outward)."""
+    pad = np.pad(labels, 1, mode="edge")
+    h, w = labels.shape
+    inside = np.ones(labels.shape, dtype=bool)
+    for dy in range(3):
+        for dx in range(3):
+            inside &= pad[dy:dy + h, dx:dx + w] == labels
+    return inside
 
-    Only used on the noisy (KMeans) path. Returns (remapped cluster ids, palette).
+
+def _interior_fraction(labels: np.ndarray, n: int) -> np.ndarray:
+    """Per label 0..n-1: share of its pixels that are interior (1.0 for absent labels)."""
+    opaque = labels >= 0
+    total = np.bincount(labels[opaque], minlength=n).astype(np.float64)
+    inner = np.bincount(labels[opaque & interior_mask(labels)], minlength=n)
+    return np.divide(inner, total, out=np.ones(n), where=total > 0)
+
+
+def _drop_blend_clusters(
+    cluster: np.ndarray, palette: np.ndarray, counts: np.ndarray, labels: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove minor clusters that are JPEG/AA blends between two larger clusters.
+
+    A blend lies between two larger clusters in colour AND has (almost) no interior pixels in
+    `labels` (per-pixel cluster ids, TRANSPARENT < 0): blends live in 1-2 px edge ribbons, while
+    a genuine minor colour has solid area. Only used on the noisy (KMeans) path.
+    Returns (remapped cluster ids, palette).
     """
+    interior = _interior_fraction(labels, len(palette))
     lab = _to_lab(palette)
     dist = deltaE_ciede2000(lab[:, None, :], lab[None, :, :])
     alive = np.ones(len(palette), dtype=bool)
@@ -104,6 +130,8 @@ def _drop_blend_clusters(
     for c in np.argsort(counts, kind="stable"):
         if counts[c] > BLEND_MAX_SHARE * total:
             break
+        if interior[c] >= BLEND_MAX_INTERIOR:
+            continue  # has solid area: a genuine fill, not an edge ribbon
         bigger = np.flatnonzero(alive & (counts > counts[c]))
         if len(bigger) < 2:
             continue

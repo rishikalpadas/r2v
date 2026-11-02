@@ -199,12 +199,12 @@ def segment(image: RasterImage, params: SegmentParams) -> RegionMap:
     cluster = _cluster_colors(colors, pixel_colors, params)
     cluster, palette = _merge_clusters(colors, counts, cluster, params.merge_delta_e)
     noisy = len(colors) > params.max_colors  # quantized (KMeans) input
-    if noisy and len(palette) >= 3:
-        per_cluster = np.bincount(cluster[pixel_colors], minlength=len(palette))
-        cluster, palette = _drop_blend_clusters(cluster, palette, per_cluster)
-
     labels = np.full((h, w), TRANSPARENT, dtype=np.int32)
     labels[opaque] = cluster[pixel_colors]
+    if noisy and len(palette) >= 3:
+        per_cluster = np.bincount(cluster[pixel_colors], minlength=len(palette))
+        cluster, palette = _drop_blend_clusters(cluster, palette, per_cluster, labels)
+        labels[opaque] = cluster[pixel_colors]
     labels = _majority_cleanup(labels, palette, noisy)
 
     comp, comp_cluster = _components(labels)

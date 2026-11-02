@@ -127,9 +127,32 @@ def test_kmeans_path_deterministic():
 
 def test_drop_blend_clusters_never_yields_invalid_ids():
     palette = np.array([[0, 0, 0], [255, 255, 255], [120, 120, 120], [127, 127, 127]], np.uint8)
-    counts = np.array([1000, 1000, 30, 10])
+    labels = np.repeat(np.array([0, 1, 2, 3]), [1000, 1000, 30, 10]).reshape(1, -1)
+    counts = np.bincount(labels.ravel())
     cluster = np.array([0, 1, 2, 3])
-    new, kept = _drop_blend_clusters(cluster, palette, counts)
+    new, kept = _drop_blend_clusters(cluster, palette, counts, labels)
+    assert (new >= 0).all() and (new < len(kept)).all()
+
+
+def _blend_drop_case() -> tuple[np.ndarray, np.ndarray]:
+    """Black | white halves; a solid 20x20 dark-grey block (2%) and a 1-px light-grey ramp."""
+    palette = np.array([[0, 0, 0], [255, 255, 255], [90, 90, 90], [160, 160, 160]], np.uint8)
+    labels = np.zeros((100, 200), np.int32)
+    labels[:, 101:] = 1
+    labels[:, 100] = 3  # AA ramp along the black/white edge: no interior pixel
+    labels[40:60, 40:60] = 2  # genuine minor colour between black and white
+    return palette, labels
+
+
+def test_blend_drop_keeps_solid_minor_colour():
+    palette, labels = _blend_drop_case()
+    counts = np.bincount(labels.ravel())
+    assert counts[2] / counts.sum() == 0.02
+    new, kept = _drop_blend_clusters(np.arange(4), palette, counts, labels)
+    kept_set = {tuple(c) for c in kept}
+    assert (90, 90, 90) in kept_set
+    assert (160, 160, 160) not in kept_set
+    assert len(kept) == 3
     assert (new >= 0).all() and (new < len(kept)).all()
 
 
@@ -233,6 +256,21 @@ def _chain_image(size: int = 128) -> np.ndarray:
     return supersample(draw, size)
 
 
+def _accent_image(size: int = 128) -> np.ndarray:
+    """White page, pink disc with dark pink core, and a small solid light-pink block (~3%)."""
+
+    def draw(n: int) -> np.ndarray:
+        k = n / size
+        px = solid(n, (*CHAIN_COLORS["white"], 255))
+        px[_circle_mask(n, 70.3 * k, 70.6 * k, 40.2 * k)] = (*CHAIN_COLORS["pink"], 255)
+        px[_circle_mask(n, 70.3 * k, 70.6 * k, 20.4 * k)] = (*CHAIN_COLORS["dark_pink"], 255)
+        y0, x0, side = round(6.4 * k), round(8.6 * k), round(22 * k)
+        px[y0:y0 + side, x0:x0 + side] = (*CHAIN_COLORS["light_pink"], 255)
+        return px
+
+    return supersample(draw, size)
+
+
 def _de(a, b) -> float:
     lab = rgb2lab(np.array([a, b], np.float64).reshape(1, 2, 3) / 255.0)[0]
     return float(deltaE_ciede2000(lab[0], lab[1]))
@@ -241,6 +279,17 @@ def _de(a, b) -> float:
 def test_aa_bridged_near_colours_stay_distinct():
     px = _chain_image()
     assert len(np.unique(px[..., :3].reshape(-1, 3), axis=0)) > SegmentParams().max_colors
+    rm = segment(_img(px), SegmentParams())
+    palette = np.unique(rm.palette_rgb, axis=0)
+    for name, rgb in CHAIN_COLORS.items():
+        nearest = min(_de(rgb, p) for p in palette)
+        assert nearest < 3, f"{name} {rgb} lost; palette {palette.tolist()}"
+
+
+def test_minor_solid_accent_colour_survives_blend_drop():
+    px = _accent_image()
+    accent = (px[..., :3] == CHAIN_COLORS["light_pink"]).all(-1).mean()
+    assert 0.02 < accent < 0.05  # minor colour, lying between white and pink
     rm = segment(_img(px), SegmentParams())
     palette = np.unique(rm.palette_rgb, axis=0)
     for name, rgb in CHAIN_COLORS.items():
