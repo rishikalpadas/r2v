@@ -5,6 +5,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import replace
 
+from engine.geometry.adaptive_fit import fit_curve_adaptive
 from engine.geometry.corner_placement import place_corners
 from engine.geometry.corners import dense_samples, find_corners, samples_at_scale, smooth_dense
 from engine.geometry.primitives import detect_primitive
@@ -75,15 +76,22 @@ def _fit_spans(points: Sequence[Point], breaks: Sequence[int], params: FitParams
     return snap_axis(chain, params)
 
 
+def _raw_samples(
+    curve: BoundaryCurve, context: EdgeContext | None
+) -> tuple[tuple[Point, ...], tuple[Point, ...]]:
+    """(raw, plain): plain = crack-grid dense samples, raw = their sub-pixel version.
+
+    Without a context raw is plain.
+    """
+    plain = dense_samples(curve.points, curve.closed)
+    return (plain if context is None else subpixel_dense(curve, context)), plain
+
+
 def _samples(
     curve: BoundaryCurve, sigma: float, context: EdgeContext | None
 ) -> tuple[tuple[Point, ...], tuple[tuple[Point, ...], tuple[Point, ...]]]:
-    """(smoothed, (raw, plain)): plain = crack-grid dense samples, raw = their sub-pixel version.
-
-    Without a context raw is plain, and smoothing it is exactly `smooth_polyline`.
-    """
-    plain = dense_samples(curve.points, curve.closed)
-    raw = plain if context is None else subpixel_dense(curve, context)
+    """(smoothed, (raw, plain)); without a context smoothing raw is exactly `smooth_polyline`."""
+    raw, plain = _raw_samples(curve, context)
     return smooth_dense(raw, curve.closed, sigma), (raw, plain)
 
 
@@ -125,6 +133,9 @@ def _fit_smooth(
     min_length = MIN_CLOSED_LENGTH_PX if curve.closed else MIN_OPEN_LENGTH_PX
     if _length(curve.points) < min_length * scale:
         return _fit_curve(curve)
+    if params.adaptive:
+        samples = _raw_samples(curve, context)
+        return fit_curve_adaptive(curve, samples, params, scale, CORNER_WINDOW, CORNERLESS_SPANS)
     fit = _fit_closed if curve.closed else _fit_open
     return fit(curve, params, scale, context)
 
@@ -154,6 +165,10 @@ def fit_geometry(
     With an `EdgeContext` (see `make_edge_context`) and `params.subpixel`, the dense samples are
     first moved to the edge positions read from anti-aliased edge pixels (`subpixel_dense`) and
     corners are placed from them; otherwise samples stay on the crack grid.
+
+    With `params.adaptive` (the default) each curve is fitted by `fit_curve_adaptive`, which
+    scales smoothing, corner detection, tolerance and model cost to the curve's measured edge
+    noise; `adaptive=False` is the fixed-parameter fit above, unchanged.
 
     `graph` is in processing pixels (original pixels x `scale`); every length threshold in
     `params` and in this module is in original pixels and is converted here, and every

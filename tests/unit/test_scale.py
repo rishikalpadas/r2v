@@ -148,16 +148,18 @@ def test_min_curve_length_measured_in_original_pixels():
     assert fit_geometry(graph, FitParams(), scale=2.0) == exact  # only 10 original px
 
 
-def test_fit_tolerance_measured_in_original_pixels(monkeypatch):
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_fit_tolerance_measured_in_original_pixels(monkeypatch, adaptive):
     seen = []
 
-    def spy(points, params):
+    def spy(points, params, noise=None):
         seen.append(params.tolerance_px)
         return (Line(points[0], points[-1]),)
 
     monkeypatch.setattr("engine.stages.fit_geometry.fit_span", spy)
+    monkeypatch.setattr("engine.geometry.adaptive_fit.fit_span", spy)
     graph = _closed_square_graph(10)
-    fit_geometry(graph, FitParams(tolerance_px=0.75), scale=2.0)
+    fit_geometry(graph, FitParams(tolerance_px=0.75, adaptive=adaptive), scale=2.0)
     assert seen and all(t == pytest.approx(1.5) for t in seen)
 
 
