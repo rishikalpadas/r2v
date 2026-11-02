@@ -152,7 +152,7 @@ def test_min_curve_length_measured_in_original_pixels():
 def test_fit_tolerance_measured_in_original_pixels(monkeypatch, adaptive):
     seen = []
 
-    def spy(points, params, noise=None):
+    def spy(points, params, noise=None, tangent_samples=1):
         seen.append(params.tolerance_px)
         return (Line(points[0], points[-1]),)
 

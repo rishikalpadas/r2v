@@ -4,11 +4,13 @@ Fixed fitting parameters suit clean edges; on JPEG art the sub-pixel samples jit
 corner detection finds fake corners every few pixels and a tight tolerance makes Beziers follow
 the jitter. Here every step is scaled to the curve's own measured noise (`estimate_noise`):
 
-1. corners must persist from the fine scale up to a noise-dependent coarse scale;
+0. samples next to a junction stay on the crack grid (their pixels mix in a third region);
+1. corners must persist from the fine scale up to a noise-dependent coarse scale, and are not
+   kept right beside a junction or on top of the previous corner;
 2. each corner-to-corner run is smoothed on its own (corners pinned) with sigma >= 2 x noise;
 3. the tolerance is at least 2.5 x noise and spans are chosen by noise-normalised MDL;
-4. a gentle corner is dropped (its two runs merged) when, judged by MDL on the samples around
-   it, one smooth fit explains them better than two fits meeting at the corner;
+4. a gentle corner (coarse turn below that of any right angle) is dropped, its two runs merged,
+   when by MDL on the samples around it one smooth fit beats two fits meeting at the corner;
 5. a corner between two straight runs moves to where lines through the whole runs meet;
 6. joins that are not corners (the splits of a corner-free ring) are made G1.
 
@@ -26,10 +28,16 @@ from engine.geometry.corner_placement import (
     CORNER_SNAP_PX,
     SideLines,
     collapse_behind,
+    corner_neighbours,
     line_intersection,
     place_corners,
 )
-from engine.geometry.corners import find_corners_multiscale, smooth_between, smooth_dense
+from engine.geometry.corners import (
+    even_breaks,
+    find_corners_multiscale,
+    smooth_between,
+    smooth_dense,
+)
 from engine.geometry.noise import estimate_noise
 from engine.geometry.primitives import detect_primitive
 from engine.geometry.segment_fit import align_joins, chain_cost, fit_span, snap_axis
@@ -40,17 +48,35 @@ SMOOTH_PER_NOISE = 2.0  # fit smoothing sigma (samples) per px of noise: halves 
 TOL_PER_NOISE = 2.5  # fit tolerance per px of noise: ~99% of Gaussian jitter lies within it
 COARSE_PER_SIGMA = 2.0  # coarse corner scale is at least this x the fine smoothing sigma
 COARSE_PER_NOISE = 3.0  # ... and this x the noise: jitter bumps are flat at 3 sigma
-MERGE_MAX_ANGLE_DEG = 60.0  # coarse turn above which a corner is never merged away
+# Coarse turn above which a corner is never merged away. The coarse response is ~0.65 x the
+# true turn: an ideal 90 deg corner reads 61 deg, anti-aliased / soft ones 52-58 deg, a 60 deg
+# turn 38 deg. 40 keeps every right angle well clear of the merge pass.
+MERGE_MAX_ANGLE_DEG = 40.0
 # Corner placement fits longer side lines than on clean input: under JPEG noise 4 samples give
-# an unstable direction (rotated-rect corners up to 0.85 px off), while much longer lines bend
-# toward curved sides (a heart's cusp 1.1 px off at 12 samples). 8 measured best for both.
+# an unstable direction (rotated-rect corners up to 0.85 px off). Lines that meet inside the raw
+# corner have bent toward curved sides (sharp tips between arcs); those retry with the short
+# clean-input lines before falling back to the grid snap.
 # The hit may lie behind the blended samples next to the corner; those are pulled onto it.
-SIDE_LINES = (SideLines(gap=1, samples=8, allow_behind=True),)
+SIDE_LINES = (
+    SideLines(gap=1, samples=8, allow_behind=True, outward_only=True),
+    SideLines(allow_behind=True, outward_only=True),
+)
 BEHIND_REACH = 4  # samples each side of a corner checked for lying past it
 LINE_CORNER_TRIM = 2  # samples next to a corner left out of a straight side's line fit
 MIN_LINE_SIDE_SAMPLES = 6  # shorter sides keep the corner `place_corners` gave them
 JUDGE_REACH = 8  # samples each side of a corner that `_corner_is_fake` compares models on
 MIN_JUDGE_SAMPLES = 3  # a corner closer than this to its neighbour is kept unjudged
+# Next to a junction a sample's pixels belong to a third region, so its sub-pixel offset reads
+# the wrong colour pair and can push the curve across its neighbour (1jpg__scan: inter-curve
+# crossings 44 -> 20 with these samples kept on the crack grid; adaptive off has 23).
+JUNCTION_GRID_SAMPLES = 2
+# With sub-pixel samples, Bezier end tangents are read over 3 samples, not 1: the sample beside
+# a placed corner is often a blended one off the side, and a one-sample tangent then smooths the
+# corner away (1.jpg: right-angle corners emitted with < 30 deg breaks 9 -> 4). Exact crack-grid
+# samples keep the one-sample tangent (3 costs flat_shapes(3) cutout SSIM 0.952 -> 0.949), and
+# their grid snaps may go inward: there the crack vertex is the exact pixel corner.
+END_TANGENT_SAMPLES = 3
+COINCIDENT_PX = 0.5  # corners placed closer than this to the previous corner are one corner
 
 
 @dataclass(frozen=True)
@@ -62,6 +88,16 @@ class _Curve:
     params: FitParams  # tolerance_px / smooth_sigma already adapted to the noise
     judge: FitParams  # params with a noise-limited tolerance, for comparing alternative fits
     noise: float
+    subpixel: bool = False  # samples were moved off the crack grid (anti-aliased input)
+
+    @property
+    def tangent_samples(self) -> int:
+        """Bezier end tangents are read over this many samples (see END_TANGENT_SAMPLES)."""
+        return END_TANGENT_SAMPLES if self.subpixel else 1
+
+
+def _fit(curve: _Curve, points: Sequence[Point], params: FitParams) -> tuple[Segment, ...]:
+    return fit_span(points, params, curve.noise, curve.tangent_samples)
 
 
 def _run(seq: Sequence[Point], a: int, b: int) -> tuple[Point, ...]:
@@ -87,59 +123,76 @@ def _beats(curve: _Curve, data: Sequence[Point], a: Sequence[Segment], b: Sequen
 def _corner_is_fake(curve: _Curve, pinned: Sequence[Point], c: int, lo: int, hi: int) -> bool:
     """MDL test of corner c on the samples lo..hi around it (unwrapped indices).
 
-    The corner model is two fits meeting at the placed corner, the smooth model one fit through
-    it, both with the noise-limited `judge` tolerance, both scored by `chain_cost` against the
-    same unsmoothed samples (corner sample left raw). A real corner costs the smooth model
-    residual or extra pieces where it has to turn sharply; a fake one costs the corner model
-    parameters it does not need. Judging only near the corner keeps the comparison about the
-    corner rather than about how the rest of two long runs happened to split into pieces.
+    The corner model is two fits meeting at the placed corner, the smooth model one fit of the
+    samples with the raw (rounded) corner sample, both with the noise-limited `judge` tolerance.
+    Both are scored by `chain_cost` against the same samples with the corner placed: the
+    question is whether the edge really turns there, and the raw sample next to an anti-aliased
+    corner is rounded off by the pixels, not by the shape. A real corner costs the smooth model
+    residual or extra pieces; a fake one costs the corner model parameters it does not need.
+    Judging only near the corner keeps the comparison about the corner rather than about how
+    two long runs happened to split into pieces.
     """
     n = len(curve.raw)
     sigma = curve.params.smooth_sigma
-    data = list(_run(pinned, lo, hi))
-    data[c - lo] = curve.raw[c % n]
+    data = _run(pinned, lo, hi)
+    unpinned = list(data)
+    unpinned[c - lo] = curve.raw[c % n]
     left = smooth_dense(_run(pinned, lo, c), False, sigma)
     right = smooth_dense(_run(pinned, c, hi), False, sigma)
-    cornered = fit_span(left, curve.judge, curve.noise) + fit_span(right, curve.judge, curve.noise)
-    smooth = fit_span(smooth_dense(tuple(data), False, sigma), curve.judge, curve.noise)
+    cornered = _fit(curve, left, curve.judge) + _fit(curve, right, curve.judge)
+    smooth = _fit(curve, smooth_dense(tuple(unpinned), False, sigma), curve.judge)
     return _beats(curve, data, smooth, cornered)
 
 
-def _try_merge(
-    curve: _Curve, pinned: list[Point], seq: list[Point], corners: list[int], k: int
-) -> None:
-    """Drop corners[k] when `_corner_is_fake`, joining the runs on either side of it.
+@dataclass(frozen=True)
+class _Merge:
+    """State of the merge pass: placed-raw samples, samples to fit, and the corners left."""
 
-    `pinned` holds the raw samples with every remaining corner placed; `seq` the samples being
-    fitted. On success the union run is re-smoothed without corners[k] pinned.
+    pinned: tuple[Point, ...]  # raw samples with every remaining corner placed
+    seq: tuple[Point, ...]  # the samples being fitted (smoothed between corners)
+    corners: tuple[int, ...]
+
+
+def _try_merge(curve: _Curve, state: _Merge, k: int) -> _Merge:
+    """`state` without corners[k] when `_corner_is_fake`, else `state` unchanged.
+
+    The union run is re-smoothed without corners[k] pinned. Re-smoothing brings back samples that
+    `collapse_behind` had pulled onto the neighbouring corners, so they are collapsed again.
     """
-    n = len(seq)
+    n = len(state.seq)
+    corners = state.corners
     c = corners[k]
-    a = corners[k - 1] if k > 0 else corners[-1] - n
-    b = corners[k + 1] if k + 1 < len(corners) else corners[0] + n
+    a, b = corner_neighbours(corners, k, n, curve.closed)
     lo, hi = max(a, c - JUDGE_REACH), min(b, c + JUDGE_REACH)
-    if min(c - lo, hi - c) < MIN_JUDGE_SAMPLES or not _corner_is_fake(curve, pinned, c, lo, hi):
-        return
+    if min(c - lo, hi - c) < MIN_JUDGE_SAMPLES:
+        return state
+    if not _corner_is_fake(curve, state.pinned, c, lo, hi):
+        return state
+    pinned = list(state.pinned)
     pinned[c % n] = curve.raw[c % n]
-    corners.pop(k)
-    if not corners:
-        return  # the ring is now corner-free and is fitted as such
+    left = corners[:k] + corners[k + 1 :]
+    if not left:
+        return _Merge(tuple(pinned), state.seq, left)  # now corner-free; fitted as such
+    seq = list(state.seq)
     smoothed = smooth_dense(_run(pinned, a, b), False, curve.params.smooth_sigma)
     for i, p in zip(range(a + 1, b), smoothed[1:-1]):
         seq[i % n] = p
+    inner = left if curve.closed else left[1:-1]
+    ends = [i for i in {a % n, b % n} if i in inner]
+    seq = collapse_behind(seq, ends, left, curve.closed, BEHIND_REACH)
+    return _Merge(tuple(pinned), tuple(seq), left)
 
 
-def _merge_spans(
-    curve: _Curve, pinned: list[Point], seq: list[Point], corners: list[int],
-    angles: dict[int, float],
-) -> None:
+def _merge_spans(curve: _Curve, state: _Merge, angles: dict[int, float]) -> _Merge:
     """Greedily drop fake corners among the gentle ones, gentlest first (see `_try_merge`)."""
+    corners = state.corners
     lo, hi = (0, len(corners)) if curve.closed else (1, len(corners) - 1)
     candidates = sorted(
         (angles[c], c) for c in corners[lo:hi] if angles[c] < MERGE_MAX_ANGLE_DEG
     )
     for _, c in candidates:
-        _try_merge(curve, pinned, seq, corners, corners.index(c))
+        state = _try_merge(curve, state, state.corners.index(c))
+    return state
 
 
 def _side_line(curve: _Curve, a: int, b: int) -> np.ndarray | None:
@@ -175,12 +228,36 @@ def _sharpen_line_corners(
     return out
 
 
+def _fit_run(
+    points: Sequence[Point], params: FitParams, noise: float, tangent_samples: int = 1
+) -> tuple[Segment, ...]:
+    """`fit_span` of one corner-to-corner run, never as a zero-chord segment.
+
+    A run whose ends coincide (a lone corner of a ring, or two corners placed on the same
+    vertex) is split at the sample farthest from its end into two fits; one that never leaves
+    its end point has no segments.
+    """
+    def fit(run: Sequence[Point]) -> tuple[Segment, ...]:
+        return fit_span(run, params, noise, tangent_samples)
+
+    if points[0] != points[-1]:
+        return fit(points)
+    start = np.asarray(points[0])
+    far = int(np.argmax(np.hypot(*(np.asarray(points) - start).T)))
+    if points[far] == points[0]:
+        return ()
+    return fit(points[: far + 1]) + fit(points[far:])
+
+
 def _fit_runs(
     curve: _Curve, seq: Sequence[Point], corners: Sequence[int], snap: float
 ) -> tuple[Segment, ...]:
     """The chain of every corner-to-corner run, starting at the first corner."""
     bounds = _bounds(corners, len(seq), curve.closed)
-    runs = [fit_span(_run(seq, a, b), curve.params, curve.noise) for a, b in bounds]
+    runs = [
+        _fit_run(_run(seq, a, b), curve.params, curve.noise, curve.tangent_samples)
+        for a, b in bounds
+    ]
     return tuple(s for run in _sharpen_line_corners(curve, runs, bounds, snap) for s in run)
 
 
@@ -189,13 +266,71 @@ def _cornerless(curve: _Curve, spans: int) -> tuple[tuple[Segment, ...], list[in
     ring = smooth_dense(curve.raw, True, curve.params.smooth_sigma)
     n = len(ring)
     seq = (*ring, ring[0])
-    breaks = [n * k // spans for k in range(spans + 1)]
+    breaks = even_breaks(n, spans)
     chain: list[Segment] = []
     joins: list[int] = []
     for a, b in zip(breaks, breaks[1:]):
         joins.append(len(chain))
-        chain.extend(fit_span(seq[a : b + 1], curve.params, curve.noise))
+        chain.extend(_fit(curve, seq[a : b + 1], curve.params))
     return tuple(chain), joins
+
+
+def _clear_of_ends(corners: Sequence[int], n: int, closed: bool) -> list[int]:
+    """Corners without the inner ones within JUNCTION_GRID_SAMPLES of an open curve's ends.
+
+    The junction is already a vertex; a corner right next to it only adds a sliver or hairpin.
+    """
+    if closed:
+        return list(corners)
+    k = JUNCTION_GRID_SAMPLES
+    return [i for i in corners if i in (0, n - 1) or k <= i <= n - 1 - k]
+
+
+def _place(
+    curve: _Curve, plain: tuple[Point, ...], original: Sequence[Point], corners: Sequence[int],
+    scale: float,
+) -> list[Point]:
+    """Samples to fit: smoothed between `corners`, corners placed, overshoots collapsed."""
+    inner = list(corners) if curve.closed else list(corners[1:-1])
+    seq = place_corners(
+        smooth_between(curve.raw, corners, curve.closed, curve.params.smooth_sigma),
+        inner, corners, (curve.raw, plain), original, curve.closed, scale, SIDE_LINES,
+        outward_snap=curve.subpixel,
+    )
+    return collapse_behind(seq, inner, corners, curve.closed, BEHIND_REACH)
+
+
+def _placed(
+    curve: _Curve, plain: tuple[Point, ...], original: Sequence[Point], corners: list[int],
+    scale: float,
+) -> tuple[tuple[Point, ...], list[int]]:
+    """`_place`, then without any corner placed onto the corner before it, and placed again.
+
+    Two corners on one point (both snapped to the same vertex) leave a run that leaves and
+    returns to it: a hairpin. The later corner of such a pair is dropped (never a curve end).
+    """
+    seq = _place(curve, plain, original, corners, scale)
+    n = len(seq)
+
+    def distinct(k: int, c: int) -> bool:
+        if len(corners) == 1 or (not curve.closed and c in (0, n - 1)):
+            return True
+        return math.dist(seq[c], seq[corners[k - 1]]) > COINCIDENT_PX * scale
+
+    keep = [c for k, c in enumerate(corners) if distinct(k, c)]
+    if len(keep) == len(corners):
+        return tuple(seq), corners
+    return tuple(_place(curve, plain, original, keep, scale)), keep
+
+
+def _grid_near_junctions(
+    raw: tuple[Point, ...], plain: tuple[Point, ...], closed: bool
+) -> tuple[Point, ...]:
+    """`raw` with the samples within JUNCTION_GRID_SAMPLES of an open curve's ends on the grid."""
+    if closed:
+        return raw
+    n, k = len(raw), JUNCTION_GRID_SAMPLES
+    return tuple(plain[i] if i < k or i >= n - k else p for i, p in enumerate(raw))
 
 
 def _adapt(params: FitParams, noise: float) -> FitParams:
@@ -220,28 +355,23 @@ def fit_curve_adaptive(
     without sub-pixel input). `params` are in processing pixels. Open-curve end points (shared
     junctions) are kept exactly; a closed chain starts at a corner and closes exactly.
     """
-    raw, plain = tuple(samples[0]), tuple(samples[1])
+    plain = tuple(samples[1])
+    raw = _grid_near_junctions(tuple(samples[0]), plain, curve.closed)
     closed, n = curve.closed, len(raw)
     noise = estimate_noise(raw, closed)
     adapted = _adapt(params, noise)
     judge = replace(adapted, tolerance_px=TOL_PER_NOISE * noise)
-    c = _Curve(raw, closed, adapted, judge, noise)
+    c = _Curve(raw, closed, adapted, judge, noise, subpixel=raw != plain)
     coarse = max(COARSE_PER_SIGMA * params.smooth_sigma, COARSE_PER_NOISE * noise)
     found = find_corners_multiscale(
         raw, closed, params.corner_angle_deg, params.smooth_sigma, coarse, corner_window
     )
-    corners = list(found.indices)
-    angles = dict(zip(corners, found.coarse_angles))
-    inner = corners if closed else corners[1:-1]
-    seq = place_corners(
-        smooth_between(raw, corners, closed, c.params.smooth_sigma),
-        inner, corners, (raw, plain), curve.points, closed, scale, SIDE_LINES,
-    )
-    seq = collapse_behind(seq, inner, corners, closed, BEHIND_REACH)
-    pinned = list(raw)
-    for i in inner:
-        pinned[i] = seq[i]
-    _merge_spans(c, pinned, seq, corners, angles)
+    angles = dict(zip(found.indices, found.coarse_angles))
+    seq, corners = _placed(c, plain, curve.points, _clear_of_ends(found.indices, n, closed), scale)
+    inner = set(corners if closed else corners[1:-1])
+    pinned = tuple(seq[i] if i in inner else p for i, p in enumerate(raw))
+    merged = _merge_spans(c, _Merge(pinned, tuple(seq), tuple(corners)), angles)
+    seq, corners = merged.seq, list(merged.corners)
     joins: list[int] = []
     if closed and not corners:
         chain, joins = _cornerless(c, cornerless_spans)

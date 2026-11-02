@@ -69,3 +69,48 @@ def test_exact_colour_output_identical_to_master(call, seg_digest, svg_digest):
     assert seg.hexdigest()[:16] == seg_digest
     svg = to_svg(vectorize(to_png_bytes(px), overrides={"fit.adaptive": False}).doc)
     assert hashlib.sha256(svg.encode()).hexdigest()[:16] == svg_digest
+
+
+# Default-pipeline (adaptive fit on) SVG digests for the same exact-colour inputs, recorded on
+# fix/noise-adaptive-fit: pins the adaptive fit's output on clean art so changes to it show up.
+DEFAULT_SVG_DIGESTS = {
+    "flat_shapes(0, n_colors=3)": "c2146177fd532386",
+    "flat_shapes(0, n_colors=4)": "892f8b73f4198a2e",
+    "flat_shapes(0, n_colors=6)": "528494ae84020f34",
+    "flat_shapes(1, n_colors=3)": "4511fcf902d5f4d8",
+    "flat_shapes(1, n_colors=4)": "6e301ff628c8ae1f",
+    "flat_shapes(1, n_colors=6)": "9c83fe24c2c5fed1",
+    "flat_shapes(2, n_colors=3)": "6fe7ad1e96a51883",
+    "flat_shapes(2, n_colors=4)": "860e2d6b91701f78",
+    "flat_shapes(2, n_colors=6)": "b46a1475f8a5840d",
+    "flat_shapes(3, n_colors=3)": "4a7bfc12eca8cd21",
+    "flat_shapes(3, n_colors=4)": "d203ede49bb07bc3",
+    "flat_shapes(3, n_colors=6)": "ecf220e4210dd839",
+    "flat_shapes(4, n_colors=3)": "a3210e4f2ba2ca58",
+    "flat_shapes(4, n_colors=4)": "3d0ac938d53a0b15",
+    "flat_shapes(4, n_colors=6)": "56c43145c3e4d2d5",
+    "flat_shapes(5, n_colors=3)": "936a4d36e540e782",
+    "flat_shapes(5, n_colors=4)": "da91f8245998f0ee",
+    "flat_shapes(5, n_colors=6)": "c161a81709d3cb08",
+    "flat_shapes(6, n_colors=3)": "d7a311708c1b652a",
+    "flat_shapes(6, n_colors=4)": "525b96e2398ff105",
+    "flat_shapes(6, n_colors=6)": "bb48bd2fb2812ac2",
+    "flat_shapes(7, n_colors=3)": "ae0a3ddf07cd5775",
+    "flat_shapes(7, n_colors=4)": "d8f8eb0235a51483",
+    "flat_shapes(7, n_colors=6)": "0fee985168cc4124",
+    "flat_shapes(8, n_colors=3)": "7f3e9e630ccb4312",
+    "flat_shapes(8, n_colors=4)": "5e08ab289659f95e",
+    "flat_shapes(8, n_colors=6)": "5e48da528b24e997",
+    "flat_shapes(9, n_colors=3)": "2256617892a4312f",
+    "flat_shapes(9, n_colors=4)": "dbc972ac0485cdf7",
+    "flat_shapes(9, n_colors=6)": "bd0d044bcd81d986",
+    "ring_in_ring()": "ba8a9132d31a77f2",
+    "transparent_logo()": "59fb8141bd2e3755",
+    "circle()": "7c4d1e496e0d21f0",
+}
+
+
+@pytest.mark.parametrize("call", list(CASES))
+def test_exact_colour_default_pipeline_svg_is_pinned(call):
+    svg = to_svg(vectorize(to_png_bytes(_build(call))).doc)
+    assert hashlib.sha256(svg.encode()).hexdigest()[:16] == DEFAULT_SVG_DIGESTS[call]
