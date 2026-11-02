@@ -311,3 +311,42 @@ def test_complete_linkage_merges_tight_group_and_respects_strict_threshold():
     groups = _complete_linkage_groups(dist, 5.0)
     assert groups[0] == groups[1] == groups[2]
     assert groups[3] != groups[0]  # exactly at threshold: not merged
+
+
+def _speck_image() -> tuple[np.ndarray, dict[str, tuple[int, int, int]]]:
+    """White | black halves with specks, a fringe sliver, a 3x3 dot and thin lines.
+
+    Every speck has a colour of its own, so the old "last of its colour" rule kept them all.
+    """
+    c = {
+        "red": (230, 20, 20), "green": (20, 200, 40), "grey": (128, 128, 128),
+        "blue": (20, 40, 220), "orange": (250, 150, 0), "purple": (140, 30, 160),
+    }
+    px = solid(64, (255, 255, 255, 255))
+    px[:, 32:, :3] = 0
+    px[5:7, 5:7, :3] = c["red"]  # 2x2 speck (4 px)
+    px[50, 10:13, :3] = c["green"]  # 1x3 speck
+    px[20:30, 31, :3] = c["grey"]  # 1-px fringe sliver along the white/black edge
+    px[10:13, 18:21, :3] = c["blue"]  # solid 3x3 dot: has an interior pixel
+    px[60, 12:52, :3] = c["orange"]  # 1-px wide, 40-px long line
+    for i in range(30):  # 1-px diagonal staircase line: 4-connected pieces of 1 px
+        px[14 + i, 34 + i, :3] = c["purple"]
+    px[40:42, 45, :3] = 255  # 2-px white speck inside black (white has other components)
+    px[41, 46, :3] = 255
+    px[42, 46, :3] = 255
+    return px, c
+
+
+def test_fringe_specks_merged_but_dots_and_lines_survive():
+    px, c = _speck_image()
+    rm = segment(_img(px), SegmentParams())
+    palette = {tuple(int(v) for v in p) for p in rm.palette_rgb}
+    for gone in ("red", "green", "grey"):
+        assert c[gone] not in palette, gone
+    for kept in ("blue", "orange", "purple"):
+        assert c[kept] in palette, kept
+    colour = rm.palette_rgb[rm.labels]
+    assert (colour[10:13, 18:21] == c["blue"]).all()
+    assert (colour[60, 12:52] == c["orange"]).all()
+    assert (colour[40:43, 45:47] == 0).all()  # 4-px white speck absorbed by black
+    assert (colour[20:30, 31] == 255).all()  # sliver joins its longest border (white)

@@ -93,7 +93,7 @@ def _merge_clusters(
     return new_id, palette
 
 
-def interior_mask(labels: np.ndarray) -> np.ndarray:
+def _interior_mask(labels: np.ndarray) -> np.ndarray:
     """Pixels whose whole 3x3 neighbourhood has their label (image edges replicate outward)."""
     pad = np.pad(labels, 1, mode="edge")
     h, w = labels.shape
@@ -108,7 +108,7 @@ def _interior_fraction(labels: np.ndarray, n: int) -> np.ndarray:
     """Per label 0..n-1: share of its pixels that are interior (1.0 for absent labels)."""
     opaque = labels >= 0
     total = np.bincount(labels[opaque], minlength=n).astype(np.float64)
-    inner = np.bincount(labels[opaque & interior_mask(labels)], minlength=n)
+    inner = np.bincount(labels[opaque & _interior_mask(labels)], minlength=n)
     return np.divide(inner, total, out=np.ones(n), where=total > 0)
 
 

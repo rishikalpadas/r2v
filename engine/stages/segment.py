@@ -11,6 +11,7 @@ from engine.presets import SegmentParams
 from engine.stages.segment_palette import (
     _cluster_colors,
     _drop_blend_clusters,
+    _interior_mask,
     _merge_clusters,
     _to_lab,
 )
@@ -24,6 +25,10 @@ MAX_SPECKLE_OWN_VOTES = 1
 MIN_WINNER_VOTES = 5
 MAX_BLEND_OWN_VOTES = 5
 BLEND_TOLERANCE = 1.2
+# Components below this area (original px) with no interior pixel (none whose 3x3 is all its
+# own colour) are fringe or JPEG speckle and merge away even when last of their colour. Real
+# thin lines are longer than this; genuine small dots have an interior pixel.
+SPECK_MAX_PX = 16
 
 
 def _blend_vote_changes(
@@ -123,13 +128,17 @@ def _diagonal_reach(comp: np.ndarray, comp_cluster: np.ndarray) -> np.ndarray:
     return reach
 
 
-def _merge_small_components(comp: np.ndarray, comp_cluster: np.ndarray, min_px: int) -> np.ndarray:
+def _merge_small_components(
+    comp: np.ndarray, comp_cluster: np.ndarray, min_px: int, speck_px: int = 0
+) -> np.ndarray:
     """Root id per component id; small ones join their longest-border neighbor.
 
-    A component that is the only one of its color is always kept.
+    Small = 8-connected same-color group under min_px (kept if it is the only component of its
+    color), or under speck_px with no interior pixel (merged even if last of its color).
     """
     sizes = np.bincount(comp.ravel(), minlength=len(comp_cluster)).astype(np.int64)
     reach = _diagonal_reach(comp, comp_cluster)
+    has_interior = np.bincount(comp[_interior_mask(comp)], minlength=len(comp_cluster)) > 0
     a, b = _edge_pairs(comp)
     borders: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     n_ids = len(comp_cluster)
@@ -146,7 +155,11 @@ def _merge_small_components(comp: np.ndarray, comp_cluster: np.ndarray, min_px: 
             i = parent[i]
         return int(i)
 
-    small = [i for i in range(1, len(sizes)) if reach[i] < min_px and per_cluster[comp_cluster[i]] > 1]
+    speck = (reach < speck_px) & ~has_interior
+    small = [
+        i for i in range(1, len(sizes))
+        if speck[i] or (reach[i] < min_px and per_cluster[comp_cluster[i]] > 1)
+    ]
     for i in sorted(small, key=lambda i: (sizes[i], i)):
         if find(i) != i:
             continue
@@ -210,7 +223,8 @@ def segment(image: RasterImage, params: SegmentParams) -> RegionMap:
     comp, comp_cluster = _components(labels)
     # min_region_px is an area in original pixels; one original pixel covers scale^2 here.
     min_px = round(params.min_region_px * image.scale**2)
-    merged = _merge_small_components(comp, comp_cluster, min_px)[comp]
+    speck_px = round(SPECK_MAX_PX * image.scale**2)
+    merged = _merge_small_components(comp, comp_cluster, min_px, speck_px)[comp]
     survivors, region = np.unique(merged[comp > 0], return_inverse=True)
     out = np.full((h, w), TRANSPARENT, dtype=np.int32)
     out[comp > 0] = region.ravel().astype(np.int32)
