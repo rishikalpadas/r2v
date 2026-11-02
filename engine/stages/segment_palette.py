@@ -34,33 +34,53 @@ def _cluster_colors(
     return km.predict(lab)
 
 
+def _complete_linkage_groups(dist: np.ndarray, threshold: float) -> np.ndarray:
+    """Group id per item: agglomerative complete linkage on a pairwise distance matrix.
+
+    Repeatedly merges the closest pair of groups while every pairwise distance inside the
+    merged group stays < threshold. Unlike transitive (single-linkage) merging, a chain of
+    close neighbours (white ~ blend ~ pink) can never fuse colours that are far apart.
+    """
+    n = len(dist)
+    link = dist.astype(np.float64).copy()
+    np.fill_diagonal(link, np.inf)
+    group = np.arange(n)
+    active = np.ones(n, dtype=bool)
+    while active.sum() > 1:
+        masked = np.where(active[:, None] & active[None, :], link, np.inf)
+        flat = int(np.argmin(masked))
+        i, j = divmod(flat, n)
+        if not masked[i, j] < threshold:
+            break
+        i, j = min(i, j), max(i, j)
+        # Lance-Williams update for complete linkage: distance to the union is the max.
+        link[i, :] = np.maximum(link[i, :], link[j, :])
+        link[:, i] = link[i, :]
+        link[i, i] = np.inf
+        active[j] = False
+        group[group == j] = i
+    return group
+
+
 def _merge_clusters(
     colors: np.ndarray, counts: np.ndarray, cluster: np.ndarray, delta_e: float
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Merge clusters with centroid deltaE2000 < delta_e. Returns (cluster ids, palette rgb)."""
+    """Complete-linkage merge of clusters whose centroids are all within deltaE2000 < delta_e.
+
+    Returns (cluster ids, palette rgb); merged colours are pixel-weighted means.
+    """
     k = int(cluster.max()) + 1
     w = counts.astype(np.float64)
     sums = np.zeros((k, 3))
     np.add.at(sums, cluster, colors * w[:, None])
     tot = np.bincount(cluster, weights=w, minlength=k)
-    present = tot > 0
-    parent = list(range(k))
-
-    def find(i: int) -> int:
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    cent_rgb = sums / np.maximum(tot, 1)[:, None]
+    ids = np.flatnonzero(tot > 0)
+    cent_rgb = sums[ids] / tot[ids, None]
     cent_lab = _to_lab(np.clip(np.rint(cent_rgb), 0, 255).astype(np.uint8))
-    ids = np.flatnonzero(present)
-    for ai, a in enumerate(ids):
-        for b in ids[ai + 1:]:
-            if deltaE_ciede2000(cent_lab[a], cent_lab[b]) < delta_e:
-                parent[find(int(b))] = find(int(a))
-    roots = np.array([find(i) for i in range(k)])
-    _, new_id = np.unique(roots[cluster], return_inverse=True)
+    dist = deltaE_ciede2000(cent_lab[:, None, :], cent_lab[None, :, :])
+    root = np.zeros(k, dtype=np.int64)
+    root[ids] = ids[_complete_linkage_groups(dist, delta_e)]
+    _, new_id = np.unique(root[cluster], return_inverse=True)
     new_id = new_id.ravel()
     m = int(new_id.max()) + 1
     msum = np.zeros((m, 3))

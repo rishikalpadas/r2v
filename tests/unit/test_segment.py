@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 from scipy import ndimage
 from PIL import Image
+from skimage.color import deltaE_ciede2000, rgb2lab
 
 from engine.presets import SegmentParams
 from engine.stages.segment import (
@@ -12,9 +13,9 @@ from engine.stages.segment import (
     _merge_small_components,
     segment,
 )
-from engine.stages.segment_palette import _drop_blend_clusters
+from engine.stages.segment_palette import _complete_linkage_groups, _drop_blend_clusters
 from engine.types import TRANSPARENT, RasterImage
-from eval.synthetic import flat_shapes, solid, transparent_logo
+from eval.synthetic import _circle_mask, flat_shapes, solid, supersample, transparent_logo
 
 
 def _img(pixels: np.ndarray) -> RasterImage:
@@ -206,3 +207,58 @@ def test_small_component_joins_longest_border_neighbour_in_any_direction():
 def test_params_types_validated(kwargs):
     with pytest.raises(ValueError):
         SegmentParams(**kwargs)
+
+
+# Near-white pinks like a real logo: white-light pink and pink-dark pink are each ~5.5-6 dE2000
+# apart, close enough that a coarse threshold or transitive (AA-bridged) merging fuses them.
+CHAIN_COLORS = {
+    "white": (255, 255, 255),
+    "light_pink": (249, 239, 242),
+    "pink": (237, 197, 205),
+    "dark_pink": (222, 174, 184),
+}
+
+
+def _chain_image(size: int = 128) -> np.ndarray:
+    """Concentric anti-aliased discs: white > light pink > pink > dark pink (AA ramps between)."""
+    rings = [(52.3, "light_pink"), (36.4, "pink"), (18.2, "dark_pink")]
+
+    def draw(n: int) -> np.ndarray:
+        k = n / size
+        px = solid(n, (*CHAIN_COLORS["white"], 255))
+        for r, name in rings:
+            px[_circle_mask(n, 64.3 * k, 63.6 * k, r * k)] = (*CHAIN_COLORS[name], 255)
+        return px
+
+    return supersample(draw, size)
+
+
+def _de(a, b) -> float:
+    lab = rgb2lab(np.array([a, b], np.float64).reshape(1, 2, 3) / 255.0)[0]
+    return float(deltaE_ciede2000(lab[0], lab[1]))
+
+
+def test_aa_bridged_near_colours_stay_distinct():
+    px = _chain_image()
+    assert len(np.unique(px[..., :3].reshape(-1, 3), axis=0)) > SegmentParams().max_colors
+    rm = segment(_img(px), SegmentParams())
+    palette = np.unique(rm.palette_rgb, axis=0)
+    for name, rgb in CHAIN_COLORS.items():
+        nearest = min(_de(rgb, p) for p in palette)
+        assert nearest < 3, f"{name} {rgb} lost; palette {palette.tolist()}"
+
+
+def test_complete_linkage_never_chains():
+    # A-B 4, B-C 4, A-C 8 at threshold 5: single linkage would chain A..C into one group.
+    dist = np.array([[0.0, 4.0, 8.0], [4.0, 0.0, 4.0], [8.0, 4.0, 0.0]])
+    groups = _complete_linkage_groups(dist, 5.0)
+    assert groups[0] != groups[2]
+    assert len(np.unique(groups)) == 2
+
+
+def test_complete_linkage_merges_tight_group_and_respects_strict_threshold():
+    dist = np.array([[0.0, 1.0, 2.0, 5.0], [1.0, 0.0, 1.5, 9.0], [2.0, 1.5, 0.0, 9.0],
+                     [5.0, 9.0, 9.0, 0.0]])
+    groups = _complete_linkage_groups(dist, 5.0)
+    assert groups[0] == groups[1] == groups[2]
+    assert groups[3] != groups[0]  # exactly at threshold: not merged
