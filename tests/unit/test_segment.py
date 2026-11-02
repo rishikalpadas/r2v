@@ -9,10 +9,10 @@ from PIL import Image
 from engine.presets import SegmentParams
 from engine.stages.segment import (
     _components,
-    _drop_blend_clusters,
     _merge_small_components,
     segment,
 )
+from engine.stages.segment_palette import _drop_blend_clusters
 from engine.types import TRANSPARENT, RasterImage
 from eval.synthetic import flat_shapes, solid, transparent_logo
 
