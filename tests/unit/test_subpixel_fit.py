@@ -240,7 +240,7 @@ def test_open_curve_corners_land_on_true_corners():
 
 
 def test_corner_line_intersection_rejects_near_parallel_lines():
-    from engine.stages.fit_geometry import _line_intersection
+    from engine.geometry.corner_placement import _line_intersection
 
     a = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
     shallow = np.array([[3.0, 0.0], [4.0, 0.2], [5.0, 0.4]])  # ~11 degrees
@@ -250,7 +250,7 @@ def test_corner_line_intersection_rejects_near_parallel_lines():
 
 
 def test_subpixel_corner_needs_samples_on_both_sides_and_a_near_hit():
-    from engine.stages.fit_geometry import _subpixel_corner
+    from engine.geometry.corner_placement import _subpixel_corner
 
     raw = [(x + 0.5, 0.2) for x in range(6)] + [(6.2, y + 0.5) for y in range(6)]
     dense = list(raw)
@@ -285,7 +285,7 @@ def test_corner_without_subpixel_intersection_falls_back_to_grid_snap():
 
 
 def test_subpixel_corner_rejects_intersection_behind_the_side_samples():
-    from engine.stages.fit_geometry import _subpixel_corner
+    from engine.geometry.corner_placement import _subpixel_corner
 
     # Side A runs +x and ends at x = 3.5; side B is the line x = 2, which meets A behind it.
     raw = [(x + 0.5, 0.0) for x in range(5)] + [(2.0, y + 0.5) for y in range(1, 7)]
