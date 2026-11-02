@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass, replace
 
 from engine.errors import InputError, StageError
+from engine.geometry.subpixel import make_edge_context
 from engine.loader import load_image
 from engine.presets import Preset, apply_overrides, resolve_preset
 from engine.stages.export import build_doc
@@ -49,7 +50,11 @@ def _run_trace(state: PipelineState) -> PipelineState:
 
 def _run_fit(state: PipelineState) -> PipelineState:
     graph = _need(state.graph, "boundary graph", "fit")
-    return replace(state, fitted=fit_geometry(graph, state.preset.fit, state.image.scale))
+    params = state.preset.fit
+    context = None
+    if params.enabled and params.subpixel:
+        context = make_edge_context(state.image, _need(state.regions, "regions", "fit"))
+    return replace(state, fitted=fit_geometry(graph, params, state.image.scale, context))
 
 
 def _run_export(state: PipelineState) -> PipelineState:
