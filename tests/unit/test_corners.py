@@ -200,3 +200,14 @@ def test_smooth_between_without_corners_is_smooth_dense():
 
     raw = _jittered_ring(_circle_ring(), 0.5, 0)
     assert smooth_between(raw, [], True, 2.0) == smooth_dense(raw, True, 2.0)
+
+
+def test_multiscale_keeps_a_fine_corner_too_near_an_open_end_for_the_coarse_scale():
+    from engine.geometry.corners import find_corners_multiscale
+
+    # A right angle 1 px before the end of an open curve: the coarse window does not fit there.
+    raw = dense_samples(((0.0, 0.0), (30.0, 0.0), (30.0, 1.0)), closed=False)
+    found = find_corners_multiscale(raw, False, 35.0, fine_sigma=1.0, coarse_sigma=2.0)
+    assert len(found.indices) == 3
+    corner = found.indices[1]
+    assert abs(raw[corner][0] - 30.0) <= 1.0 and np.isnan(found.coarse_angles[1])

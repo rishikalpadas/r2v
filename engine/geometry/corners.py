@@ -152,18 +152,21 @@ class MultiscaleCorners(NamedTuple):
     coarse_angles: tuple[float, ...]
 
 
+def _track_window(i: int, n: int, closed: bool) -> np.ndarray:
+    """Sample indices within TRACK_RADIUS of i (an open curve's end points excluded)."""
+    idx = np.arange(i - TRACK_RADIUS, i + TRACK_RADIUS + 1)
+    return idx % n if closed else idx[(idx > 0) & (idx < n - 1)]
+
+
 def _coarse_response(angles: np.ndarray, i: int, n: int, closed: bool) -> float:
     """Largest coarse turning angle within TRACK_RADIUS of sample i (NaN where undefined)."""
-    idx = np.arange(i - TRACK_RADIUS, i + TRACK_RADIUS + 1)
-    idx = idx % n if closed else idx[(idx >= 0) & (idx < n)]
-    window = angles[idx]
+    window = angles[_track_window(i, n, closed)]
     return float(np.nanmax(window)) if np.isfinite(window).any() else math.nan
 
 
 def _track_to_fine(fine_angles: np.ndarray, i: int, n: int, closed: bool) -> int:
     """Index of the strongest fine-scale turn within TRACK_RADIUS of coarse corner i."""
-    idx = np.arange(i - TRACK_RADIUS, i + TRACK_RADIUS + 1)
-    idx = idx % n if closed else idx[(idx > 0) & (idx < n - 1)]
+    idx = _track_window(i, n, closed)
     window = fine_angles[idx]
     return int(idx[int(np.nanargmax(window))]) if np.isfinite(window).any() else i
 
@@ -198,7 +201,8 @@ def find_corners_multiscale(
       the strongest fine-scale turn within TRACK_RADIUS samples, or
     * a fine-scale corner (`find_corners` at `fine_sigma`, window `fine_window`) whose coarse turn
       within TRACK_RADIUS also exceeds `angle_deg` -- so the two corners of a narrow end, which
-      the coarse scale sees as one, both survive.
+      the coarse scale sees as one, both survive -- or where the coarse turn is undefined (too
+      close to an open curve's end for the coarse window), which the coarse scale cannot judge.
 
     Indices are fine-scale positions; corners closer than `fine_window` collapse into one.
     """
@@ -220,16 +224,21 @@ def find_corners_multiscale(
         for i in find_corners(coarse_pts, closed, angle_deg, window)
         if closed or 0 < i < n - 1
     ]
-    confirmed = [
-        i for i in fine
-        if i not in ends and _coarse_response(coarse_angles, i, n, closed) > angle_deg
-    ]
-    inner = _dedupe_close(tracked + confirmed, fine_angles, fine_window)
-    corners = sorted(ends + inner)
-    responses = [
-        math.nan if i in ends else _coarse_response(coarse_angles, i, n, closed) for i in corners
-    ]
+
+    def response(i: int) -> float:  # NaN: an end, or the coarse window does not fit at i
+        if i in ends or math.isnan(coarse_angles[i]):
+            return math.nan
+        return _coarse_response(coarse_angles, i, n, closed)
+
+    confirmed = [i for i in fine if i not in ends and not response(i) <= angle_deg]
+    corners = sorted(ends + _dedupe_close(tracked + confirmed, fine_angles, fine_window))
+    responses = [response(i) for i in corners]
     return MultiscaleCorners(tuple(corners), tuple(responses))
+
+
+def even_breaks(n: int, spans: int) -> list[int]:
+    """Indices 0..n splitting a corner-free ring of n samples into `spans` near-equal runs."""
+    return [n * k // spans for k in range(spans + 1)]
 
 
 def smooth_between(
