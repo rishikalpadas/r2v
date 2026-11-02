@@ -220,3 +220,55 @@ def test_axis_snap_keeps_g1_with_bezier_neighbour():
     assert b.c1[1] == pytest.approx(b.p0[1], abs=1e-9)  # handle follows the now-horizontal line
     assert math.dist(b.c1, b.p0) == pytest.approx(6.0)  # handle length preserved
     assert b.c1[0] > b.p0[0]
+
+
+# ---------------------------------------------------------------- noise-normalised MDL
+
+
+def _jittered_line(n=40, sigma=0.25, seed=0):
+    rng = np.random.default_rng(seed)
+    return [(float(i), 5.0 + float(e)) for i, e in enumerate(rng.normal(0.0, sigma, n))]
+
+
+def _scaled(points, k):
+    return [(x * k, y * k) for x, y in points]
+
+
+def test_fit_span_scored_cost_is_sse_over_noise_variance_plus_penalty():
+    from engine.geometry.segment_fit import fit_span_scored
+
+    pts = [(float(i), 0.1 * (i % 2)) for i in range(11)]
+    segs, cost = fit_span_scored(pts, PARAMS, noise=0.5)
+    (line,) = segs
+    sse = fit_line(pts)[1]
+    assert cost == pytest.approx(sse / 0.25 + PARAMS.complexity_weight * 4)
+    assert fit_span_scored(pts, PARAMS)[0] == fit_span(pts, PARAMS)
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_noise_normalised_choice_does_not_drift_with_scale(seed):
+    from engine.geometry.segment_fit import fit_span_scored
+
+    pts = _jittered_line(seed=seed)
+    kinds = []
+    for k in (1.0, 8.0):
+        params = FitParams(tolerance_px=PARAMS.tolerance_px * k)
+        segs, _ = fit_span_scored(_scaled(pts, k), params, noise=0.25 * k)
+        kinds.append(tuple(type(s).__name__ for s in segs))
+    assert kinds[0] == kinds[1]
+
+
+def test_old_cost_drifts_with_scale():
+    """Why the cost is normalised: sse grows with scale squared, the penalty did not."""
+    pts = _jittered_line(seed=0)
+    assert [type(s) for s in fit_span(pts, PARAMS)] == [Line]
+    big = fit_span(_scaled(pts, 8.0), FitParams(tolerance_px=PARAMS.tolerance_px * 8.0))
+    assert [type(s) for s in big] != [Line]
+
+
+def test_noise_below_floor_is_clamped():
+    from engine.geometry.noise import NOISE_FLOOR_PX
+    from engine.geometry.segment_fit import fit_span_scored
+
+    pts = _jittered_line(sigma=0.05)
+    assert fit_span_scored(pts, PARAMS, noise=0.0) == fit_span_scored(pts, PARAMS, noise=NOISE_FLOOR_PX)
