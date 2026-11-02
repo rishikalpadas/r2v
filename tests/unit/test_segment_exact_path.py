@@ -2,6 +2,8 @@
 
 Fix 3 (colour segmentation) targets noisy JPEG/AA input only. Digests were recorded from master:
 sha256 of segment labels (<i4) + palette bytes, and sha256 of the exported SVG (first 16 hex).
+The SVG digest pins `fit.adaptive=False`: fix 2 (noise-adaptive fitting) deliberately changes the
+fit, and `adaptive=False` is its reproduce-the-old-fit switch, so this still isolates segmentation.
 """
 import hashlib
 
@@ -65,5 +67,5 @@ def test_exact_colour_output_identical_to_master(call, seg_digest, svg_digest):
     rm = segment(RasterImage(pixels=px, original_size=px.shape[1::-1]), SegmentParams())
     seg = hashlib.sha256(rm.labels.astype("<i4").tobytes() + rm.palette_rgb.tobytes())
     assert seg.hexdigest()[:16] == seg_digest
-    svg = to_svg(vectorize(to_png_bytes(px)).doc)
+    svg = to_svg(vectorize(to_png_bytes(px), overrides={"fit.adaptive": False}).doc)
     assert hashlib.sha256(svg.encode()).hexdigest()[:16] == svg_digest
