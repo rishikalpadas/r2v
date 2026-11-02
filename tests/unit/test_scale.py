@@ -128,6 +128,7 @@ def test_speck_area_scales_with_scale_squared():
     px = np.full((24, 24, 4), 255, np.uint8)
     px[:, 12:] = (0, 0, 255, 255)
     px[3, 1:21] = (255, 0, 0, 255)  # 1-px line, 20 px, the only red: no interior pixel
+    px[23, :, :3] = (np.arange(24) * 3 + 100)[:, None]  # grey ramp row: the noisy path
     kept = segment(_image(px), SegmentParams())
     assert kept.labels[3, 5] != kept.labels[0, 0]
     # 20 processing px are 5 original px at scale 2: below SPECK_MAX_PX, so a speck.

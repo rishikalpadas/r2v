@@ -1,6 +1,8 @@
 """Segment palette: cluster pixel colours into a palette of real (non-blend) colours."""
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 from skimage.color import deltaE_ciede2000, rgb2lab
 from sklearn.cluster import KMeans
@@ -13,6 +15,14 @@ BLEND_MAX_SHARE = 0.05
 # anti-alias blend clusters 0.00 (<= 0.03 at k=32), every real colour >= 0.43.
 BLEND_MAX_INTERIOR = 0.10
 KMEANS_N_INIT = 4
+# Re-merge of one noisy colour that complete linkage split (its noise cloud is wider than the
+# merge threshold). Split halves interleave pixel by pixel; real colours occupy solid areas.
+# Measured: noise splits share >= 0.85 4-neighbour edges per pixel of the smaller half and
+# the sparser half has interior fraction <= 0.29; real near colours on a JPEG logo <= 0.39 and
+# >= 0.54. Halves sit up to dE ~8 apart, so the colour bound is a multiple of merge_delta_e.
+REMERGE_MIN_SHARED_EDGES = 0.5
+REMERGE_MAX_INTERIOR = 0.5
+REMERGE_DELTA_E_FACTOR = 2.0
 
 
 def _to_lab(rgb: np.ndarray) -> np.ndarray:
@@ -94,8 +104,12 @@ def _merge_clusters(
 
 
 def _interior_mask(labels: np.ndarray) -> np.ndarray:
-    """Pixels whose whole 3x3 neighbourhood has their label (image edges replicate outward)."""
-    pad = np.pad(labels, 1, mode="edge")
+    """Pixels whose whole 3x3 neighbourhood has their label.
+
+    Outside the image counts as a different label, so a 1-2 px strip along the border is not
+    mistaken for solid area.
+    """
+    pad = np.pad(labels, 1, mode="constant", constant_values=labels.min(initial=0) - 1)
     h, w = labels.shape
     inside = np.ones(labels.shape, dtype=bool)
     for dy in range(3):
@@ -144,3 +158,51 @@ def _drop_blend_clusters(
     nearest = np.argmin(dist[:, kept], axis=1)
     nearest[kept] = np.arange(len(kept))
     return nearest[cluster], palette[kept]
+
+
+def _shared_edges(labels: np.ndarray, n: int) -> np.ndarray:
+    """Symmetric (n, n) count of 4-neighbour pixel edges between differing labels >= 0."""
+    a = np.concatenate([labels[:, :-1].ravel(), labels[:-1, :].ravel()])
+    b = np.concatenate([labels[:, 1:].ravel(), labels[1:, :].ravel()])
+    keep = (a >= 0) & (b >= 0) & (a != b)
+    edges = np.bincount(a[keep] * n + b[keep], minlength=n * n).reshape(n, n)
+    return edges + edges.T
+
+
+def _merge_intermixed(
+    cluster: np.ndarray,
+    palette: np.ndarray,
+    labels_of: Callable[[np.ndarray], np.ndarray],
+    delta_e: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Re-merge clusters that are pixel-interleaved splits of one noisy colour.
+
+    Greedy: merge the closest pair (palette dE2000 < REMERGE_DELTA_E_FACTOR * delta_e) that
+    shares many edges relative to the smaller cluster's area while one of them has little
+    solid interior; the merged colour is their area-weighted mean; repeat. Unmerged colours
+    are unchanged. `labels_of(cluster)` builds the label map. Returns (cluster ids, palette).
+    """
+    palette = palette.copy()
+    while len(palette) > 1:
+        n = len(palette)
+        labels = labels_of(cluster)
+        area = np.bincount(labels[labels >= 0], minlength=n)
+        interior = _interior_fraction(labels, n)
+        mixed = _shared_edges(labels, n) / np.maximum(np.minimum.outer(area, area), 1)
+        lab = _to_lab(palette)
+        dist = deltaE_ciede2000(lab[:, None, :], lab[None, :, :])
+        candidate = (
+            (dist < REMERGE_DELTA_E_FACTOR * delta_e)
+            & (mixed >= REMERGE_MIN_SHARED_EDGES)
+            & (np.minimum.outer(interior, interior) < REMERGE_MAX_INTERIOR)
+        )
+        np.fill_diagonal(candidate, False)
+        if not candidate.any():
+            break
+        i, j = sorted(divmod(int(np.argmin(np.where(candidate, dist, np.inf))), n))
+        mean = (palette[i] * float(area[i]) + palette[j] * float(area[j])) / max(area[i] + area[j], 1)
+        palette[i] = np.clip(np.rint(mean), 0, 255).astype(np.uint8)
+        palette = np.delete(palette, j, axis=0)
+        cluster = np.where(cluster == j, i, cluster)
+        cluster = np.where(cluster > j, cluster - 1, cluster)
+    return cluster, palette

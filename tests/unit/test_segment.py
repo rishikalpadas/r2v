@@ -9,6 +9,7 @@ from skimage.color import deltaE_ciede2000, rgb2lab
 
 from engine.presets import SegmentParams
 from engine.stages.segment import (
+    SPECK_MAX_PX,
     _components,
     _merge_small_components,
     segment,
@@ -127,11 +128,15 @@ def test_kmeans_path_deterministic():
 
 def test_drop_blend_clusters_never_yields_invalid_ids():
     palette = np.array([[0, 0, 0], [255, 255, 255], [120, 120, 120], [127, 127, 127]], np.uint8)
-    labels = np.repeat(np.array([0, 1, 2, 3]), [1000, 1000, 30, 10]).reshape(1, -1)
+    labels = np.zeros((50, 41), np.int32)
+    labels[:, 21:] = 1
+    labels[:, 20] = 3  # 1-px ribbon between black and white: a blend, dropped
+    labels[10:15, 5:11] = 2  # 30-px solid grey block
     counts = np.bincount(labels.ravel())
     cluster = np.array([0, 1, 2, 3])
     new, kept = _drop_blend_clusters(cluster, palette, counts, labels)
     assert (new >= 0).all() and (new < len(kept)).all()
+    assert len(kept) == 3 and (127, 127, 127) not in {tuple(c) for c in kept}
 
 
 def _blend_drop_case() -> tuple[np.ndarray, np.ndarray]:
@@ -337,15 +342,22 @@ def _speck_image() -> tuple[np.ndarray, dict[str, tuple[int, int, int]]]:
     return px, c
 
 
+def _speck_merge_result(px: np.ndarray) -> np.ndarray:
+    """Colour per pixel after the noisy-path small-component merge (min 4 px, speck 16 px)."""
+    colours, labels = np.unique(px[..., :3].reshape(-1, 3), axis=0, return_inverse=True)
+    comp, comp_cluster = _components(labels.reshape(px.shape[:2]).astype(np.int32))
+    roots = _merge_small_components(comp, comp_cluster, 4, SPECK_MAX_PX)
+    return colours[comp_cluster[roots[comp]]]
+
+
 def test_fringe_specks_merged_but_dots_and_lines_survive():
     px, c = _speck_image()
-    rm = segment(_img(px), SegmentParams())
-    palette = {tuple(int(v) for v in p) for p in rm.palette_rgb}
+    colour = _speck_merge_result(px)
+    present = {tuple(int(v) for v in p) for p in colour.reshape(-1, 3)}
     for gone in ("red", "green", "grey"):
-        assert c[gone] not in palette, gone
+        assert c[gone] not in present, gone
     for kept in ("blue", "orange", "purple"):
-        assert c[kept] in palette, kept
-    colour = rm.palette_rgb[rm.labels]
+        assert c[kept] in present, kept
     assert (colour[10:13, 18:21] == c["blue"]).all()
     assert (colour[60, 12:52] == c["orange"]).all()
     assert (colour[40:43, 45:47] == 0).all()  # 4-px white speck absorbed by black
@@ -354,21 +366,75 @@ def test_fringe_specks_merged_but_dots_and_lines_survive():
 
 def test_pixels_diagonally_touching_a_solid_block_are_specks():
     px = solid(40, (255, 255, 255, 255))
-    px[0, :, :3] = np.arange(40)[:, None] + 100  # grey ramp row: > max_colors, the noisy path
     px[10:30, 10:30, :3] = (200, 30, 90)  # solid block: its 8-connected reach has interior
     px[9, 9, :3] = (200, 30, 90)  # 1 px touching the top-left corner diagonally
     px[30:32, 30, :3] = (200, 30, 90)  # 2 px touching the bottom-right corner diagonally
-    rm = segment(_img(px), SegmentParams())
+    rm = segment(_img(_with_ramp_row(px)), SegmentParams())
     colour = rm.palette_rgb[rm.labels]
     assert (colour[9, 9] == 255).all()
     assert (colour[30:32, 30] == 255).all()
     assert (colour[10:30, 10:30] == (200, 30, 90)).all()
 
 
-def test_exact_colour_tips_diagonally_touching_a_shape_survive():
-    # Exact flat art (<= max_colors colors): a 1-px tip is part of the aliased shape, not noise.
-    px = solid(40, (255, 255, 255, 255))
-    px[10:30, 10:30, :3] = (200, 30, 90)
-    px[9, 9, :3] = (200, 30, 90)
+def test_exact_colour_input_keeps_specks():
+    # Exact flat art (<= max_colors colors) has no JPEG speckle: specks are real details.
+    px, c = _speck_image()
+    px[9, 17, :3] = c["blue"]  # 1-px tip diagonally touching the blue dot
     rm = segment(_img(px), SegmentParams())
-    assert tuple(rm.palette_rgb[rm.labels[9, 9]]) == (200, 30, 90)
+    palette = {tuple(int(v) for v in p) for p in rm.palette_rgb}
+    assert all(c[name] in palette for name in ("red", "green", "grey"))
+    assert tuple(rm.palette_rgb[rm.labels[9, 17]]) == c["blue"]
+
+
+def _noisy(base: np.ndarray, amp: int, jpeg_quality: int | None) -> np.ndarray:
+    """Uniform +-amp noise on an RGB image, optionally JPEG round-tripped; returns RGBA."""
+    rng = np.random.default_rng(amp)
+    rgb = np.clip(base.astype(int) + rng.integers(-amp, amp + 1, base.shape), 0, 255).astype(np.uint8)
+    if jpeg_quality is not None:
+        buf = io.BytesIO()
+        Image.fromarray(rgb, "RGB").save(buf, format="JPEG", quality=jpeg_quality)
+        rgb = np.array(Image.open(io.BytesIO(buf.getvalue())).convert("RGB"))
+    return np.dstack([rgb, np.full(rgb.shape[:2], 255, np.uint8)])
+
+
+NOISE_CASES = [(3, None), (6, None), (10, None), (3, 85), (6, 85), (10, 85)]
+
+
+@pytest.mark.parametrize(("amp", "quality"), NOISE_CASES)
+def test_noisy_single_flat_colour_is_one_region(amp, quality):
+    px = _noisy(np.full((120, 120, 3), (120, 160, 200)), amp, quality)
+    rm = segment(_img(px), SegmentParams())
+    assert len(np.unique(rm.palette_rgb, axis=0)) == 1
+    assert len(rm.palette_rgb) <= 3
+
+
+@pytest.mark.parametrize(("amp", "quality"), NOISE_CASES)
+def test_noisy_two_flat_colours_give_two_entries(amp, quality):
+    base = np.full((200, 200, 3), (120, 160, 200))
+    base[:, 100:] = (240, 230, 200)
+    rm = segment(_img(_noisy(base, amp, quality)), SegmentParams())
+    assert len(np.unique(rm.palette_rgb, axis=0)) == 2
+
+
+def test_small_noisy_grey_is_one_colour():
+    px = _noisy(np.full((30, 30, 3), 128), 3, None)
+    rm = segment(_img(px), SegmentParams())
+    assert len(rm.palette_rgb) == 1
+
+
+def _with_ramp_row(px: np.ndarray) -> np.ndarray:
+    """Grey ramp in row 0: more than max_colors colours, so segment takes the noisy path."""
+    out = px.copy()
+    out[0, :, :3] = (np.arange(px.shape[1]) % 64 + 100)[:, None]
+    return out
+
+
+def test_noisy_diagonal_hairline_attached_to_solid_block_survives():
+    px = solid(80, (255, 255, 255, 255))
+    px[10:30, 10:30, :3] = (200, 30, 90)
+    line = [(30 + i, 30 + i) for i in range(40)]  # 1-px 45 degree line leaving the corner
+    for y, x in line:
+        px[y, x, :3] = (200, 30, 90)
+    rm = segment(_img(_with_ramp_row(px)), SegmentParams())
+    colour = rm.palette_rgb[rm.labels]
+    assert all((colour[y, x] == (200, 30, 90)).all() for y, x in line)

@@ -13,6 +13,7 @@ from engine.stages.segment_palette import (
     _drop_blend_clusters,
     _interior_mask,
     _merge_clusters,
+    _merge_intermixed,
     _to_lab,
 )
 from engine.types import TRANSPARENT, RasterImage, RegionMap
@@ -25,9 +26,9 @@ MAX_SPECKLE_OWN_VOTES = 1
 MIN_WINNER_VOTES = 5
 MAX_BLEND_OWN_VOTES = 5
 BLEND_TOLERANCE = 1.2
-# Components below this area (original px) with no interior pixel (none whose 3x3 is all its
-# own colour) are fringe or JPEG speckle and merge away even when last of their colour. Real
-# thin lines are longer than this; genuine small dots have an interior pixel.
+# Noisy (KMeans) input only: components below this area (original px) with no interior pixel
+# (none whose 3x3 is all its own colour) are fringe or JPEG speckle and merge away even when
+# last of their colour. Real thin lines are longer; genuine small dots have an interior pixel.
 SPECK_MAX_PX = 16
 
 
@@ -111,48 +112,46 @@ def _components(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _diagonal_reach(
-    comp: np.ndarray, comp_cluster: np.ndarray, interior: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per component: pixel count of its 8-connected same-color group, and whether that group
-    has any interior pixel (`interior`: per-pixel mask).
+    comp: np.ndarray, comp_cluster: np.ndarray, within: np.ndarray | None = None
+) -> np.ndarray:
+    """Pixel count of each component's 8-connected same-color group.
 
     Staircase pieces of a thin diagonal line are tiny 4-connected components but belong to
-    one long feature; judging smallness on the 8-connected group keeps them.
+    one long feature; judging smallness on the 8-connected group keeps them. With `within`
+    (a pixel mask holding whole components), groups only span those pixels; components
+    outside it get 0.
     """
     reach = np.zeros(len(comp_cluster), dtype=np.int64)
-    group_interior = np.zeros(len(comp_cluster), dtype=bool)
     eight = np.ones((3, 3), dtype=int)
-    cluster_map = comp_cluster[comp]
-    for c in np.unique(comp_cluster[1:]):
+    cluster_map = np.where(comp > 0, comp_cluster[comp], -1)
+    if within is not None:
+        cluster_map = np.where(within, cluster_map, -1)
+    for c in np.unique(cluster_map[cluster_map >= 0]):
         mask = cluster_map == c
         lab, n = ndimage.label(mask, structure=eight)
         group_sizes = np.bincount(lab.ravel(), minlength=n + 1)
-        solid = np.bincount(lab[interior & mask], minlength=n + 1) > 0
         ids, first = np.unique(comp[mask], return_index=True)
-        groups = lab[mask][first]
-        reach[ids] = group_sizes[groups]
-        group_interior[ids] = solid[groups]
-    return reach, group_interior
+        reach[ids] = group_sizes[lab[mask][first]]
+    return reach
 
 
 def _merge_small_components(
-    comp: np.ndarray,
-    comp_cluster: np.ndarray,
-    min_px: int,
-    speck_px: int = 0,
-    noisy: bool = False,
+    comp: np.ndarray, comp_cluster: np.ndarray, min_px: int, speck_px: int = 0
 ) -> np.ndarray:
     """Root id per component id; small ones join their longest-border neighbor.
 
     Small = 8-connected same-color group under min_px (kept if it is the only component of its
-    color), or a speck: no interior pixel and under speck_px (merged even if last of its
-    color). On noisy input a speck diagonally attached to a solid same-color area is sized by
-    its own 4-connected area; otherwise (and always for thin lines) by its 8-connected group.
+    color), or a speck (merged even if last of its color): a component with no interior pixel
+    whose 8-connected group of interior-less same-color components is under speck_px. Thin
+    lines and staircases stay protected even when attached to a solid area of their color;
+    a stray pixel touching such an area diagonally does not borrow the area's size.
     """
     sizes = np.bincount(comp.ravel(), minlength=len(comp_cluster)).astype(np.int64)
-    interior = _interior_mask(comp)
-    reach, group_interior = _diagonal_reach(comp, comp_cluster, interior)
-    has_interior = np.bincount(comp[interior], minlength=len(comp_cluster)) > 0
+    reach = _diagonal_reach(comp, comp_cluster)
+    has_interior = np.bincount(comp[_interior_mask(comp)], minlength=len(comp_cluster)) > 0
+    thin = (comp > 0) & ~has_interior[comp]
+    thin_reach = _diagonal_reach(comp, comp_cluster, thin)
+    speck = (thin_reach < speck_px) & ~has_interior
     a, b = _edge_pairs(comp)
     borders: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     n_ids = len(comp_cluster)
@@ -169,11 +168,6 @@ def _merge_small_components(
             i = parent[i]
         return int(i)
 
-    # An interior-less piece of an interior-less 8-group (thin line, staircase) is judged by the
-    # group. On noisy input a stray pixel diagonally touching a solid area is JPEG/AA residue and
-    # is judged by its own 4-conn size; on exact-color input it is a real aliased shape tip.
-    speck_size = np.where(group_interior & noisy, sizes, reach)
-    speck = (speck_size < speck_px) & ~has_interior
     small = [
         i for i in range(1, len(sizes))
         if speck[i] or (reach[i] < min_px and per_cluster[comp_cluster[i]] > 1)
@@ -230,19 +224,27 @@ def segment(image: RasterImage, params: SegmentParams) -> RegionMap:
     cluster = _cluster_colors(colors, pixel_colors, params)
     cluster, palette = _merge_clusters(colors, counts, cluster, params.merge_delta_e)
     noisy = len(colors) > params.max_colors  # quantized (KMeans) input
-    labels = np.full((h, w), TRANSPARENT, dtype=np.int32)
-    labels[opaque] = cluster[pixel_colors]
+
+    def labels_of(cluster_ids: np.ndarray) -> np.ndarray:
+        out = np.full((h, w), TRANSPARENT, dtype=np.int32)
+        out[opaque] = cluster_ids[pixel_colors]
+        return out
+
+    labels = labels_of(cluster)
     if noisy and len(palette) >= 3:
         per_cluster = np.bincount(cluster[pixel_colors], minlength=len(palette))
         cluster, palette = _drop_blend_clusters(cluster, palette, per_cluster, labels)
-        labels[opaque] = cluster[pixel_colors]
+    if noisy:
+        cluster, palette = _merge_intermixed(cluster, palette, labels_of, params.merge_delta_e)
+    labels = labels_of(cluster)
     labels = _majority_cleanup(labels, palette, noisy)
 
     comp, comp_cluster = _components(labels)
     # min_region_px is an area in original pixels; one original pixel covers scale^2 here.
     min_px = round(params.min_region_px * image.scale**2)
-    speck_px = round(SPECK_MAX_PX * image.scale**2)
-    merged = _merge_small_components(comp, comp_cluster, min_px, speck_px, noisy)[comp]
+    # Speck cleanup targets JPEG/AA residue: exact-color input has none, its specks are real.
+    speck_px = round(SPECK_MAX_PX * image.scale**2) if noisy else 0
+    merged = _merge_small_components(comp, comp_cluster, min_px, speck_px)[comp]
     survivors, region = np.unique(merged[comp > 0], return_inverse=True)
     out = np.full((h, w), TRANSPARENT, dtype=np.int32)
     out[comp > 0] = region.ravel().astype(np.int32)
