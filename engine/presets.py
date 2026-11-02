@@ -55,12 +55,15 @@ class FitParams:
     smooth_sigma: float = 1.0
     corner_angle_deg: float = 35.0
     subpixel: bool = True  # place edges between pixels using anti-aliased edge colours
+    adaptive: bool = True  # scale smoothing, corners, tolerance and model cost to edge noise
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ValueError("enabled must be a bool")
         if not isinstance(self.subpixel, bool):
             raise ValueError("subpixel must be a bool")
+        if not isinstance(self.adaptive, bool):
+            raise ValueError("adaptive must be a bool")
         numeric = (self.tolerance_px, self.complexity_weight, self.axis_snap_deg,
                    self.smooth_sigma, self.corner_angle_deg)
         if not all(_is_finite_number(v) for v in numeric):
