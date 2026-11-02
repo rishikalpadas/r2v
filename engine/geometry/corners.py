@@ -6,8 +6,9 @@ here therefore work on a *dense* representation with one sample per unit crack e
 
 Conventions
 -----------
-* `smooth_polyline` resamples at unit-edge midpoints, Gaussian-smooths the coordinates and returns
-  the smoothed dense sequence.
+* `smooth_polyline` resamples at unit-edge midpoints (`dense_samples`), Gaussian-smooths the
+  coordinates (`smooth_dense`) and returns the smoothed dense sequence. The two halves are
+  separate so callers can move the dense samples (e.g. to sub-pixel edges) before smoothing.
 * Closed curves are treated as cyclic and the output does NOT repeat the first point (unlike
   `BoundaryCurve.points`, which does). `find_corners(closed=True)` expects that same convention.
 * Open curves keep their original first and last points exactly (they are shared junctions); the
@@ -33,10 +34,12 @@ def _unit_midpoints(a: Point, b: Point) -> list[Point]:
     return [(a[0] + dx * (k + 0.5), a[1] + dy * (k + 0.5)) for k in range(pieces)]
 
 
-def smooth_polyline(points: tuple[Point, ...], closed: bool, sigma: float = 1.0) -> tuple[Point, ...]:
-    """Resample at unit-edge midpoints and Gaussian-smooth; open endpoints stay exactly fixed."""
-    if sigma < 0:
-        raise ValueError(f"sigma must be >= 0, got {sigma}")
+def dense_samples(points: tuple[Point, ...], closed: bool) -> tuple[Point, ...]:
+    """One sample per unit edge, at its midpoint.
+
+    Open: the exact first and last points are added at the ends. Closed: cyclic, the first
+    sample is not repeated (a repeated closing point in `points` is ignored).
+    """
     if len(points) < 2:
         return tuple(points)
     ring = points[:-1] if closed and points[0] == points[-1] else points
@@ -44,17 +47,33 @@ def smooth_polyline(points: tuple[Point, ...], closed: bool, sigma: float = 1.0)
     dense: list[Point] = []
     for a, b in segments:
         dense.extend(_unit_midpoints(a, b))
-    if closed and len(dense) < _MIN_CLOSED_POINTS:
-        return tuple(dense)
     if not closed:
         dense = [points[0], *dense, points[-1]]
+    return tuple(dense)
+
+
+def smooth_dense(dense: tuple[Point, ...], closed: bool, sigma: float = 1.0) -> tuple[Point, ...]:
+    """Gaussian-smooth a dense sequence (see `dense_samples`); open endpoints stay exactly fixed."""
+    if sigma < 0:
+        raise ValueError(f"sigma must be >= 0, got {sigma}")
+    if (closed and len(dense) < _MIN_CLOSED_POINTS) or len(dense) < 2:
+        return tuple(dense)
     arr = np.asarray(dense, np.float64)
     if sigma > 0:
         arr = gaussian_filter1d(arr, sigma, axis=0, mode="wrap" if closed else "nearest")
     out = [(float(x), float(y)) for x, y in arr]
     if not closed:
-        out[0], out[-1] = points[0], points[-1]
+        out[0], out[-1] = dense[0], dense[-1]
     return tuple(out)
+
+
+def smooth_polyline(points: tuple[Point, ...], closed: bool, sigma: float = 1.0) -> tuple[Point, ...]:
+    """Resample at unit-edge midpoints and Gaussian-smooth; open endpoints stay exactly fixed."""
+    if sigma < 0:
+        raise ValueError(f"sigma must be >= 0, got {sigma}")
+    if len(points) < 2:
+        return tuple(points)
+    return smooth_dense(dense_samples(points, closed), closed, sigma)
 
 
 def _turning_angles(arr: np.ndarray, closed: bool, window: int) -> np.ndarray:
