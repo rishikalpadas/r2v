@@ -31,7 +31,7 @@ from dataclasses import dataclass
 import numpy as np
 from skimage.color import rgb2lab
 
-from engine.geometry.corners import dense_samples
+from engine.geometry.corners import dense_samples, unit_pieces
 from engine.types import OUTSIDE, TRANSPARENT, BoundaryCurve, Point, RasterImage, RegionMap
 
 WINDOW = 2  # pixels read per side: a 30-60 degree edge spreads its blend over ~2 pixels
@@ -78,7 +78,8 @@ def _right_normals(points: tuple[Point, ...], closed: bool) -> np.ndarray:
         pts = np.vstack([pts, pts[:1]])
     vec = np.diff(pts, axis=0)
     length = np.hypot(vec[:, 0], vec[:, 1])
-    pieces = np.maximum(1, np.rint(length)).astype(np.int64)
+    # Same piece count as `dense_samples`, so normals line up one-to-one with its midpoints.
+    pieces = [unit_pieces(tuple(a), tuple(b)) for a, b in zip(pts[:-1], pts[1:])]
     unit = vec / np.where(length > 0, length, 1.0)[:, None]
     normals = np.stack([unit[:, 1], -unit[:, 0]], axis=1)  # right of (dx, dy) is (dy, -dx)
     return np.repeat(normals, pieces, axis=0)
@@ -153,6 +154,8 @@ def subpixel_dense(curve: BoundaryCurve, ctx: EdgeContext) -> tuple[Point, ...]:
     inner = dense if curve.closed else dense[1:-1]
     mids = np.asarray(inner, np.float64)
     normals = _right_normals(curve.points, curve.closed)
+    if len(normals) != len(mids):
+        raise ValueError(f"{len(mids)} dense samples but {len(normals)} normals")
     offsets = _offsets(mids, normals, ctx)
     if not offsets.any():
         return dense

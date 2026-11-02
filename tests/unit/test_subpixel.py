@@ -178,3 +178,15 @@ def test_make_edge_context_rejects_mismatched_shapes():
     regions = RegionMap(np.zeros((4, 4), np.int32), palette, _to_lab(palette), frozenset())
     with pytest.raises(ValueError):
         make_edge_context(RasterImage(pixels, (8, 8)), regions)
+
+
+def test_sample_and_normal_counts_must_agree(monkeypatch):
+    import engine.geometry.subpixel as sp
+
+    pixels = aa_half_plane(16, x0=6.3, left=WHITE, right=BLUE)
+    ctx, regions = _context(pixels, (WHITE, BLUE))
+    (curve,) = _inner_curves(regions)
+    real = sp._right_normals
+    monkeypatch.setattr(sp, "_right_normals", lambda pts, closed: real(pts, closed)[:-1])
+    with pytest.raises(ValueError, match="normals"):
+        subpixel_dense(curve, ctx)

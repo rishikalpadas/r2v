@@ -27,9 +27,14 @@ from engine.types import Point
 _MIN_CLOSED_POINTS = 3
 
 
+def unit_pieces(a: Point, b: Point) -> int:
+    """Number of unit-length pieces segment a->b is resampled into (at least one)."""
+    return max(1, round(math.hypot(b[0] - a[0], b[1] - a[1])))
+
+
 def _unit_midpoints(a: Point, b: Point) -> list[Point]:
     """Midpoints of the unit-length pieces of segment a->b (at least one piece)."""
-    pieces = max(1, round(math.hypot(b[0] - a[0], b[1] - a[1])))
+    pieces = unit_pieces(a, b)
     dx, dy = (b[0] - a[0]) / pieces, (b[1] - a[1]) / pieces
     return [(a[0] + dx * (k + 0.5), a[1] + dy * (k + 0.5)) for k in range(pieces)]
 
