@@ -22,7 +22,8 @@ def _is_finite_number(value: object) -> bool:
 @dataclass(frozen=True)
 class SegmentParams:
     max_colors: int = 16
-    merge_delta_e: float = 8.0
+    # Complete-linkage dE2000 bound; 5 keeps light pink (dE ~5 from white) distinct.
+    merge_delta_e: float = 5.0
     min_region_px: int = 4
     sample_px: int = 200_000
     seed: int = 0

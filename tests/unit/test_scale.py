@@ -114,12 +114,26 @@ def test_canvas_underlay_uses_original_size():
 def test_min_region_area_scales_with_scale_squared():
     px = np.full((16, 16, 4), 255, np.uint8)
     px[:, 8:] = (0, 0, 255, 255)
-    px[2:4, 2:4] = (0, 0, 255, 255)  # 4 px speck of a colour that has another component
-    params = SegmentParams(min_region_px=4)
-    assert segment(_image(px), params).labels[2, 2] != segment(_image(px), params).labels[0, 0]
-    # The same 4 processing px are only 1 original px at scale 2: below min_region_px.
+    # 3x3 dot (has an interior pixel, so it is not a speck) of a colour with another component
+    px[2:5, 2:5] = (0, 0, 255, 255)
+    params = SegmentParams(min_region_px=9)
+    kept = segment(_image(px), params)
+    assert kept.labels[3, 3] != kept.labels[0, 0]
+    # The same 9 processing px are only 2.25 original px at scale 2: below min_region_px.
     merged = segment(_image(px, 2.0, (8, 8)), params)
-    assert merged.labels[2, 2] == merged.labels[0, 0]
+    assert merged.labels[3, 3] == merged.labels[0, 0]
+
+
+def test_speck_area_scales_with_scale_squared():
+    px = np.full((24, 24, 4), 255, np.uint8)
+    px[:, 12:] = (0, 0, 255, 255)
+    px[3, 1:21] = (255, 0, 0, 255)  # 1-px line, 20 px, the only red: no interior pixel
+    px[23, :, :3] = (np.arange(24) * 3 + 100)[:, None]  # grey ramp row: the noisy path
+    kept = segment(_image(px), SegmentParams())
+    assert kept.labels[3, 5] != kept.labels[0, 0]
+    # 20 processing px are 5 original px at scale 2: below SPECK_MAX_PX, so a speck.
+    merged = segment(_image(px, 2.0, (12, 12)), SegmentParams())
+    assert merged.labels[3, 5] == merged.labels[0, 0]
 
 
 def _closed_square_graph(side: int) -> BoundaryGraph:

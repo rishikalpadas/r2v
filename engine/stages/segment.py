@@ -5,10 +5,17 @@ from collections import defaultdict
 
 import numpy as np
 from scipy import ndimage
-from skimage.color import deltaE_ciede2000, rgb2lab
-from sklearn.cluster import KMeans
+from skimage.color import deltaE_ciede2000
 
 from engine.presets import SegmentParams
+from engine.stages.segment_palette import (
+    _cluster_colors,
+    _drop_blend_clusters,
+    _interior_mask,
+    _merge_clusters,
+    _merge_intermixed,
+    _to_lab,
+)
 from engine.types import TRANSPARENT, RasterImage, RegionMap
 
 OPAQUE_ALPHA = 128
@@ -19,95 +26,10 @@ MAX_SPECKLE_OWN_VOTES = 1
 MIN_WINNER_VOTES = 5
 MAX_BLEND_OWN_VOTES = 5
 BLEND_TOLERANCE = 1.2
-BLEND_CLUSTER_TOLERANCE = 1.05
-BLEND_MAX_SHARE = 0.05
-KMEANS_N_INIT = 4
-
-
-def _to_lab(rgb: np.ndarray) -> np.ndarray:
-    return rgb2lab(rgb.reshape(-1, 1, 3).astype(np.float64) / 255.0).reshape(-1, 3)
-
-
-def _cluster_colors(
-    colors: np.ndarray, pixel_colors: np.ndarray, params: SegmentParams
-) -> np.ndarray:
-    """Cluster id per unique color. pixel_colors: per-opaque-pixel index into colors."""
-    if len(colors) <= params.max_colors:
-        return np.arange(len(colors))
-    rng = np.random.default_rng(params.seed)
-    if len(pixel_colors) > params.sample_px:
-        sample = rng.choice(pixel_colors, size=params.sample_px, replace=False)
-    else:
-        sample = pixel_colors
-    lab = _to_lab(colors)
-    k = min(params.max_colors, len(np.unique(sample)))
-    km = KMeans(n_clusters=k, n_init=KMEANS_N_INIT, random_state=params.seed)
-    km.fit(lab[sample])
-    return km.predict(lab)
-
-
-def _merge_clusters(
-    colors: np.ndarray, counts: np.ndarray, cluster: np.ndarray, delta_e: float
-) -> tuple[np.ndarray, np.ndarray]:
-    """Merge clusters with centroid deltaE2000 < delta_e. Returns (cluster ids, palette rgb)."""
-    k = int(cluster.max()) + 1
-    w = counts.astype(np.float64)
-    sums = np.zeros((k, 3))
-    np.add.at(sums, cluster, colors * w[:, None])
-    tot = np.bincount(cluster, weights=w, minlength=k)
-    present = tot > 0
-    parent = list(range(k))
-
-    def find(i: int) -> int:
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    cent_rgb = sums / np.maximum(tot, 1)[:, None]
-    cent_lab = _to_lab(np.clip(np.rint(cent_rgb), 0, 255).astype(np.uint8))
-    ids = np.flatnonzero(present)
-    for ai, a in enumerate(ids):
-        for b in ids[ai + 1:]:
-            if deltaE_ciede2000(cent_lab[a], cent_lab[b]) < delta_e:
-                parent[find(int(b))] = find(int(a))
-    roots = np.array([find(i) for i in range(k)])
-    _, new_id = np.unique(roots[cluster], return_inverse=True)
-    new_id = new_id.ravel()
-    m = int(new_id.max()) + 1
-    msum = np.zeros((m, 3))
-    np.add.at(msum, new_id, colors * w[:, None])
-    mtot = np.bincount(new_id, weights=w, minlength=m)
-    palette = np.clip(np.rint(msum / mtot[:, None]), 0, 255).astype(np.uint8)
-    return new_id, palette
-
-
-def _drop_blend_clusters(
-    cluster: np.ndarray, palette: np.ndarray, counts: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Remove minor clusters whose color lies between two larger clusters (JPEG/AA blends).
-
-    Only used on the noisy (KMeans) path. Returns (remapped cluster ids, palette).
-    """
-    lab = _to_lab(palette)
-    dist = deltaE_ciede2000(lab[:, None, :], lab[None, :, :])
-    alive = np.ones(len(palette), dtype=bool)
-    total = counts.sum()
-    for c in np.argsort(counts, kind="stable"):
-        if counts[c] > BLEND_MAX_SHARE * total:
-            break
-        bigger = np.flatnonzero(alive & (counts > counts[c]))
-        if len(bigger) < 2:
-            continue
-        pair = dist[np.ix_(bigger, bigger)]
-        via = dist[bigger, c][:, None] + dist[c, bigger][None, :]
-        if np.any((via <= BLEND_CLUSTER_TOLERANCE * pair) & (pair > 0)):
-            alive[c] = False
-    kept = np.flatnonzero(alive)
-    # Nearest *surviving* cluster for every cluster (kept ones map to themselves).
-    nearest = np.argmin(dist[:, kept], axis=1)
-    nearest[kept] = np.arange(len(kept))
-    return nearest[cluster], palette[kept]
+# Noisy (KMeans) input only: components below this area (original px) with no interior pixel
+# (none whose 3x3 is all its own colour) are fringe or JPEG speckle and merge away even when
+# last of their colour. Real thin lines are longer; genuine small dots have an interior pixel.
+SPECK_MAX_PX = 16
 
 
 def _blend_vote_changes(
@@ -189,16 +111,22 @@ def _components(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return comp, np.array(comp_cluster)
 
 
-def _diagonal_reach(comp: np.ndarray, comp_cluster: np.ndarray) -> np.ndarray:
+def _diagonal_reach(
+    comp: np.ndarray, comp_cluster: np.ndarray, within: np.ndarray | None = None
+) -> np.ndarray:
     """Pixel count of each component's 8-connected same-color group.
 
     Staircase pieces of a thin diagonal line are tiny 4-connected components but belong to
-    one long feature; judging smallness on the 8-connected group keeps them.
+    one long feature; judging smallness on the 8-connected group keeps them. With `within`
+    (a pixel mask holding whole components), groups only span those pixels; components
+    outside it get 0.
     """
     reach = np.zeros(len(comp_cluster), dtype=np.int64)
     eight = np.ones((3, 3), dtype=int)
-    cluster_map = comp_cluster[comp]
-    for c in np.unique(comp_cluster[1:]):
+    cluster_map = np.where(comp > 0, comp_cluster[comp], -1)
+    if within is not None:
+        cluster_map = np.where(within, cluster_map, -1)
+    for c in np.unique(cluster_map[cluster_map >= 0]):
         mask = cluster_map == c
         lab, n = ndimage.label(mask, structure=eight)
         group_sizes = np.bincount(lab.ravel(), minlength=n + 1)
@@ -207,13 +135,23 @@ def _diagonal_reach(comp: np.ndarray, comp_cluster: np.ndarray) -> np.ndarray:
     return reach
 
 
-def _merge_small_components(comp: np.ndarray, comp_cluster: np.ndarray, min_px: int) -> np.ndarray:
+def _merge_small_components(
+    comp: np.ndarray, comp_cluster: np.ndarray, min_px: int, speck_px: int = 0
+) -> np.ndarray:
     """Root id per component id; small ones join their longest-border neighbor.
 
-    A component that is the only one of its color is always kept.
+    Small = 8-connected same-color group under min_px (kept if it is the only component of its
+    color), or a speck (merged even if last of its color): a component with no interior pixel
+    whose 8-connected group of interior-less same-color components is under speck_px. Thin
+    lines and staircases stay protected even when attached to a solid area of their color;
+    a stray pixel touching such an area diagonally does not borrow the area's size.
     """
     sizes = np.bincount(comp.ravel(), minlength=len(comp_cluster)).astype(np.int64)
     reach = _diagonal_reach(comp, comp_cluster)
+    has_interior = np.bincount(comp[_interior_mask(comp)], minlength=len(comp_cluster)) > 0
+    thin = (comp > 0) & ~has_interior[comp]
+    thin_reach = _diagonal_reach(comp, comp_cluster, thin)
+    speck = (thin_reach < speck_px) & ~has_interior
     a, b = _edge_pairs(comp)
     borders: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     n_ids = len(comp_cluster)
@@ -230,7 +168,10 @@ def _merge_small_components(comp: np.ndarray, comp_cluster: np.ndarray, min_px: 
             i = parent[i]
         return int(i)
 
-    small = [i for i in range(1, len(sizes)) if reach[i] < min_px and per_cluster[comp_cluster[i]] > 1]
+    small = [
+        i for i in range(1, len(sizes))
+        if speck[i] or (reach[i] < min_px and per_cluster[comp_cluster[i]] > 1)
+    ]
     for i in sorted(small, key=lambda i: (sizes[i], i)):
         if find(i) != i:
             continue
@@ -283,18 +224,29 @@ def segment(image: RasterImage, params: SegmentParams) -> RegionMap:
     cluster = _cluster_colors(colors, pixel_colors, params)
     cluster, palette = _merge_clusters(colors, counts, cluster, params.merge_delta_e)
     noisy = len(colors) > params.max_colors  # quantized (KMeans) input
+
+    def labels_of(cluster_ids: np.ndarray) -> np.ndarray:
+        out = np.full((h, w), TRANSPARENT, dtype=np.int32)
+        out[opaque] = cluster_ids[pixel_colors]
+        return out
+
+    labels = labels_of(cluster)
     if noisy and len(palette) >= 3:
         per_cluster = np.bincount(cluster[pixel_colors], minlength=len(palette))
-        cluster, palette = _drop_blend_clusters(cluster, palette, per_cluster)
-
-    labels = np.full((h, w), TRANSPARENT, dtype=np.int32)
-    labels[opaque] = cluster[pixel_colors]
+        cluster, palette = _drop_blend_clusters(cluster, palette, per_cluster, labels)
+    if noisy:
+        cluster, palette = _merge_intermixed(
+            cluster, palette, colors, counts, labels_of, params.merge_delta_e
+        )
+    labels = labels_of(cluster)
     labels = _majority_cleanup(labels, palette, noisy)
 
     comp, comp_cluster = _components(labels)
     # min_region_px is an area in original pixels; one original pixel covers scale^2 here.
     min_px = round(params.min_region_px * image.scale**2)
-    merged = _merge_small_components(comp, comp_cluster, min_px)[comp]
+    # Speck cleanup targets JPEG/AA residue: exact-color input has none, its specks are real.
+    speck_px = round(SPECK_MAX_PX * image.scale**2) if noisy else 0
+    merged = _merge_small_components(comp, comp_cluster, min_px, speck_px)[comp]
     survivors, region = np.unique(merged[comp > 0], return_inverse=True)
     out = np.full((h, w), TRANSPARENT, dtype=np.int32)
     out[comp > 0] = region.ravel().astype(np.int32)

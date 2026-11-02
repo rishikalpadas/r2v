@@ -5,16 +5,23 @@ import numpy as np
 import pytest
 from scipy import ndimage
 from PIL import Image
+from skimage.color import deltaE_ciede2000, rgb2lab
 
 from engine.presets import SegmentParams
 from engine.stages.segment import (
+    SPECK_MAX_PX,
     _components,
-    _drop_blend_clusters,
     _merge_small_components,
     segment,
 )
+from engine.stages.segment_palette import (
+    _complete_linkage_groups,
+    _drop_blend_clusters,
+    _core_share,
+    _merge_intermixed,
+)
 from engine.types import TRANSPARENT, RasterImage
-from eval.synthetic import flat_shapes, solid, transparent_logo
+from eval.synthetic import _circle_mask, flat_shapes, solid, supersample, transparent_logo
 
 
 def _img(pixels: np.ndarray) -> RasterImage:
@@ -126,9 +133,36 @@ def test_kmeans_path_deterministic():
 
 def test_drop_blend_clusters_never_yields_invalid_ids():
     palette = np.array([[0, 0, 0], [255, 255, 255], [120, 120, 120], [127, 127, 127]], np.uint8)
-    counts = np.array([1000, 1000, 30, 10])
+    labels = np.zeros((50, 41), np.int32)
+    labels[:, 21:] = 1
+    labels[:, 20] = 3  # 1-px ribbon between black and white: a blend, dropped
+    labels[10:15, 5:11] = 2  # 30-px solid grey block
+    counts = np.bincount(labels.ravel())
     cluster = np.array([0, 1, 2, 3])
-    new, kept = _drop_blend_clusters(cluster, palette, counts)
+    new, kept = _drop_blend_clusters(cluster, palette, counts, labels)
+    assert (new >= 0).all() and (new < len(kept)).all()
+    assert len(kept) == 3 and (127, 127, 127) not in {tuple(c) for c in kept}
+
+
+def _blend_drop_case() -> tuple[np.ndarray, np.ndarray]:
+    """Black | white halves; a solid 20x20 dark-grey block (2%) and a 1-px light-grey ramp."""
+    palette = np.array([[0, 0, 0], [255, 255, 255], [90, 90, 90], [160, 160, 160]], np.uint8)
+    labels = np.zeros((100, 200), np.int32)
+    labels[:, 101:] = 1
+    labels[:, 100] = 3  # AA ramp along the black/white edge: no interior pixel
+    labels[40:60, 40:60] = 2  # genuine minor colour between black and white
+    return palette, labels
+
+
+def test_blend_drop_keeps_solid_minor_colour():
+    palette, labels = _blend_drop_case()
+    counts = np.bincount(labels.ravel())
+    assert counts[2] / counts.sum() == 0.02
+    new, kept = _drop_blend_clusters(np.arange(4), palette, counts, labels)
+    kept_set = {tuple(c) for c in kept}
+    assert (90, 90, 90) in kept_set
+    assert (160, 160, 160) not in kept_set
+    assert len(kept) == 3
     assert (new >= 0).all() and (new < len(kept)).all()
 
 
@@ -206,3 +240,325 @@ def test_small_component_joins_longest_border_neighbour_in_any_direction():
 def test_params_types_validated(kwargs):
     with pytest.raises(ValueError):
         SegmentParams(**kwargs)
+
+
+# Near-white pinks like a real logo: white-light pink and pink-dark pink are each ~5.5-6 dE2000
+# apart, close enough that a coarse threshold or transitive (AA-bridged) merging fuses them.
+CHAIN_COLORS = {
+    "white": (255, 255, 255),
+    "light_pink": (249, 239, 242),
+    "pink": (237, 197, 205),
+    "dark_pink": (222, 174, 184),
+}
+
+
+def _chain_image(size: int = 128) -> np.ndarray:
+    """Concentric anti-aliased discs: white > light pink > pink > dark pink (AA ramps between)."""
+    rings = [(52.3, "light_pink"), (36.4, "pink"), (18.2, "dark_pink")]
+
+    def draw(n: int) -> np.ndarray:
+        k = n / size
+        px = solid(n, (*CHAIN_COLORS["white"], 255))
+        for r, name in rings:
+            px[_circle_mask(n, 64.3 * k, 63.6 * k, r * k)] = (*CHAIN_COLORS[name], 255)
+        return px
+
+    return supersample(draw, size)
+
+
+def _accent_image(size: int = 128) -> np.ndarray:
+    """White page, pink disc with dark pink core, and a small solid light-pink block (~3%)."""
+
+    def draw(n: int) -> np.ndarray:
+        k = n / size
+        px = solid(n, (*CHAIN_COLORS["white"], 255))
+        px[_circle_mask(n, 70.3 * k, 70.6 * k, 40.2 * k)] = (*CHAIN_COLORS["pink"], 255)
+        px[_circle_mask(n, 70.3 * k, 70.6 * k, 20.4 * k)] = (*CHAIN_COLORS["dark_pink"], 255)
+        y0, x0, side = round(6.4 * k), round(8.6 * k), round(22 * k)
+        px[y0:y0 + side, x0:x0 + side] = (*CHAIN_COLORS["light_pink"], 255)
+        return px
+
+    return supersample(draw, size)
+
+
+def _de(a, b) -> float:
+    lab = rgb2lab(np.array([a, b], np.float64).reshape(1, 2, 3) / 255.0)[0]
+    return float(deltaE_ciede2000(lab[0], lab[1]))
+
+
+def test_aa_bridged_near_colours_stay_distinct():
+    px = _chain_image()
+    assert len(np.unique(px[..., :3].reshape(-1, 3), axis=0)) > SegmentParams().max_colors
+    rm = segment(_img(px), SegmentParams())
+    palette = np.unique(rm.palette_rgb, axis=0)
+    for name, rgb in CHAIN_COLORS.items():
+        nearest = min(_de(rgb, p) for p in palette)
+        assert nearest < 3, f"{name} {rgb} lost; palette {palette.tolist()}"
+
+
+def test_minor_solid_accent_colour_survives_blend_drop():
+    px = _accent_image()
+    accent = (px[..., :3] == CHAIN_COLORS["light_pink"]).all(-1).mean()
+    assert 0.02 < accent < 0.05  # minor colour, lying between white and pink
+    rm = segment(_img(px), SegmentParams())
+    palette = np.unique(rm.palette_rgb, axis=0)
+    for name, rgb in CHAIN_COLORS.items():
+        nearest = min(_de(rgb, p) for p in palette)
+        assert nearest < 3, f"{name} {rgb} lost; palette {palette.tolist()}"
+
+
+def test_complete_linkage_never_chains():
+    # A-B 4, B-C 4, A-C 8 at threshold 5: single linkage would chain A..C into one group.
+    dist = np.array([[0.0, 4.0, 8.0], [4.0, 0.0, 4.0], [8.0, 4.0, 0.0]])
+    groups = _complete_linkage_groups(dist, 5.0)
+    assert groups[0] != groups[2]
+    assert len(np.unique(groups)) == 2
+
+
+def test_complete_linkage_merges_tight_group_and_respects_strict_threshold():
+    dist = np.array([[0.0, 1.0, 2.0, 5.0], [1.0, 0.0, 1.5, 9.0], [2.0, 1.5, 0.0, 9.0],
+                     [5.0, 9.0, 9.0, 0.0]])
+    groups = _complete_linkage_groups(dist, 5.0)
+    assert groups[0] == groups[1] == groups[2]
+    assert groups[3] != groups[0]  # exactly at threshold: not merged
+
+
+def _speck_image() -> tuple[np.ndarray, dict[str, tuple[int, int, int]]]:
+    """White | black halves with specks, a fringe sliver, a 3x3 dot and thin lines.
+
+    Every speck has a colour of its own, so the old "last of its colour" rule kept them all.
+    """
+    c = {
+        "red": (230, 20, 20), "green": (20, 200, 40), "grey": (128, 128, 128),
+        "blue": (20, 40, 220), "orange": (250, 150, 0), "purple": (140, 30, 160),
+    }
+    px = solid(64, (255, 255, 255, 255))
+    px[:, 32:, :3] = 0
+    px[5:7, 5:7, :3] = c["red"]  # 2x2 speck (4 px)
+    px[50, 10:13, :3] = c["green"]  # 1x3 speck
+    px[20:30, 31, :3] = c["grey"]  # 1-px fringe sliver along the white/black edge
+    px[10:13, 18:21, :3] = c["blue"]  # solid 3x3 dot: has an interior pixel
+    px[60, 12:52, :3] = c["orange"]  # 1-px wide, 40-px long line
+    for i in range(30):  # 1-px diagonal staircase line: 4-connected pieces of 1 px
+        px[14 + i, 34 + i, :3] = c["purple"]
+    px[40:42, 45, :3] = 255  # 2-px white speck inside black (white has other components)
+    px[41, 46, :3] = 255
+    px[42, 46, :3] = 255
+    return px, c
+
+
+def _speck_merge_result(px: np.ndarray) -> np.ndarray:
+    """Colour per pixel after the noisy-path small-component merge (min 4 px, speck 16 px)."""
+    colours, labels = np.unique(px[..., :3].reshape(-1, 3), axis=0, return_inverse=True)
+    comp, comp_cluster = _components(labels.reshape(px.shape[:2]).astype(np.int32))
+    roots = _merge_small_components(comp, comp_cluster, 4, SPECK_MAX_PX)
+    return colours[comp_cluster[roots[comp]]]
+
+
+def test_fringe_specks_merged_but_dots_and_lines_survive():
+    px, c = _speck_image()
+    colour = _speck_merge_result(px)
+    present = {tuple(int(v) for v in p) for p in colour.reshape(-1, 3)}
+    for gone in ("red", "green", "grey"):
+        assert c[gone] not in present, gone
+    for kept in ("blue", "orange", "purple"):
+        assert c[kept] in present, kept
+    assert (colour[10:13, 18:21] == c["blue"]).all()
+    assert (colour[60, 12:52] == c["orange"]).all()
+    assert (colour[40:43, 45:47] == 0).all()  # 4-px white speck absorbed by black
+    assert (colour[20:30, 31] == 255).all()  # sliver joins its longest border (white)
+
+
+def test_pixels_diagonally_touching_a_solid_block_are_specks():
+    px = solid(40, (255, 255, 255, 255))
+    px[10:30, 10:30, :3] = (200, 30, 90)  # solid block: its 8-connected reach has interior
+    px[9, 9, :3] = (200, 30, 90)  # 1 px touching the top-left corner diagonally
+    px[30:32, 30, :3] = (200, 30, 90)  # 2 px touching the bottom-right corner diagonally
+    rm = segment(_img(_with_ramp_row(px)), SegmentParams())
+    colour = rm.palette_rgb[rm.labels]
+    assert (colour[9, 9] == 255).all()
+    assert (colour[30:32, 30] == 255).all()
+    assert (colour[10:30, 10:30] == (200, 30, 90)).all()
+
+
+def test_exact_colour_input_keeps_specks():
+    # Exact flat art (<= max_colors colors) has no JPEG speckle: specks are real details.
+    px, c = _speck_image()
+    px[9, 17, :3] = c["blue"]  # 1-px tip diagonally touching the blue dot
+    rm = segment(_img(px), SegmentParams())
+    palette = {tuple(int(v) for v in p) for p in rm.palette_rgb}
+    assert all(c[name] in palette for name in ("red", "green", "grey"))
+    assert tuple(rm.palette_rgb[rm.labels[9, 17]]) == c["blue"]
+
+
+def _noisy(base: np.ndarray, amp: int, jpeg_quality: int | None) -> np.ndarray:
+    """Uniform +-amp noise on an RGB image, optionally JPEG round-tripped; returns RGBA."""
+    rng = np.random.default_rng(amp)
+    rgb = np.clip(base.astype(int) + rng.integers(-amp, amp + 1, base.shape), 0, 255).astype(np.uint8)
+    if jpeg_quality is not None:
+        buf = io.BytesIO()
+        Image.fromarray(rgb, "RGB").save(buf, format="JPEG", quality=jpeg_quality)
+        rgb = np.array(Image.open(io.BytesIO(buf.getvalue())).convert("RGB"))
+    return np.dstack([rgb, np.full(rgb.shape[:2], 255, np.uint8)])
+
+
+NOISE_CASES = [(3, None), (6, None), (10, None), (3, 85), (6, 85), (10, 85)]
+
+
+@pytest.mark.parametrize(("amp", "quality"), NOISE_CASES)
+def test_noisy_single_flat_colour_is_one_region(amp, quality):
+    px = _noisy(np.full((120, 120, 3), (120, 160, 200)), amp, quality)
+    rm = segment(_img(px), SegmentParams())
+    assert len(np.unique(rm.palette_rgb, axis=0)) == 1
+    assert len(rm.palette_rgb) <= 3
+
+
+@pytest.mark.parametrize(("amp", "quality"), NOISE_CASES)
+def test_noisy_two_flat_colours_give_two_entries(amp, quality):
+    base = np.full((200, 200, 3), (120, 160, 200))
+    base[:, 100:] = (240, 230, 200)
+    rm = segment(_img(_noisy(base, amp, quality)), SegmentParams())
+    assert len(np.unique(rm.palette_rgb, axis=0)) == 2
+
+
+def test_small_noisy_grey_is_one_colour():
+    px = _noisy(np.full((30, 30, 3), 128), 3, None)
+    rm = segment(_img(px), SegmentParams())
+    assert len(rm.palette_rgb) == 1
+
+
+def _with_ramp_row(px: np.ndarray) -> np.ndarray:
+    """Grey ramp in row 0: more than max_colors colours, so segment takes the noisy path."""
+    out = px.copy()
+    out[0, :, :3] = (np.arange(px.shape[1]) % 64 + 100)[:, None]
+    return out
+
+
+def test_noisy_diagonal_hairline_attached_to_solid_block_survives():
+    px = solid(80, (255, 255, 255, 255))
+    px[10:30, 10:30, :3] = (200, 30, 90)
+    line = [(30 + i, 30 + i) for i in range(40)]  # 1-px 45 degree line leaving the corner
+    for y, x in line:
+        px[y, x, :3] = (200, 30, 90)
+    rm = segment(_img(_with_ramp_row(px)), SegmentParams())
+    colour = rm.palette_rgb[rm.labels]
+    assert all((colour[y, x] == (200, 30, 90)).all() for y, x in line)
+
+
+OUTLINE_WHITE = (252, 252, 253)
+
+
+def _outlined_disc(pink: tuple[int, int, int], width: int, quality: int | None) -> np.ndarray:
+    """Pink disc with a thin white outline on a dark page, 4x supersampled, +-3 noise."""
+    factor, size = 4, 200
+    yy, xx = np.mgrid[0:size * factor, 0:size * factor] / factor
+    r = np.hypot(yy - 100, xx - 100)
+    hi = np.empty((size * factor, size * factor, 3))
+    hi[:] = (60, 40, 80)
+    hi[r < 70 + width] = OUTLINE_WHITE
+    hi[r < 70] = pink
+    rgb = np.rint(hi.reshape(size, factor, size, factor, 3).mean((1, 3)))
+    return _noisy(rgb, 3, quality)
+
+
+# JPEG q85 smears a 2-3 px white ring (chroma subsampling) before clustering: its colour lands
+# > dE 3 from the source before any re-merge (commit 0bf95b3) too, so q85 checks 4 px only.
+OUTLINE_CASES = [(w, None) for w in (2, 3, 4)] + [(4, 85)]
+
+
+@pytest.mark.parametrize("pink", [(251, 238, 241), (250, 232, 236)])  # dE 6.5 / 8.7 from white
+@pytest.mark.parametrize(("width", "quality"), OUTLINE_CASES)
+def test_thin_outline_next_to_near_colour_stays_distinct(width, quality, pink):
+    rm = segment(_img(_outlined_disc(pink, width, quality)), SegmentParams())
+    palette = np.unique(rm.palette_rgb, axis=0)
+    white = min(range(len(palette)), key=lambda i: _de(OUTLINE_WHITE, palette[i]))
+    near_pink = min(range(len(palette)), key=lambda i: _de(pink, palette[i]))
+    assert white != near_pink, palette.tolist()
+    assert _de(OUTLINE_WHITE, palette[white]) < 3 and _de(pink, palette[near_pink]) < 3
+
+
+def test_intermixed_merge_uses_max_linkage_on_original_colours():
+    # Pixel-interleaved noisy greys: A-B and B-C under the bound (4 x 5 = 20 dE), A-C over it.
+    centres = np.array([90, 125, 160])
+    palette = np.repeat(centres[:, None], 3, axis=1).astype(np.uint8)
+    assert _de(palette[0], palette[1]) < 20 and _de(palette[1], palette[2]) < 20
+    assert _de(palette[0], palette[2]) > 20
+    offsets = np.arange(-15, 16)
+    colors = np.repeat((centres[:, None] + offsets).ravel()[:, None], 3, axis=1).astype(np.uint8)
+    colour_cluster = np.repeat(np.arange(3), len(offsets))
+    yy, xx = np.mgrid[0:40, 0:80]
+    region = np.where((xx + yy) % 2 == 0, 1, np.where(xx < 40, 0, 2))  # A/B | B/C checker
+    rng = np.random.default_rng(0)
+    pixel_colour = region * len(offsets) + rng.integers(0, len(offsets), region.shape)
+    counts = np.bincount(pixel_colour.ravel(), minlength=len(colors))
+    cluster, merged = _merge_intermixed(
+        colour_cluster, palette, colors, counts, lambda c: c[pixel_colour], 5.0
+    )
+    assert len(merged) == 2  # A+B (or B+C) merge; the merged mean must not then absorb C
+    assert cluster[0] != cluster[-1]
+
+
+PATTERN_A = (70, 120, 200)
+
+
+def _pattern_partner(target_de: float) -> tuple[int, int, int]:
+    """Lighter blue at about `target_de` from PATTERN_A."""
+    a, light = np.array(PATTERN_A, float), np.array([200, 220, 245], float)
+    for t in np.linspace(0, 1, 400):
+        c = tuple(int(v) for v in np.rint(a + t * (light - a)))
+        if _de(PATTERN_A, c) >= target_de:
+            return c
+    raise AssertionError("no partner colour")
+
+
+def _pattern(kind: str, n: int = 160) -> np.ndarray:
+    yy, xx = np.mgrid[0:n, 0:n]
+    if kind == "stripes3":
+        return (xx // 3) % 2 == 1
+    if kind == "checker6":
+        return ((xx // 6) + (yy // 6)) % 2 == 1
+    return ((xx % 10) < 5) & ((yy % 10) < 5)  # dots5/p10
+
+
+@pytest.mark.parametrize("quality", [None, 85])
+@pytest.mark.parametrize("target_de", [12, 19])
+@pytest.mark.parametrize("kind", ["stripes3", "checker6", "dots5"])
+def test_real_two_colour_pattern_is_not_remerged(kind, target_de, quality):
+    b = _pattern_partner(target_de)
+    rgb = np.full((200, 200, 3), 250)
+    rgb[20:180, 20:180] = np.where(_pattern(kind)[..., None], b, PATTERN_A)
+    rm = segment(_img(_noisy(rgb, 3, quality)), SegmentParams())
+    palette = np.unique(rm.palette_rgb, axis=0)
+    ia = min(range(len(palette)), key=lambda i: _de(PATTERN_A, palette[i]))
+    ib = min(range(len(palette)), key=lambda i: _de(b, palette[i]))
+    assert ia != ib, palette.tolist()
+    assert _de(PATTERN_A, palette[ia]) < 3 and _de(b, palette[ib]) < 3, palette.tolist()
+
+
+@pytest.mark.parametrize("pink", [(251, 238, 241), (250, 235, 238)])  # dE 6.5 / 7.4 from white
+def test_thin_frame_along_canvas_edge_stays_distinct(pink):
+    factor, size, width = 4, 200, 2
+    yy, xx = np.mgrid[0:size * factor, 0:size * factor] / factor
+    hi = np.empty((size * factor, size * factor, 3))
+    hi[:] = OUTLINE_WHITE
+    inner = (yy >= width) & (yy < size - width) & (xx >= width) & (xx < size - width)
+    hi[inner] = pink
+    hi[np.hypot(yy - 100, xx - 100) < 40] = (60, 40, 80)
+    rgb = np.rint(hi.reshape(size, factor, size, factor, 3).mean((1, 3)))
+    rm = segment(_img(_noisy(rgb, 3, 85)), SegmentParams())
+    palette = np.unique(rm.palette_rgb, axis=0)
+    white = min(range(len(palette)), key=lambda i: _de(OUTLINE_WHITE, palette[i]))
+    near_pink = min(range(len(palette)), key=lambda i: _de(pink, palette[i]))
+    assert white != near_pink, palette.tolist()
+    assert _de(OUTLINE_WHITE, palette[white]) < 3 and _de(pink, palette[near_pink]) < 3
+
+
+def test_band_along_canvas_edge_has_no_core():
+    labels = np.ones((60, 60), np.int32)
+    labels[:2, :] = 0  # 2-px band along the top canvas edge
+    labels[:, :2] = 0
+    band_core, rest_core = _core_share(labels, 0, 1)
+    assert band_core == 0.0 and rest_core > 0.5
+    noise = (np.add.outer(np.arange(60), np.arange(60)) % 2).astype(np.int32)
+    a, b = _core_share(noise, 0, 1)
+    assert a > 0.5 and abs(a - b) < 0.05  # interleaved halves reach the core equally
