@@ -137,14 +137,21 @@ def _fit_piece(
     return left + right
 
 
-def fit_cubic(points: Sequence[Point], tolerance_px: float) -> tuple[CubicBezier, ...]:
-    """Fit a G1-joined chain of cubic Beziers from points[0] to points[-1] (exact endpoints)."""
+def fit_cubic(
+    points: Sequence[Point], tolerance_px: float, tangent_samples: int = 1
+) -> tuple[CubicBezier, ...]:
+    """Fit a G1-joined chain of cubic Beziers from points[0] to points[-1] (exact endpoints).
+
+    The end tangents point from each end to the mean of its next `tangent_samples` points (at
+    most a third of the run); 1 is Schneider's one-sample estimate.
+    """
     if len(points) < 2:
         return ()
     pts = _dedupe(points)
     if len(pts) < 2:  # all points coincide
         return (CubicBezier(pts[0], pts[0], pts[0], pts[0]),)
     d = np.array(pts, dtype=float)
-    t1 = _unit(d[1] - d[0])
-    t2 = _unit(d[-2] - d[-1])
+    k = max(1, min(tangent_samples, len(d) // 3))
+    t1 = _unit(d[1 : k + 1].mean(axis=0) - d[0])
+    t2 = _unit(d[-k - 1 : -1].mean(axis=0) - d[-1])
     return tuple(_fit_piece(pts, d, t1, t2, tolerance_px**2))
