@@ -272,3 +272,45 @@ def test_noise_below_floor_is_clamped():
 
     pts = _jittered_line(sigma=0.05)
     assert fit_span_scored(pts, PARAMS, noise=0.0) == fit_span_scored(pts, PARAMS, noise=NOISE_FLOOR_PX)
+
+
+# ---------------------------------------------------------------- G1 at smooth joins
+
+
+def _turn_deg(u, v) -> float:
+    u, v = np.asarray(u, float), np.asarray(v, float)
+    cos = float(u @ v / (np.hypot(*u) * np.hypot(*v)))
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+
+
+def test_align_joins_makes_bezier_bezier_join_g1():
+    from engine.geometry.segment_fit import align_joins
+
+    a = CubicBezier((0.0, 0.0), (3.0, 0.0), (6.0, 1.0), (9.0, 1.0))
+    b = CubicBezier((9.0, 1.0), (12.0, 2.0), (15.0, 2.0), (18.0, 2.0))
+    out = align_joins((a, b), [1])
+    assert _turn_deg(np.subtract(out[0].p1, out[0].c2), np.subtract(out[1].c1, out[1].p0)) < 1e-9
+    assert out[0].p1 == a.p1 and out[1].p0 == b.p0 and out[0].p0 == a.p0  # end points stay
+    # handle lengths are kept
+    assert math.dist(out[0].c2, a.p1) == pytest.approx(math.dist(a.c2, a.p1))
+
+
+def test_align_joins_aims_the_bezier_along_a_rigid_neighbour():
+    from engine.geometry.segment_fit import align_joins
+
+    line = Line((0.0, 0.0), (10.0, 0.0))
+    bez = CubicBezier((10.0, 0.0), (13.0, 1.0), (16.0, 3.0), (18.0, 6.0))
+    out_line, out_bez = align_joins((line, bez), [1])
+    assert out_line == line
+    assert out_bez.c1[1] == pytest.approx(0.0) and out_bez.c1[0] > 10.0
+
+
+def test_align_joins_wraps_round_a_closed_chain_and_skips_rigid_pairs():
+    from engine.geometry.segment_fit import align_joins
+
+    a = CubicBezier((0.0, 0.0), (3.0, -1.0), (6.0, -1.0), (9.0, 0.0))
+    b = Line((9.0, 0.0), (0.0, 0.0))
+    c = Line((0.0, 0.0), (5.0, 5.0))
+    out = align_joins((a, b), [0])  # the wrap join: b ends where a starts
+    assert _turn_deg(np.subtract(out[0].c1, out[0].p0), np.subtract(b.p1, b.p0)) < 1e-9
+    assert align_joins((b, c), [1]) == (b, c)

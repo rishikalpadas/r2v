@@ -247,3 +247,70 @@ def snap_axis(segments: Sequence[Segment], params: FitParams) -> tuple[Segment, 
         segs[i] = snapped
         segs[i + 1] = _move_end(nxt, False, d1, direction)
     return tuple(segs)
+
+
+def _unit_vec(dx: float, dy: float) -> Point | None:
+    length = math.hypot(dx, dy)
+    return (dx / length, dy / length) if length > _EPS else None
+
+
+def _arc_tangent(arc: Arc, p: Point) -> Point | None:
+    """Direction of travel along `arc` at its end point `p`."""
+    rx, ry = p[0] - arc.center[0], p[1] - arc.center[1]
+    sign = 1.0 if arc.sweep else -1.0  # sweep = increasing angle in the y-down frame
+    return _unit_vec(-ry * sign, rx * sign)
+
+
+def _end_tangent(seg: Segment, at_end: bool) -> Point | None:
+    """Unit direction of travel where `seg` ends (at_end) or starts."""
+    if isinstance(seg, Line):
+        return _unit_vec(seg.p1[0] - seg.p0[0], seg.p1[1] - seg.p0[1])
+    if isinstance(seg, Arc):
+        return _arc_tangent(seg, seg.p1 if at_end else seg.p0)
+    ctrl = (seg.p0, seg.c1, seg.c2, seg.p1)
+    if at_end:
+        anchor, others = seg.p1, ctrl[2::-1]
+        return next((u for q in others if (u := _unit_vec(anchor[0] - q[0], anchor[1] - q[1]))), None)
+    anchor, others = seg.p0, ctrl[1:]
+    return next((u for q in others if (u := _unit_vec(q[0] - anchor[0], q[1] - anchor[1]))), None)
+
+
+def _aim_handle(seg: CubicBezier, at_end: bool, direction: Point) -> CubicBezier:
+    """Re-aim the handle at one end of `seg` along the travel `direction`, keeping its length."""
+    anchor, handle = (seg.p1, seg.c2) if at_end else (seg.p0, seg.c1)
+    length = math.hypot(handle[0] - anchor[0], handle[1] - anchor[1])
+    if length <= _EPS:
+        return seg
+    sign = -1.0 if at_end else 1.0  # the end handle points back against the travel
+    aimed = (anchor[0] + sign * direction[0] * length, anchor[1] + sign * direction[1] * length)
+    return replace(seg, c2=aimed) if at_end else replace(seg, c1=aimed)
+
+
+def align_joins(segments: Sequence[Segment], joins: Sequence[int]) -> tuple[Segment, ...]:
+    """Make the chain G1 at each join index j (between segments[j - 1] and segments[j]).
+
+    j = 0 is the wrap-around join of a closed chain. Lines and arcs are rigid: a Bezier next to
+    one has its handle aimed along the rigid tangent; two Beziers share the bisecting direction;
+    joins between two rigid segments (or at a cusp) are left alone. End points never move.
+    """
+    segs = list(segments)
+    for j in joins:
+        i = (j - 1) % len(segs)
+        prev, nxt = segs[i], segs[j]
+        t_out, t_in = _end_tangent(prev, True), _end_tangent(nxt, False)
+        prev_bez, next_bez = isinstance(prev, CubicBezier), isinstance(nxt, CubicBezier)
+        if t_out is None or t_in is None or not (prev_bez or next_bez):
+            continue
+        if not prev_bez:
+            direction = t_out
+        elif not next_bez:
+            direction = t_in
+        else:
+            direction = _unit_vec(t_out[0] + t_in[0], t_out[1] + t_in[1])
+            if direction is None:
+                continue
+        if prev_bez:
+            segs[i] = _aim_handle(prev, True, direction)
+        if next_bez:
+            segs[j] = _aim_handle(segs[j], False, direction)
+    return tuple(segs)
