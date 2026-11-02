@@ -24,6 +24,7 @@ CORNER_LINE_SAMPLES = 4  # samples per side for each line fit
 CORNER_LINE_GAP = 1  # samples skipped on each side of the corner index
 MIN_CORNER_LINE_SAMPLES = 2  # samples
 MIN_CORNER_LINE_ANGLE_DEG = 20.0  # flatter corners make the intersection ill-conditioned
+SNAP_SIDE = 2  # samples each side of a corner that say which way is outward for a grid snap
 
 
 @dataclass(frozen=True)
@@ -33,32 +34,48 @@ class SideLines:
     `gap` samples next to the corner are skipped (their pixels blend both sides) and up to
     `samples` per side are used. With `allow_behind` an intersection behind the smoothed samples
     next to the corner is accepted; the caller must then pull those samples onto the corner
-    (see `collapse_behind`) or the fitted span doubles back. `gap` and `samples` are sample
-    counts at scale 1, converted with `samples_at_scale` where used.
+    (see `collapse_behind`) or the fitted span doubles back. With `outward_only` an
+    intersection on the inner side of the raw corner sample is rejected: anti-aliasing rounds a
+    corner's samples inwards, so the true apex lies outward; lines that meet inside have bent
+    toward curved sides. `gap` and `samples` are sample counts at scale 1, converted with
+    `samples_at_scale` where used.
     """
 
     gap: int = CORNER_LINE_GAP
     samples: int = CORNER_LINE_SAMPLES
     allow_behind: bool = False
+    outward_only: bool = False
 
 
 DEFAULT_SIDE_LINES = (SideLines(),)
 
 
 def _snap_corners(
-    dense: Sequence[Point], corners: Sequence[int], original: Sequence[Point], scale: float
+    dense: Sequence[Point], corners: Sequence[int], original: Sequence[Point], scale: float,
+    outward_of: tuple[Sequence[Point], bool] | None = None,
 ) -> list[Point]:
     """Replace each corner sample by the nearest original crack-grid vertex, if close.
 
     Smoothing pulls a corner inwards; fitting between the true vertices keeps straight edges
-    where the pixels put them.
+    where the pixels put them. With `outward_of` = (raw, closed) a vertex on the inner side of
+    the raw corner sample is refused and the corner keeps its sample (snapping inward would
+    round off a sharp tip that the raw samples still reach past).
     """
     out = list(dense)
+    n = len(dense)
     for c in corners:
         x, y = dense[c]
         best = min(original, key=lambda p: (p[0] - x) ** 2 + (p[1] - y) ** 2)
-        if math.hypot(best[0] - x, best[1] - y) <= CORNER_SNAP_PX * scale:
-            out[c] = best
+        if math.hypot(best[0] - x, best[1] - y) > CORNER_SNAP_PX * scale:
+            continue
+        if outward_of is not None:
+            raw, closed = outward_of
+            a, b = ((c - SNAP_SIDE) % n, (c + SNAP_SIDE) % n) if closed else (
+                max(0, c - SNAP_SIDE), min(n - 1, c + SNAP_SIDE))
+            ends = np.asarray(raw[a], np.float64), np.asarray(raw[b], np.float64)
+            if _inward(best, np.asarray(raw[c], np.float64), *ends):
+                continue
+        out[c] = best
     return out
 
 
@@ -68,8 +85,8 @@ def _fit_direction(pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return centroid, np.linalg.svd(pts - centroid, full_matrices=False)[2][0]
 
 
-def _line_intersection(side_a: np.ndarray, side_b: np.ndarray) -> Point | None:
-    """Where the lines fitted to two point runs cross; None when they are too close to parallel."""
+def line_intersection(side_a: np.ndarray, side_b: np.ndarray) -> Point | None:
+    """Where TLS lines fitted to two point runs cross; None when they are too close to parallel."""
     pa, da = _fit_direction(side_a)
     pb, db = _fit_direction(side_b)
     cross = da[0] * db[1] - da[1] * db[0]
@@ -91,18 +108,22 @@ def _behind(hit: Point, run: np.ndarray, nearest: Point) -> bool:
     return bool((h - run[-1]) @ direction < 0.0 or (h - np.asarray(nearest)) @ direction < 0.0)
 
 
-def _corner_neighbours(corners: Sequence[int], k: int, n: int, closed: bool) -> tuple[int, int]:
-    """Indices of the corners before and after corners[k], unwrapped around a closed ring."""
+def _inward(hit: Point, corner: np.ndarray, before: np.ndarray, after: np.ndarray) -> bool:
+    """True when `hit` lies on the inner side of `corner` (toward its neighbours' midpoint)."""
+    outward = corner - (before + after) / 2.0
+    return bool((np.asarray(hit) - corner) @ outward < 0.0)
+
+
+def corner_neighbours(corners: Sequence[int], k: int, n: int, closed: bool) -> tuple[int, int]:
+    """Indices of the corners before and after corners[k], unwrapped around a closed ring.
+
+    A lone closed-ring corner c is its own neighbour: (c - n, c + n).
+    """
     if not closed:
         return corners[k - 1], corners[k + 1]
     prev = corners[k - 1] - (n if k == 0 else 0)
     nxt = corners[(k + 1) % len(corners)] + (n if k == len(corners) - 1 else 0)
     return prev, nxt
-
-
-def line_intersection(side_a: np.ndarray, side_b: np.ndarray) -> Point | None:
-    """Where total-least-squares lines through two point runs cross (None if near-parallel)."""
-    return _line_intersection(side_a, side_b)
 
 
 def _subpixel_corner(
@@ -127,7 +148,7 @@ def _subpixel_corner(
         return None
     side_a = np.asarray([raw[i % n] for i in before], np.float64)
     side_b = np.asarray([raw[i % n] for i in after], np.float64)
-    hit = _line_intersection(side_a, side_b)
+    hit = line_intersection(side_a, side_b)
     if hit is None:
         return None
     if _behind(hit, side_a, side_a[-1]) or _behind(hit, side_b[::-1], side_b[0]):
@@ -136,6 +157,8 @@ def _subpixel_corner(
     if not lines.allow_behind and (
         _behind(hit, side_a, before_corner) or _behind(hit, side_b[::-1], after_corner)
     ):
+        return None
+    if lines.outward_only and _inward(hit, np.asarray(raw[c % n]), side_a[-1], side_b[0]):
         return None
     x, y = dense[c]
     return hit if math.hypot(hit[0] - x, hit[1] - y) <= CORNER_SNAP_PX * scale else None
@@ -161,6 +184,7 @@ def place_corners(
     closed: bool,
     scale: float,
     lines: Sequence[SideLines] = DEFAULT_SIDE_LINES,
+    outward_snap: bool = False,
 ) -> list[Point]:
     """Move each of `corners` (a subset of `all_corners`) from its smoothed sample to the corner.
 
@@ -168,13 +192,14 @@ def place_corners(
     Near sub-pixel samples the corner is `_subpixel_corner`. Elsewhere, and wherever that finds
     no usable intersection, it is grid-snapped by `_snap_corners` exactly as without sub-pixel
     input (leaving the smoothed sample would keep the corner rounded in). Each entry of `lines`
-    is tried in turn until one gives an intersection.
+    is tried in turn until one gives an intersection. With `outward_snap` a grid vertex inside
+    the raw corner sample is refused (see `_snap_corners`).
     """
     raw, plain = samples
     order = list(all_corners)
     hits: dict[int, Point] = {}
     for c in corners:
-        neighbours = _corner_neighbours(order, order.index(c), len(dense), closed)
+        neighbours = corner_neighbours(order, order.index(c), len(dense), closed)
         for side_lines in lines:
             reach = samples_at_scale(side_lines.gap, scale) + samples_at_scale(side_lines.samples, scale)
             if not _has_subpixel_samples(raw, plain, c, closed, reach):
@@ -183,7 +208,8 @@ def place_corners(
             if hit is not None:
                 hits[c] = hit
                 break
-    out = _snap_corners(dense, [c for c in corners if c not in hits], original, scale)
+    snapped = [c for c in corners if c not in hits]
+    out = _snap_corners(dense, snapped, original, scale, (raw, closed) if outward_snap else None)
     for c, hit in hits.items():
         out[c] = hit
     return out
@@ -204,7 +230,7 @@ def collapse_behind(
     n = len(out)
     order = list(all_corners)
     for c in corners:
-        neighbours = _corner_neighbours(order, order.index(c), n, closed)
+        neighbours = corner_neighbours(order, order.index(c), n, closed)
         corner = np.asarray(out[c])
         for step, limit in zip((-1, 1), neighbours):
             far = c + step * reach
