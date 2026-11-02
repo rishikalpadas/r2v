@@ -18,6 +18,8 @@ Conventions
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
+from typing import NamedTuple
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
@@ -25,6 +27,9 @@ from scipy.ndimage import gaussian_filter1d
 from engine.types import Point
 
 _MIN_CLOSED_POINTS = 3
+# Scale-space corners (find_corners_multiscale)
+WINDOW_PER_SIGMA = 2.0  # turning-angle window at the coarse scale: +-2 sigma spans the blur
+TRACK_RADIUS = 2  # samples; a coarse corner response this close confirms a fine corner
 
 
 def unit_pieces(a: Point, b: Point) -> int:
@@ -135,3 +140,86 @@ def find_corners(
     if not closed:
         found = sorted({0, n - 1, *found})
     return tuple(found)
+
+
+class MultiscaleCorners(NamedTuple):
+    """Corner indices (fine-scale positions) and each one's coarse-scale turning angle.
+
+    Open curves include their end points, whose coarse angle is NaN.
+    """
+
+    indices: tuple[int, ...]
+    coarse_angles: tuple[float, ...]
+
+
+def _coarse_response(angles: np.ndarray, i: int, n: int, closed: bool) -> float:
+    """Largest coarse turning angle within TRACK_RADIUS of sample i (NaN where undefined)."""
+    idx = np.arange(i - TRACK_RADIUS, i + TRACK_RADIUS + 1)
+    idx = idx % n if closed else idx[(idx >= 0) & (idx < n)]
+    window = angles[idx]
+    return float(np.nanmax(window)) if np.isfinite(window).any() else math.nan
+
+
+def find_corners_multiscale(
+    raw: Sequence[Point],
+    closed: bool,
+    angle_deg: float,
+    fine_sigma: float,
+    coarse_sigma: float,
+    fine_window: int = 2,
+) -> MultiscaleCorners:
+    """Corners that persist from the fine scale up to the coarse scale.
+
+    `raw` is an unsmoothed dense sequence (see `dense_samples`). Candidates are the fine-scale
+    corners (`find_corners` on `raw` smoothed at `fine_sigma`, window `fine_window`). One is kept
+    only if, smoothed at `coarse_sigma` with a window of WINDOW_PER_SIGMA * coarse_sigma samples,
+    the curve still turns by more than `angle_deg` within TRACK_RADIUS samples of it. Real corners
+    keep their turn under heavy smoothing; jitter bumps flatten out. Each kept corner stays at its
+    fine-scale index, so two corners closer than the coarse window (a narrow end) both survive.
+    """
+    pts = tuple((float(x), float(y)) for x, y in raw)
+    n = len(pts)
+    fine = find_corners(smooth_dense(pts, closed, fine_sigma), closed, angle_deg, fine_window)
+    window = max(fine_window, math.ceil(WINDOW_PER_SIGMA * coarse_sigma))
+    if closed and n < 2 * window + 1:
+        return MultiscaleCorners((), ())  # too short to show a coarse-scale turn
+    angles = np.full(n, math.nan)
+    if n > 1:
+        coarse = np.asarray(smooth_dense(pts, closed, coarse_sigma), np.float64)
+        angles = _turning_angles(coarse, closed, window)
+    kept: list[tuple[int, float]] = []
+    for i in fine:
+        if not closed and i in (0, n - 1):
+            kept.append((i, math.nan))
+            continue
+        response = _coarse_response(angles, i, n, closed)
+        if response > angle_deg:
+            kept.append((i, response))
+    return MultiscaleCorners(tuple(i for i, _ in kept), tuple(a for _, a in kept))
+
+
+def smooth_between(
+    points: Sequence[Point], corners: Sequence[int], closed: bool, sigma: float
+) -> tuple[Point, ...]:
+    """Gaussian-smooth each corner-to-corner run on its own; corner samples stay exactly put.
+
+    Smoothing never mixes samples across a corner, so it cannot round one off. `corners` are
+    sorted indices into `points`; for an open curve they must include both end points. A closed
+    curve without corners is smoothed as one ring (`smooth_dense`).
+    """
+    pts = tuple(points)
+    n = len(pts)
+    if not corners:
+        return smooth_dense(pts, closed, sigma)
+    order = sorted(corners)
+    out = list(pts)
+    ends = list(zip(order, order[1:]))
+    if closed:
+        ends.append((order[-1], order[0] + n))
+    for a, b in ends:
+        if b - a < 2:
+            continue
+        run = tuple(pts[i % n] for i in range(a, b + 1))
+        for i, p in zip(range(a + 1, b), smooth_dense(run, False, sigma)[1:-1]):
+            out[i % n] = p
+    return tuple(out)
