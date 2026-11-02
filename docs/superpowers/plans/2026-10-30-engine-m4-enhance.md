@@ -158,3 +158,13 @@ Carried from the M1–M3 final review: sample-count thresholds (`CORNER_WINDOW`,
 - [ ] **Step 2:** Record per-category numbers (logos + degraded) and GPU runtime per image in `eval/README.md` under "M4 baseline (date)". Honest numbers, no tuning in this task. If `ours` does not beat vtracer on degraded SSIM, report it as a concern.
 - [ ] **Step 3:** If real images exist in `eval/dataset/`, run them too and record.
 - [ ] **Step 4:** Commit `docs: M4 enhance benchmark baseline`.
+
+---
+
+### Task 7: Re-evaluate parked fix 2 (noise-adaptive fitting) on enhanced input
+
+Branch `fix/noise-adaptive-fit` (head 3b9b354, rebased on master 2f293c9 with fixes 1+3; 502 tests pass; `FitParams.adaptive=True`, `False` = master's fit byte-identical) was parked on 2026-11-02. On 40 degraded images at 1× it gave nodes −8.0% summed (−11.3% mean per image), SSIM +0.0004, ΔE −0.005, kinks 831→157, fit time +13%; clean 1.jpg −8.7% nodes, SSIM −0.0003, fit +19%. Keep rule (≥10% fewer nodes summed, SSIM not lower, ΔE not higher) missed. Its constants were tuned for raw 1× JPEG edges.
+
+- [ ] **Step 1:** Rebase `fix/noise-adaptive-fit` onto master after Tasks 1–6; full suite green.
+- [ ] **Step 2:** Run the fix 2 evaluation (degraded set built as in `.superpowers/fix2-noise/brief.md` §real-image check + the degradations listed in its eval notes: JPEG q50/q30, small web, scan, phone) with enhance ON, adaptive off vs on. Report nodes (summed), SSIM, ΔE, fit time, kinks, inter-curve crossings, lost ≥90° corners.
+- [ ] **Step 3:** Keep rule as above. If met → independent review, then merge. If not → delete the branch and record why in the rulings note.
