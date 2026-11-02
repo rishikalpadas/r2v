@@ -76,6 +76,40 @@ rendered PNGs, and `report.html`. Output under `eval/reports/` is git-ignored.
 more paths than vtracer (7.32 vs 4.72 per image) and is roughly 12x slower. This is synthetic flat art only; the real-image baseline is pending
 a licensed dataset in `eval/dataset/`.
 
+## GPU setup
+
+The Enhance stage (M4) runs ML models through PyTorch and spandrel, installed with the
+optional `gpu` extra. The flat-art pipeline still works without them. Commands used on
+the dev laptop (RTX 4050 Laptop GPU, driver 616.64, CUDA 13.4), in order:
+
+```
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install -e .[dev]
+.venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cu134
+.venv\Scripts\python -m pip install torchvision==0.29.2 --index-url https://download.pytorch.org/whl/cu134
+.venv\Scripts\python -m pip install -e .[dev,gpu]
+.venv\Scripts\python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+.venv\Scripts\python -m engine.ml.fetch_weights --all
+```
+
+- Install torch and torchvision from the CUDA index *before* the `gpu` extra. Otherwise
+  pip resolves `torch` from PyPI and installs the CPU-only build.
+- Pick the `cuXYZ` index that matches the CUDA version `nvidia-smi` reports (here 13.4, so `cu134`).
+- The check command should print `True NVIDIA GeForce RTX 4050 Laptop GPU`.
+- Tests marked `gpu` are skipped automatically when torch is missing or CUDA is unavailable.
+
+Weights download only through `python -m engine.ml.fetch_weights` (`--all` or names), never at
+import or inside `vectorize()`. Each file is sha256-checked against the manifest in
+`engine/ml/weights.py`. They are cached in `%LOCALAPPDATA%\raster2vector\weights` on Windows and
+`~/.cache/raster2vector/weights` elsewhere; set `R2V_WEIGHTS_DIR` to override.
+
+| name                         | kind    | size   | license      | source repo          |
+|------------------------------|---------|--------|--------------|----------------------|
+| `realesrgan_x4plus`          | sr (4x) | 67 MB  | BSD-3-Clause | xinntao/Real-ESRGAN  |
+| `realesrgan_x4plus_anime_6b` | sr (4x) | 18 MB  | BSD-3-Clause | xinntao/Real-ESRGAN  |
+| `fbcnn_color`                | deblock | 288 MB | Apache-2.0   | jiaxi-jiang/FBCNN    |
+| `scunet_color_real_psnr`     | denoise | 72 MB  | Apache-2.0   | cszn/SCUNet (file hosted in the cszn/KAIR release) |
+
 ## Trying the engine on your own images
 
 - **Preview page:** double-click `preview.bat` (or run `.venv\Scripts\python -m app.server`) and open http://127.0.0.1:8765. Drop an image to see the original next to the SVG, with similarity score, node count, timing, an outlines view and a download button.
