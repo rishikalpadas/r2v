@@ -17,7 +17,10 @@ copy of it: the SVG is rendered at the clean image's size and ssim/delta_e/edge_
 computed against the clean image, not against the degraded input. Scoring a vectorized
 JPEG against the JPEG itself rewards reproducing JPEG noise (in a scratch run, bicubic
 upscaling scored best against the degraded input and worst against the clean source).
-Files in `clean/` (and `reference/`) are never benchmarked as inputs.
+Files in `clean/` (and `reference/`) are never benchmarked as inputs. Keep one input per
+stem in each category, since clean targets and renders are keyed by stem. If an input
+and its clean target differ in aspect ratio by more than 1 px of rounding, the image's
+rows are `error`. A 1 px rounding gap is fine: the render is resized to the target's size.
 
 Real images live in `eval/dataset/` (git-ignored; target about 200 per category).
 
@@ -165,7 +168,7 @@ different sessions, so treat that as timing noise rather than a speed-up.
 - On `degraded`, Enhance is a clear win: SSIM 0.976 vs 0.937 (off) and 0.897 (vtracer),
   with about 3.4x fewer nodes than Enhance off and 8x fewer than vtracer.
 - On `aa_logos`, Enhance on matches SSIM and improves edge F1, but delta_e is worse
-  (0.127 vs 0.094) and nodes and paths are more than 2x higher (56.8 vs 23.8 nodes).
+  (0.127 vs 0.094), nodes are 2.4x higher (56.8 vs 23.8) and paths 1.9x higher (7.5 vs 4.0).
   The run is 13x slower. Anti-aliased but clean 256 px art does not seem to benefit
   from 4x SR.
 - On happiness.jpg, Enhance costs 6x the runtime (51 s vs 8.6 s) for a small fidelity

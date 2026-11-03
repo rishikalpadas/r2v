@@ -154,3 +154,55 @@ def test_ours_noenhance_disables_enhance(dataset, monkeypatch):
     monkeypatch.setitem(sys.modules, "engine", fake)
     assert RUNNERS["ours_noenhance"](dataset / "logos" / "a.png") == "<svg/>"
     assert calls == [{"overrides": {"enhance.enabled": False}}]
+
+
+def test_report_accepts_csv_without_reference_column(tmp_path):
+    csv_path = tmp_path / "results.csv"
+    lines = [",".join(HEADER[:10]), "logos,a.png,vtracer,ok,0.9,1.0,0.8,10,2,0.1"]
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    html = write_report(csv_path).read_text(encoding="utf-8")
+    assert "<td>input</td>" in html
+
+
+def test_clean_target_aspect_mismatch_is_error(tmp_path, monkeypatch):
+    import numpy as np
+    from PIL import Image
+
+    cat = tmp_path / "ds" / "degraded"
+    (cat / "clean").mkdir(parents=True)
+    Image.new("RGB", (32, 32), (255, 255, 255)).save(cat / "x.jpg", format="JPEG")
+    wide = np.zeros((64, 96, 4), dtype=np.uint8)  # 3:2 target for a 1:1 input
+    wide[..., 3] = 255
+    (cat / "clean" / "x.png").write_bytes(to_png_bytes(wide))
+    calls = []
+    monkeypatch.setitem(RUNNERS, "black", lambda p: calls.append(p) or _black_square_svg(32))
+    rows = _rows(run_benchmark(tmp_path / "ds", tmp_path / "out", ["black", "vtracer"]))
+    assert [(r["engine"], r["status"], r["reference"]) for r in rows] == [
+        ("black", "error", "clean"), ("vtracer", "error", "clean")]
+    assert calls == []
+
+
+def test_clean_target_rounding_within_1px_is_ok(tmp_path, monkeypatch):
+    import numpy as np
+    from PIL import Image
+
+    cat = tmp_path / "ds" / "degraded"
+    (cat / "clean").mkdir(parents=True)
+    Image.new("RGB", (32, 33), (255, 255, 255)).save(cat / "x.jpg", format="JPEG")
+    target = np.zeros((67, 64, 4), dtype=np.uint8)  # 33 * 2 = 66, off by one: rounding
+    target[..., 3] = 255
+    (cat / "clean" / "x.png").write_bytes(to_png_bytes(target))
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="33">'
+           '<rect width="32" height="33" fill="#000"/></svg>')
+    monkeypatch.setitem(RUNNERS, "black", lambda p: svg)
+    out = tmp_path / "out"
+    rows = _rows(run_benchmark(tmp_path / "ds", out, ["black"]))
+    assert rows[0]["status"] == "ok"
+    assert float(rows[0]["delta_e"]) < 0.5
+    with Image.open(out / "renders" / "black" / "degraded" / "x.png") as render:
+        assert render.size == (64, 67)  # exactly the clean target's size
+
+
+def test_ours_noenhance_runs_real_engine(dataset, tmp_path):
+    rows = _rows(run_benchmark(dataset, tmp_path / "out", ["ours_noenhance"]))
+    assert {r["status"] for r in rows} == {"ok"}
