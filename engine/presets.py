@@ -9,6 +9,9 @@ from typing import Literal
 from engine.errors import InputError
 
 LAYER_MODES = ("stacked", "cutout")
+DEVICES = ("auto", "cuda", "cpu")
+MAX_ENHANCE_SCALE = 4  # the SR models are 4x; smaller factors downsample their output
+MIN_TILE = 64  # run_tiled's OOM floor
 
 
 def _is_int(value: object) -> bool:
@@ -17,6 +20,39 @@ def _is_int(value: object) -> bool:
 
 def _is_finite_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+@dataclass(frozen=True)
+class EnhanceParams:
+    enabled: bool = True
+    scale: int = 4
+    sr_model_flat: str = "realesrgan_x4plus_anime_6b"
+    sr_model_general: str = "realesrgan_x4plus"
+    deblock: bool = True  # JPEG sources only
+    denoise: bool = False
+    tile: int = 512
+    device: Literal["auto", "cuda", "cpu"] = "auto"
+    max_output_side: int = 8192
+
+    def __post_init__(self) -> None:
+        for name in ("enabled", "deblock", "denoise"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a bool")
+        for name in ("scale", "tile", "max_output_side"):
+            if not _is_int(getattr(self, name)):
+                raise ValueError(f"{name} must be an integer")
+        for name in ("sr_model_flat", "sr_model_general"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty string")
+        if not 1 <= self.scale <= MAX_ENHANCE_SCALE:
+            raise ValueError(f"scale must be between 1 and {MAX_ENHANCE_SCALE}")
+        if self.tile < MIN_TILE:
+            raise ValueError(f"tile must be >= {MIN_TILE}")
+        if self.device not in DEVICES:
+            raise ValueError(f"device must be one of {DEVICES}")
+        if self.max_output_side < 1:
+            raise ValueError("max_output_side must be >= 1")
 
 
 @dataclass(frozen=True)
@@ -95,6 +131,7 @@ class ExportParams:
 class Preset:
     name: str
     stages: tuple[str, ...]
+    enhance: EnhanceParams
     segment: SegmentParams
     fit: FitParams
     export: ExportParams
@@ -103,7 +140,8 @@ class Preset:
 PRESETS: dict[str, Preset] = {
     "logo": Preset(
         name="logo",
-        stages=("segment", "trace", "fit", "export"),
+        stages=("enhance", "segment", "trace", "fit", "export"),
+        enhance=EnhanceParams(),
         segment=SegmentParams(),
         fit=FitParams(),
         export=ExportParams(),
@@ -111,7 +149,7 @@ PRESETS: dict[str, Preset] = {
 }
 
 PRESET_ALIASES: Mapping[str, str] = {"auto": "logo"}
-_OVERRIDE_GROUPS = ("segment", "fit", "export")
+_OVERRIDE_GROUPS = ("enhance", "segment", "fit", "export")
 
 
 def resolve_preset(name: str) -> Preset:

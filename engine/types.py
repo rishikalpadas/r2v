@@ -19,6 +19,7 @@ class RasterImage:
     original_size: tuple[int, int]  # (w, h)
     scale: float = 1.0
     color_space: str = "sRGB"
+    source_format: str | None = None  # Pillow format name of the decoded file ("JPEG", "PNG", ...)
 
 
 @dataclass(frozen=True)
