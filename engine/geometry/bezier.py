@@ -10,6 +10,7 @@ from engine.types import CubicBezier, Point
 _MAX_REPARAM_ITERATIONS = 4
 _REPARAM_ERROR_FACTOR = 16.0  # only reparameterize when squared error < tol_sq * this
 _EPS = 1e-12
+MIN_CHORD_PX = 8.0  # processing px; don't subdivide into micro-splines smaller than this
 
 
 def _dedupe(points: Sequence[Point]) -> list[Point]:
@@ -110,11 +111,14 @@ def _to_bezier(p0: Point, ctrl: np.ndarray, p1: Point) -> CubicBezier:
 
 
 def _fit_piece(
-    pts: list[Point], d: np.ndarray, t1: np.ndarray, t2: np.ndarray, tol_sq: float
+    pts: list[Point], d: np.ndarray, t1: np.ndarray, t2: np.ndarray, tol_sq: float, min_chord: float = 0.0
 ) -> list[CubicBezier]:
-    if len(d) == 2:
-        dist = float(np.hypot(*(d[1] - d[0]))) / 3.0
-        ctrl = np.array([d[0], d[0] + t1 * dist, d[1] + t2 * dist, d[1]])
+    steps = np.hypot(*(d[1:] - d[:-1]).T)
+    arc_len = float(steps.sum())
+    chord_len = float(np.hypot(d[-1, 0] - d[0, 0], d[-1, 1] - d[0, 1]))
+    if len(d) <= 3 or (min_chord > 0 and arc_len < min_chord):
+        dist = chord_len / 3.0
+        ctrl = np.array([d[0], d[0] + t1 * dist, d[-1] + t2 * dist, d[-1]])
         return [_to_bezier(pts[0], ctrl, pts[-1])]
     u = _chord_params(d)
     ctrl = _generate(d, u, t1, t2)
@@ -128,23 +132,38 @@ def _fit_piece(
             err, split = _max_error(ctrl, d, u)
             if err < tol_sq:
                 return [_to_bezier(pts[0], ctrl, pts[-1])]
-    centre = _unit(d[split - 1] - d[split + 1])
+    
+    if min_chord > 0:
+        left_arc = float(steps[:split].sum())
+        right_arc = float(steps[split:].sum())
+        if left_arc < min_chord * 0.5 or right_arc < min_chord * 0.5:
+            return [_to_bezier(pts[0], ctrl, pts[-1])]
+
+    k = min(3, split, len(d) - 1 - split) if min_chord > 0 else 1
+    centre = _unit(d[split + k] - d[split - k])
     if not centre.any():
         chord = d[-1] - d[0]
         centre = _unit(np.array([-chord[1], chord[0]]))
-    left = _fit_piece(pts[: split + 1], d[: split + 1], t1, centre, tol_sq)
-    right = _fit_piece(pts[split:], d[split:], -centre, t2, tol_sq)
+    left = _fit_piece(pts[: split + 1], d[: split + 1], t1, centre, tol_sq, min_chord)
+    right = _fit_piece(pts[split:], d[split:], -centre, t2, tol_sq, min_chord)
     return left + right
 
 
-def fit_cubic(points: Sequence[Point], tolerance_px: float) -> tuple[CubicBezier, ...]:
-    """Fit a G1-joined chain of cubic Beziers from points[0] to points[-1] (exact endpoints)."""
+def fit_cubic(
+    points: Sequence[Point], tolerance_px: float, tangent_samples: int = 1, min_chord: float = 0.0
+) -> tuple[CubicBezier, ...]:
+    """Fit a G1-joined chain of cubic Beziers from points[0] to points[-1] (exact endpoints).
+
+    The end tangents point from each end to the mean of its next `tangent_samples` points (at
+    most a third of the run); 1 is Schneider's one-sample estimate.
+    """
     if len(points) < 2:
         return ()
     pts = _dedupe(points)
     if len(pts) < 2:  # all points coincide
         return (CubicBezier(pts[0], pts[0], pts[0], pts[0]),)
     d = np.array(pts, dtype=float)
-    t1 = _unit(d[1] - d[0])
-    t2 = _unit(d[-2] - d[-1])
-    return tuple(_fit_piece(pts, d, t1, t2, tolerance_px**2))
+    k = max(1, min(tangent_samples, len(d) // 3))
+    t1 = _unit(d[1 : k + 1].mean(axis=0) - d[0])
+    t2 = _unit(d[-k - 1 : -1].mean(axis=0) - d[-1])
+    return tuple(_fit_piece(pts, d, t1, t2, tolerance_px**2, min_chord))

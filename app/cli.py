@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     output.write_text(result.svg, encoding="utf-8")
-    quality = f"SSIM {result.ssim:.4f}, mean ΔE {result.delta_e:.2f}" if result.ssim is not None else "quality n/a (image too small)"
+    quality = f"SSIM {result.ssim:.4f}, mean dE {result.delta_e:.2f}" if result.ssim is not None else "quality n/a (image too small)"
     print(f"wrote {output}  ({result.width}x{result.height}, {result.paths} shapes, {result.nodes} nodes, "
           f"{result.seconds:.2f}s, {quality})")
     return 0

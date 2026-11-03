@@ -256,9 +256,12 @@ def segment(image: RasterImage, params: SegmentParams) -> RegionMap:
     if noisy:
         # Region-level cleanup of quantized input: near-identical shades, AA slivers, specks.
         # Exact-colour input has none of these and keeps its exact segmentation.
+        lab = None
+        if opaque.all():  # reuse the per-colour conversion; transparent pixels need their own
+            lab = _to_lab(colors).astype(np.float32)[pixel_colors].reshape(h, w, 3)
         out, palette_rgb = refine_regions(
             out, palette_rgb, px[..., :3], image.scale,
-            params.region_merge_delta_e, params.speck_area_px,
+            params.region_merge_delta_e, params.speck_area_px, lab=lab,
         )
     return RegionMap(
         labels=out,

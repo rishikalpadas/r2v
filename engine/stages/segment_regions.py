@@ -41,20 +41,29 @@ MERGE_DELTA_E = 9.0
 # ...and at least this share of their shared boundary must be quiet. Measured per boundary on
 # the logos: banding/noise splits 0.5-1.0, designed edges and pieces hugging an outline 0-0.3.
 MERGE_MIN_QUIET_SHARE = 0.5
-# ...and merging may move the larger region's mean source colour (smoothed source, so noise
-# averages out) by at most this dE2000. A blotch inside a fill and the noise-split halves of one
-# fill merge; broad bands of a designed gradient (e.g. the e (13) banner) stay apart. Measured
-# on the logos (full pipeline, vs 1.0): 1.6 merges the soft-shaded letter fills of e (5), e (9)
-# and e (17) (their halves read 1.3-1.6) for dE <= +0.02 per image and SSIM/edge F1 up on all.
+# ...and the merge may add at most this much colour error, dE2000 averaged over the pixels of
+# both regions: each region's mean smoothed-source colour (noise averages out) against the merged
+# one, which is also the colour drawn. A blotch inside a fill and the noise-split halves of one
+# fill merge; broad bands of a designed gradient (e.g. the e (13) banner) and a large region
+# beside a darker large one stay apart. Measured on the logos: see the Q2 rulings note.
 MERGE_MAX_SHIFT = 1.6
 # Anti-aliasing slivers: largest inscribed distance (distance transform, original px) of a
 # region that is thin everywhere; 1.5 holds a ribbon up to 3 original px wide.
 SLIVER_MAX_HALF_WIDTH_PX = 1.5
-# "Between" test: dE(A, S) + dE(S, B) <= tol x dE(A, B). JPEG/SR ringing leaves edge ribbons a
-# little darker than the darker side; measured on the logos: those read 1.3-1.45, real dark rims
-# and outlines >= 2.0 (a black outline between pink and white ~4). 1.2 (the 3x3 blend vote's)
-# kept the ringing ribbons as ragged fragments: specks +75, wobble +54 over 1.5 on the logos.
-SLIVER_BETWEEN_TOLERANCE = 1.5
+# "Between" test on the sliver's mean source colour S against its two main neighbours A, B (Lab):
+# S projected on the line A-B may lie beyond the nearer end by at most SLIVER_MAX_OVERSHOOT (JPEG/SR
+# ringing undershoots by ~1-3; the e (11) petal rims, 7.7 dE2000 darker than their fill, sit 5-8
+# beyond and are designed), and off the line by at most SLIVER_MAX_OFFSET x |AB| (absorbed
+# ribbons on the logos measured <= 0.18; a dark rim beside two light colours is far off it).
+SLIVER_MAX_OVERSHOOT = 3.0
+SLIVER_MAX_OFFSET = 0.25
+# A designed pinstripe is flat across its width while an AA ribbon is a ramp: a sliver at least
+# SLIVER_FLAT_MIN_WIDTH_PX wide (original px, mean width = 2 area / perimeter) whose pixels lie
+# within SLIVER_FLAT_DE (Lab) of its median colour for SLIVER_FLAT_SHARE of them stays. A 1 px
+# ribbon cannot show a ramp, so it is judged on colour alone.
+SLIVER_FLAT_MIN_WIDTH_PX = 1.5
+SLIVER_FLAT_DE = 3.0
+SLIVER_FLAT_SHARE = 0.5
 # Leftover specks: regions under this area (original px^2) merge into their most similar
 # neighbour unless their dE2000 to every neighbour is at least SPECK_KEEP_DELTA_E (real dots).
 SPECK_AREA_PX = 12.0
@@ -87,7 +96,7 @@ def contrast_image(
         n = int(labels.max(initial=-1)) + 1
         sums = np.zeros((n, 3))
     for c in range(3):
-        smooth = ndimage.gaussian_filter(lab[..., c], sigma, mode="nearest")
+        smooth = ndimage.gaussian_filter(lab[..., c], sigma, mode="nearest", truncate=3.0)
         gy, gx = np.gradient(smooth)
         total += gx * gx + gy * gy
         if sums is not None:
@@ -141,15 +150,16 @@ def merge_near_regions(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Merge adjacent regions with near-identical colours and no real edge between them.
 
-    Greedy, least distinct pair (dE2000 of the current colours) first. A pair merges when every
-    pair of its members' original colours is within `max_delta_e` (complete linkage, so a banded
-    gradient cannot chain into one colour) and at least `min_quiet_share` of the boundary they
-    share has `contrast` below QUIET_GRADIENT (a designed pale-on-pale edge stays), and merging
-    moves the larger region's mean source colour by at most `max_shift`. With `smooth_sums`
-    (per-region sums of the smoothed source Lab, see `contrast_image`) that mean is read from
-    the source, so two noise-split halves of one flat fill merge whatever their areas while
-    broad bands of a gradient stay; without, from the palette colours. The merged colour is the
-    area-weighted mean in Lab; unmerged regions keep their colour exactly.
+    Greedy, cheapest pair first. A pair merges when every pair of its members' original colours
+    is within `max_delta_e` (complete linkage, so a banded gradient cannot chain into one
+    colour), at least `min_quiet_share` of the boundary they share has `contrast` below
+    QUIET_GRADIENT (a designed pale-on-pale edge stays), and its cost is at most `max_shift`:
+    the area-weighted mean dE2000 between each region's source colour and the merged one,
+    (A_x dE(m, src_x) + A_y dE(m, src_y)) / (A_x + A_y). Source colours come from
+    `smooth_sums` (per-region sums of the smoothed source Lab, see `contrast_image`), so the
+    noise-split halves of one flat fill merge whatever their areas while broad bands of a
+    gradient stay; without it, from the palette colours. A merged region is drawn in its merged
+    source colour m, so the gate and the output agree; unmerged regions keep their colour.
     Returns (labels, palette_rgb).
     """
     n = len(palette_rgb)
@@ -173,9 +183,10 @@ def merge_near_regions(
         return labels, palette_rgb
 
     area = np.bincount(labels[labels >= 0], minlength=n).astype(np.float64)
-    lab = _rgb_to_lab(palette_rgb)
-    lab_sum = lab * area[:, None]
-    src_sum = (lab_sum if smooth_sums is None else np.asarray(smooth_sums, np.float64)).copy()
+    if smooth_sums is None:
+        src_sum = _rgb_to_lab(palette_rgb) * area[:, None]
+    else:
+        src_sum = np.asarray(smooth_sums, np.float64).copy()
     members: list[frozenset[int]] = [frozenset((int(colour_of[i]),)) for i in range(n)]
     border: list[dict[int, list[float]]] = [dict() for _ in range(n)]
     for i, j, s, k in zip(pi.tolist(), pj.tolist(), sums.tolist(), counts.tolist()):
@@ -187,19 +198,18 @@ def merge_near_regions(
     def linkage(x: int, y: int) -> float:
         return max(dist[p, q] for p in members[x] for q in members[y])
 
-    def colour(x: int) -> np.ndarray:
-        return lab_sum[x] / area[x]
-
     def push(heap: list, x: int, y: int) -> None:
+        x, y = min(x, y), max(x, y)  # canonical order: the version stamps follow x, y
         s, k = border[x][y]
         if s / k < min_quiet_share or linkage(x, y) >= max_delta_e:
             return
-        big = x if area[x] >= area[y] else y
-        merged = (src_sum[x] + src_sum[y]) / (area[x] + area[y])
-        if _de(merged, src_sum[big] / area[big]) > max_shift:
+        total = area[x] + area[y]
+        merged = (src_sum[x] + src_sum[y]) / total
+        cost = (area[x] * _de(merged, src_sum[x] / area[x])
+                + area[y] * _de(merged, src_sum[y] / area[y])) / total
+        if cost > max_shift:
             return
-        heapq.heappush(heap, (_de(colour(x), colour(y)), min(x, y), max(x, y),
-                              int(version[x]), int(version[y])))
+        heapq.heappush(heap, (cost, x, y, int(version[x]), int(version[y])))
 
     heap: list = []
     for i, j in zip(pi[near].tolist(), pj[near].tolist()):
@@ -211,7 +221,6 @@ def merge_near_regions(
         keep, gone = (x, y) if area[x] >= area[y] else (y, x)
         parent[gone] = keep
         area[keep] += area[gone]
-        lab_sum[keep] += lab_sum[gone]
         src_sum[keep] += src_sum[gone]
         members[keep] = members[keep] | members[gone]
         del border[keep][gone]
@@ -238,7 +247,7 @@ def merge_near_regions(
     merged = np.bincount(root, minlength=n)[survivors] > 1
     palette = palette_rgb[survivors].copy()
     if merged.any():
-        means = lab_sum[survivors[merged]] / area[survivors[merged], None]
+        means = src_sum[survivors[merged]] / area[survivors[merged], None]
         palette[merged] = _lab_to_rgb(means)
     return out, palette
 
@@ -246,19 +255,39 @@ def merge_near_regions(
 # ------------------------------------------------------------------ 2. anti-aliasing slivers
 
 
-def _half_widths(labels: np.ndarray, n: int) -> np.ndarray:
-    """Per region: largest distance (px) from one of its pixels to the nearest pixel outside it
-    (outside the canvas counts as outside); a w px wide ribbon gives ceil(w / 2)."""
+def _interior(labels: np.ndarray) -> np.ndarray:
+    """Pixels whose 4 neighbours share their label (outside the array counts as different)."""
     pad = np.pad(labels, 1, mode="constant", constant_values=labels.min(initial=0) - 1)
-    interior = (
+    return (
         (pad[:-2, 1:-1] == labels) & (pad[2:, 1:-1] == labels)
         & (pad[1:-1, :-2] == labels) & (pad[1:-1, 2:] == labels)
     )
-    dist = ndimage.distance_transform_edt(interior).astype(np.float32) + 1.0
-    opaque = labels >= 0
-    out = np.zeros(n, np.float64)
-    np.maximum.at(out, labels[opaque], dist[opaque])
-    return out
+
+
+def _thin_regions(labels: np.ndarray, n: int, limit: float) -> np.ndarray:
+    """Per region 0..n-1: is its half width at most `limit` (processing px)? The half width is
+    the largest distance from one of its pixels to the nearest pixel outside it (outside the
+    canvas counts as outside); a w px ribbon has ceil(w / 2)."""
+    interior = _interior(labels)
+    # Chessboard distance never exceeds the Euclidean one: a region deep by it is thick for sure.
+    rough = ndimage.distance_transform_cdt(interior, metric="chessboard") + 1
+    thin = np.bincount(labels[(rough > limit) & (labels >= 0)], minlength=n)[:n] == 0
+    # The rest are checked exactly: each in its own box (the nearest non-interior pixel to a
+    # pixel of a region is always on that region's own border), or all at once when those boxes
+    # would cover more than the image.
+    boxes = ndimage.find_objects(labels + 1, max_label=n)
+    todo = [r for r in np.flatnonzero(thin) if boxes[r] is not None]
+    cover = sum((bx[0].stop - bx[0].start) * (bx[1].stop - bx[1].start)
+                for bx in (boxes[r] for r in todo))
+    if cover > labels.size:
+        dist = ndimage.distance_transform_edt(interior) + 1.0
+        deep = (dist > limit) & (labels >= 0)
+        return thin & (np.bincount(labels[deep], minlength=n)[:n] == 0)
+    for r in todo:
+        inside = interior[boxes[r]] & (labels[boxes[r]] == r)
+        if inside.any() and ndimage.distance_transform_edt(np.pad(inside, 1)).max() + 1 > limit:
+            thin[r] = False
+    return thin
 
 
 def _neighbour_borders(window: np.ndarray, mask: np.ndarray) -> dict[int, int]:
@@ -274,10 +303,19 @@ def _neighbour_borders(window: np.ndarray, mask: np.ndarray) -> dict[int, int]:
     return tally
 
 
-def _touches(piece: np.ndarray, region: np.ndarray) -> bool:
-    """Is any `piece` pixel 4-adjacent to a `region` pixel? (both boolean, same window)."""
-    grown = ndimage.binary_dilation(piece, ndimage.generate_binary_structure(2, 1))
-    return bool((grown & region).any())
+def _detached(target: np.ndarray, region: np.ndarray, own: int) -> np.ndarray:
+    """Mask of the `own` pieces of `target` with no pixel 4-adjacent to `region`."""
+    pieces, count = ndimage.label(target == own)
+    if count == 0:
+        return np.zeros(target.shape, bool)
+    attached = np.zeros(count + 1, bool)
+    for near, other in (
+        (pieces[:, :-1], region[:, 1:]), (pieces[:, 1:], region[:, :-1]),
+        (pieces[:-1, :], region[1:, :]), (pieces[1:, :], region[:-1, :]),
+    ):
+        attached[near[other]] = True
+    attached[0] = True
+    return ~attached[pieces]
 
 
 def _split_sliver(window: np.ndarray, lab_win: np.ndarray, sliver: int, a: int, b: int,
@@ -285,51 +323,73 @@ def _split_sliver(window: np.ndarray, lab_win: np.ndarray, sliver: int, a: int, 
     """New labels for the sliver's pixels in `window`: each goes to whichever of a, b its source
     colour is closer to; pieces cut off from their region flip to the other one. None when some
     piece touches neither (the sliver is then kept)."""
+    full = window == sliver
+    ys, xs = np.nonzero(full)
+    crop = (slice(max(ys.min() - 1, 0), ys.max() + 2), slice(max(xs.min() - 1, 0), xs.max() + 2))
+    window, lab_win = window[crop], lab_win[crop]  # every piece and its neighbours lie in here
     mask = window == sliver
     px = lab_win[mask]
     to_a = ((px - lab_a) ** 2).sum(1) <= ((px - lab_b) ** 2).sum(1)
     target = np.full(window.shape, -1, dtype=np.int64)
     target[mask] = np.where(to_a, a, b)
+    region = {a: window == a, b: window == b}
     for _ in range(3):
         moved = False
         for own, other in ((a, b), (b, a)):
-            pieces, count = ndimage.label(target == own)
-            if count == 0:
-                continue
-            region = window == own
-            for k in range(1, count + 1):
-                piece = pieces == k
-                if not _touches(piece, region):
-                    target[piece] = other
-                    moved = True
+            cut = _detached(target, region[own], own)
+            if cut.any():
+                target[cut] = other
+                moved = True
         if not moved:
             break
-    for own in (a, b):
-        pieces, count = ndimage.label(target == own)
-        region = window == own
-        for k in range(1, count + 1):
-            if not _touches(pieces == k, region):
-                return None
+    if any(_detached(target, region[own], own).any() for own in (a, b)):
+        return None
     return target[mask]
+
+
+def _is_blend(px: np.ndarray, lab_a: np.ndarray, lab_b: np.ndarray, width_px: float) -> bool:
+    """Do the sliver's source pixels `px` (Lab) read as a blend between A and B?
+
+    Their mean must project onto the line A-B no further than SLIVER_MAX_OVERSHOOT beyond the
+    nearer end and lie within SLIVER_MAX_OFFSET x |AB| of the line; a sliver at least
+    SLIVER_FLAT_MIN_WIDTH_PX wide (original px) must also not be flat (a designed pinstripe)."""
+    ab = np.asarray(lab_b, np.float64) - lab_a
+    length2 = float(ab @ ab)
+    if length2 <= 1e-9:
+        return False
+    length = length2 ** 0.5
+    mean = px.mean(0) - lab_a
+    t = float(mean @ ab) / length2
+    if max(0.0, -t, t - 1.0) * length > SLIVER_MAX_OVERSHOOT:
+        return False
+    if np.linalg.norm(mean - t * ab) > SLIVER_MAX_OFFSET * length:
+        return False
+    if width_px >= SLIVER_FLAT_MIN_WIDTH_PX:
+        median = np.median(px, axis=0)
+        flat = np.mean(((px - median) ** 2).sum(1) <= SLIVER_FLAT_DE ** 2)
+        if flat >= SLIVER_FLAT_SHARE:
+            return False
+    return True
 
 
 def absorb_slivers(
     labels: np.ndarray, palette_rgb: np.ndarray, lab: np.ndarray, scale: float,
     max_half_width_px: float = SLIVER_MAX_HALF_WIDTH_PX,
-    tolerance: float = SLIVER_BETWEEN_TOLERANCE,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Split anti-aliasing slivers between the two regions they separate.
 
-    A sliver is thin everywhere (half width <= max_half_width_px original px) and its colour lies
-    between its two longest-border neighbours A and B: dE(A, S) + dE(S, B) <= tolerance x dE(A, B).
-    A real thin stroke darker (or lighter) than both sides fails that test and stays. Each sliver
-    pixel goes to A or B by its source colour, so the cut sits where the blend crosses halfway.
-    Returns (labels, palette_rgb).
+    A sliver is thin everywhere (half width, see `_thin_regions`, at most `max_half_width_px`
+    original px, i.e. `max_half_width_px` x `scale` processing px) and its source pixels read as a blend between its two
+    longest-border neighbours A and B (`_is_blend`): a real thin stroke darker or lighter than
+    both sides, or a flat pinstripe, stays. Each sliver pixel goes to A or B by its source colour,
+    so the cut sits where the blend crosses halfway. A sliver that received pixels from another
+    one is re-measured before it is judged. Returns (labels, palette_rgb).
     """
     n = len(palette_rgb)
     if n < 3:
         return labels, palette_rgb
-    thin = np.flatnonzero(_half_widths(labels, n) <= max_half_width_px * scale)
+    limit = max_half_width_px * scale
+    thin = np.flatnonzero(_thin_regions(labels, n, limit))
     if len(thin) == 0:
         return labels, palette_rgb
     pal_lab = _rgb_to_lab(palette_rgb)
@@ -338,6 +398,7 @@ def absorb_slivers(
     boxes = ndimage.find_objects(labels + 1)
     h, w = labels.shape
     alive = np.ones(n, dtype=bool)
+    grown = np.zeros(n, dtype=bool)
     # Grown boxes: a sliver that receives pixels from another one spans both boxes.
     span = {int(i): boxes[i] for i in thin if boxes[i] is not None}
     for s in sorted(span, key=lambda i: (area[i], i)):
@@ -348,21 +409,29 @@ def absorb_slivers(
         mask = window == s
         if not mask.any():
             continue
+        if grown[s]:  # it received pixels: is it still thin everywhere? (taxicab distance is
+            # never below the Euclidean one, so this only errs towards keeping the sliver)
+            own = np.where(mask, 0, -1)
+            local = ndimage.distance_transform_cdt(_interior(own) & mask, metric="taxicab")
+            if local[mask].max() + 1 > limit:
+                continue
         tally = _neighbour_borders(window, mask)
         tally.pop(s, None)
         if len(tally) < 2:
             continue
         (a, _), (b, _) = sorted(tally.items(), key=lambda t: (-t[1], t[0]))[:2]
-        d_ab = _de(pal_lab[a], pal_lab[b])
-        if d_ab <= 0 or _de(pal_lab[a], pal_lab[s]) + _de(pal_lab[s], pal_lab[b]) > tolerance * d_ab:
+        lab_win = lab[y0:y1, x0:x1]
+        width = 2.0 * float(mask.sum()) / max(sum(tally.values()), 1) / scale
+        if not _is_blend(lab_win[mask].astype(np.float64), pal_lab[a], pal_lab[b], width):
             continue
-        new = _split_sliver(window, lab[y0:y1, x0:x1], s, a, b, pal_lab[a], pal_lab[b])
+        new = _split_sliver(window, lab_win, s, a, b, pal_lab[a], pal_lab[b])
         if new is None:
             continue
         window[mask] = new
         alive[s] = False
         for r in (a, b):
             if r in span:
+                grown[r] = True
                 ry, rx = span[r]
                 span[r] = (slice(min(ry.start, ys.start), max(ry.stop, ys.stop)),
                            slice(min(rx.start, xs.start), max(rx.stop, xs.stop)))
@@ -430,11 +499,14 @@ def absorb_specks(
 def refine_regions(
     labels: np.ndarray, palette_rgb: np.ndarray, rgb: np.ndarray, scale: float,
     merge_delta_e: float = MERGE_DELTA_E, speck_area_px: float = SPECK_AREA_PX,
+    lab: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """All three passes: near-identical merge, sliver absorption, speck absorption."""
+    """All three passes: near-identical merge, sliver absorption, speck absorption.
+    `lab`: the float32 CIELAB of `rgb` when the caller has it (else computed here)."""
     if len(palette_rgb) < 2:
         return labels, palette_rgb
-    lab = lab_image(rgb)
+    if lab is None:
+        lab = lab_image(rgb)
     contrast, smooth_sums = contrast_image(lab, scale, labels)
     labels, palette_rgb = merge_near_regions(labels, palette_rgb, contrast, merge_delta_e,
                                              smooth_sums=smooth_sums)

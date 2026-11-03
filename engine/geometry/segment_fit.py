@@ -7,8 +7,10 @@ from dataclasses import replace
 
 import numpy as np
 from scipy.optimize import minimize_scalar
+from scipy.spatial import cKDTree
 
 from engine.geometry.bezier import fit_cubic, sample
+from engine.geometry.noise import NOISE_FLOOR_PX
 from engine.presets import FitParams
 from engine.types import Arc, CubicBezier, Line, Point, Segment
 
@@ -124,30 +126,99 @@ def _bezier_distances(chain: Sequence[CubicBezier], pts: np.ndarray) -> np.ndarr
     return np.sqrt((diff**2).sum(axis=2)).min(axis=1)
 
 
-def fit_span(points: Sequence[Point], params: FitParams) -> tuple[Segment, ...]:
-    """Pick the cheapest of line / arc / Bezier chain by sse + complexity_weight * n_params."""
+def _model_cost(sse: float, n_params: int, params: FitParams, noise: float | None) -> float:
+    """MDL cost: sse + w * n_params, or sse / sigma^2 + w * n_params when the noise is known.
+
+    Dividing by the noise variance makes the cost scale-free (sse grows with scale squared, the
+    parameter count does not) and lets noisier curves trade residual for fewer parameters.
+    """
+    w = params.complexity_weight
+    if noise is None:
+        return sse + w * n_params
+    sigma = max(noise, NOISE_FLOOR_PX)
+    return sse / (sigma * sigma) + w * n_params
+
+
+def fit_span_scored(
+    points: Sequence[Point], params: FitParams, noise: float | None = None, tangent_samples: int = 1
+) -> tuple[tuple[Segment, ...], float]:
+    """The cheapest of line / arc / Bezier chain within tolerance, and its `_model_cost`.
+
+    `tangent_samples` is passed to `fit_cubic` for the Bezier chain's end tangents.
+    """
     if len(points) < 2:
-        return ()
+        return (), 0.0
     if len(points) == 2:
-        return (Line(_exact(points[0]), _exact(points[-1])),)
+        line = Line(_exact(points[0]), _exact(points[-1]))
+        return (line,), _model_cost(0.0, _LINE_PARAMS, params, noise)
     pts = _as_array(points)
     tol = params.tolerance_px
-    w = params.complexity_weight
     candidates: list[tuple[float, tuple[Segment, ...]]] = []
 
     line, line_sse = fit_line(points)
     if float(np.max(_dist_to_segment(pts, pts[0], pts[-1]))) <= tol:
-        candidates.append((line_sse + w * _LINE_PARAMS, (line,)))
+        candidates.append((_model_cost(line_sse, _LINE_PARAMS, params, noise), (line,)))
 
     arc_fit = fit_arc(points)
     if arc_fit is not None and _arc_max_error(arc_fit[0], pts) <= tol:
-        candidates.append((arc_fit[1] + w * _ARC_PARAMS, (arc_fit[0],)))
+        candidates.append((_model_cost(arc_fit[1], _ARC_PARAMS, params, noise), (arc_fit[0],)))
 
-    chain = fit_cubic(points, tol)
-    dists = _bezier_distances(chain, pts)
-    bez_cost = float(np.sum(dists**2)) + w * _BEZIER_PARAMS * len(chain)
-    candidates.append((bez_cost, tuple(chain)))
-    return min(candidates, key=lambda c: c[0])[1]
+    min_chord = max(6.0, tol * 3.0) if noise is not None else 0.0
+    chain = fit_cubic(points, tol, tangent_samples, min_chord)
+    sse = float(np.sum(_bezier_distances(chain, pts) ** 2))
+    candidates.append((_model_cost(sse, _BEZIER_PARAMS * len(chain), params, noise), tuple(chain)))
+    cost, segments = min(candidates, key=lambda c: c[0])
+    return segments, cost
+
+
+def fit_span(
+    points: Sequence[Point], params: FitParams, noise: float | None = None, tangent_samples: int = 1
+) -> tuple[Segment, ...]:
+    """Pick the cheapest of line / arc / Bezier chain by `_model_cost` (see `fit_span_scored`)."""
+    return fit_span_scored(points, params, noise, tangent_samples)[0]
+
+
+_CHAIN_SAMPLES_PER_PX = 10  # chain_cost samples the chain this densely (0.05 px max error)
+
+
+def _n_params(seg: Segment) -> int:
+    if isinstance(seg, Line):
+        return _LINE_PARAMS
+    return _ARC_PARAMS if isinstance(seg, Arc) else _BEZIER_PARAMS
+
+
+def _segment_points(seg: Segment) -> np.ndarray:
+    """Points along `seg`, about 1 / _CHAIN_SAMPLES_PER_PX apart."""
+    if isinstance(seg, Arc):
+        a0 = math.atan2(seg.p0[1] - seg.center[1], seg.p0[0] - seg.center[0])
+        a1 = math.atan2(seg.p1[1] - seg.center[1], seg.p1[0] - seg.center[0])
+        travel = (a1 - a0) % (2 * math.pi) if seg.sweep else -((a0 - a1) % (2 * math.pi))
+        count = max(2, math.ceil(abs(travel) * seg.radius * _CHAIN_SAMPLES_PER_PX) + 1)
+        ang = a0 + np.linspace(0.0, 1.0, count) * travel
+        return np.column_stack([seg.center[0] + seg.radius * np.cos(ang),
+                                seg.center[1] + seg.radius * np.sin(ang)])
+    ctrl = _as_array((seg.p0, seg.p1) if isinstance(seg, Line) else (seg.p0, seg.c1, seg.c2, seg.p1))
+    length = float(np.hypot(*np.diff(ctrl, axis=0).T).sum())  # bounds the curve length
+    t = np.linspace(0.0, 1.0, max(2, math.ceil(length * _CHAIN_SAMPLES_PER_PX) + 1))
+    if isinstance(seg, Line):
+        return ctrl[0] + t[:, None] * (ctrl[1] - ctrl[0])
+    return sample(seg, t)
+
+
+def chain_cost(
+    segments: Sequence[Segment], points: Sequence[Point], params: FitParams, noise: float | None
+) -> float:
+    """`_model_cost` of a whole chain against `points` (each point's squared distance to it).
+
+    Unlike the cost `fit_span_scored` reports, this can score different chains against the same
+    data, e.g. one fit across a corner against two fits that meet at it.
+    """
+    n_params = sum(_n_params(s) for s in segments)
+    if not segments or not points:
+        return _model_cost(0.0, n_params, params, noise)
+    curve = np.vstack([_segment_points(s) for s in segments])
+    dist, _ = cKDTree(curve).query(_as_array(points))
+    return _model_cost(float(np.sum(dist**2)), n_params, params, noise)
 
 
 def _shift(p: Point, delta: Point) -> Point:
@@ -200,15 +271,12 @@ def _snap_deltas(line: Line, tol_rad: float, max_move: float) -> tuple[Point, Po
     return deltas
 
 
-def snap_axis(
-    segments: Sequence[Segment], params: FitParams, locked: frozenset[int] = frozenset()
-) -> tuple[Segment, ...]:
+def snap_axis(segments: Sequence[Segment], params: FitParams, locked: frozenset[int] = frozenset()) -> tuple[Segment, ...]:
     """Snap near-axis interior Lines to exact horizontal/vertical.
 
     Only Lines that are neither the first nor the last segment qualify (their endpoints are
     interior corners); the neighbours' shared endpoints move identically. Lines next to an Arc
-    are left alone, as are lines whose snap would move an endpoint more than tolerance_px, and
-    lines that would move any segment whose index is in `locked`.
+    are left alone, as are lines whose snap would move an endpoint more than tolerance_px.
     """
     segs = list(segments)
     tol_rad = math.radians(params.axis_snap_deg)
@@ -228,4 +296,71 @@ def snap_axis(
         segs[i - 1] = _move_end(prev, True, d0, direction)
         segs[i] = snapped
         segs[i + 1] = _move_end(nxt, False, d1, direction)
+    return tuple(segs)
+
+
+def _unit_vec(dx: float, dy: float) -> Point | None:
+    length = math.hypot(dx, dy)
+    return (dx / length, dy / length) if length > _EPS else None
+
+
+def _arc_tangent(arc: Arc, p: Point) -> Point | None:
+    """Direction of travel along `arc` at its end point `p`."""
+    rx, ry = p[0] - arc.center[0], p[1] - arc.center[1]
+    sign = 1.0 if arc.sweep else -1.0  # sweep = increasing angle in the y-down frame
+    return _unit_vec(-ry * sign, rx * sign)
+
+
+def _end_tangent(seg: Segment, at_end: bool) -> Point | None:
+    """Unit direction of travel where `seg` ends (at_end) or starts."""
+    if isinstance(seg, Line):
+        return _unit_vec(seg.p1[0] - seg.p0[0], seg.p1[1] - seg.p0[1])
+    if isinstance(seg, Arc):
+        return _arc_tangent(seg, seg.p1 if at_end else seg.p0)
+    ctrl = (seg.p0, seg.c1, seg.c2, seg.p1)
+    if at_end:
+        anchor, others = seg.p1, ctrl[2::-1]
+        return next((u for q in others if (u := _unit_vec(anchor[0] - q[0], anchor[1] - q[1]))), None)
+    anchor, others = seg.p0, ctrl[1:]
+    return next((u for q in others if (u := _unit_vec(q[0] - anchor[0], q[1] - anchor[1]))), None)
+
+
+def _aim_handle(seg: CubicBezier, at_end: bool, direction: Point) -> CubicBezier:
+    """Re-aim the handle at one end of `seg` along the travel `direction`, keeping its length."""
+    anchor, handle = (seg.p1, seg.c2) if at_end else (seg.p0, seg.c1)
+    length = math.hypot(handle[0] - anchor[0], handle[1] - anchor[1])
+    if length <= _EPS:
+        return seg
+    sign = -1.0 if at_end else 1.0  # the end handle points back against the travel
+    aimed = (anchor[0] + sign * direction[0] * length, anchor[1] + sign * direction[1] * length)
+    return replace(seg, c2=aimed) if at_end else replace(seg, c1=aimed)
+
+
+def align_joins(segments: Sequence[Segment], joins: Sequence[int]) -> tuple[Segment, ...]:
+    """Make the chain G1 at each join index j (between segments[j - 1] and segments[j]).
+
+    j = 0 is the wrap-around join of a closed chain. Lines and arcs are rigid: a Bezier next to
+    one has its handle aimed along the rigid tangent; two Beziers share the bisecting direction;
+    joins between two rigid segments (or at a cusp) are left alone. End points never move.
+    """
+    segs = list(segments)
+    for j in joins:
+        i = (j - 1) % len(segs)
+        prev, nxt = segs[i], segs[j]
+        t_out, t_in = _end_tangent(prev, True), _end_tangent(nxt, False)
+        prev_bez, next_bez = isinstance(prev, CubicBezier), isinstance(nxt, CubicBezier)
+        if t_out is None or t_in is None or not (prev_bez or next_bez):
+            continue
+        if not prev_bez:
+            direction = t_out
+        elif not next_bez:
+            direction = t_in
+        else:
+            direction = _unit_vec(t_out[0] + t_in[0], t_out[1] + t_in[1])
+            if direction is None:
+                continue
+        if prev_bez:
+            segs[i] = _aim_handle(prev, True, direction)
+        if next_bez:
+            segs[j] = _aim_handle(segs[j], False, direction)
     return tuple(segs)

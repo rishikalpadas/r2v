@@ -158,8 +158,11 @@ def _three_columns(middle_rgb, width: int = 1):
 
 @pytest.mark.parametrize("width", [1, 2])  # 3 px has half width 2 > 1.5 at scale 1
 def test_anti_aliasing_sliver_is_absorbed(width):
-    labels, palette, lab = _three_columns((145, 145, 205), width)  # halfway white -> blue
-    out, pal = absorb_slivers(labels, palette, lab, scale=1.0)
+    labels, palette, _ = _three_columns((145, 145, 205), width)  # halfway white -> blue
+    rgb = palette[labels].copy()
+    if width == 2:  # a 2 px AA ribbon is a ramp, not a flat stripe
+        rgb[:, 20], rgb[:, 21] = (195, 195, 225), (95, 95, 185)
+    out, pal = absorb_slivers(labels, palette, lab_image(rgb), scale=1.0)
     assert len(pal) == 2 and _connected(out)
     assert {tuple(c) for c in pal} == {(250, 250, 250), (40, 40, 160)}
 
@@ -250,3 +253,113 @@ def test_exact_colour_input_is_untouched():
 def test_new_params_validated(kwargs):
     with pytest.raises(ValueError):
         SegmentParams(**kwargs)
+
+
+# ---------------------------------------------------------------- review fixes (dd1872a)
+
+
+def _lab(rgb) -> np.ndarray:
+    return rgb2lab(np.array(rgb, np.float64).reshape(1, 1, 3) / 255.0)[0, 0]
+
+
+def test_merge_after_repush_with_higher_keep_id():
+    """Strips 0 | 1 | 2: 1 joins the large 2 first (cost 0); 0 then needs the re-pushed pair
+    (keep=2, nb=0) whose version stamps used to be stored swapped and dropped as stale."""
+    labels = np.zeros((20, 20), np.int32)
+    labels[:, 1:2] = 1
+    labels[:, 2:] = 2
+    palette = np.array([NEAR, GROUND, GROUND], np.uint8)
+    quiet = np.zeros(labels.shape, np.float32)
+    out, pal = merge_near_regions(labels, palette, quiet)
+    assert len(pal) == 1 and (out == 0).all()
+
+
+def test_merge_drawn_colour_stays_near_each_regions_source():
+    """Two large regions whose palette colours differ (dE 6.6) but whose source means agree:
+    they merge, and the drawn colour comes from the source, not from the palette mean."""
+    labels = np.zeros((30, 30), np.int32)
+    labels[:, 16:] = 1  # areas 480 / 420
+    palette = np.array([GROUND, NEAR], np.uint8)
+    src = _lab(GROUND)
+    sums = np.array([src * 480, src * 420])
+    out, pal = merge_near_regions(labels, palette, np.zeros(labels.shape, np.float32),
+                                  smooth_sums=sums)
+    assert len(pal) == 1
+    assert _de(tuple(pal[0]), GROUND) < 2.0
+
+
+def test_large_region_does_not_merge_into_darker_large_neighbour():
+    """The smaller of two large regions would be drawn far from its own source colour."""
+    labels = np.zeros((30, 30), np.int32)
+    labels[:, 18:] = 1  # areas 540 / 360
+    palette = np.array([NEAR, GROUND], np.uint8)
+    sums = np.array([_lab(NEAR) * 540, _lab(GROUND) * 360])
+    out, pal = merge_near_regions(labels, palette, np.zeros(labels.shape, np.float32),
+                                  smooth_sums=sums)
+    if len(pal) == 1:  # if it merged, every region must still be drawn close to its source
+        assert _de(tuple(pal[0]), GROUND) < 2.0 and _de(tuple(pal[0]), NEAR) < 2.0
+    else:
+        assert {tuple(c) for c in pal} == {GROUND, NEAR}
+
+
+def _stripe_scene(stripe_rgb, width: int, left=(0, 0, 0), right=(255, 255, 255)):
+    labels = np.zeros((40, 41), np.int32)
+    labels[:, 20:20 + width] = 1
+    labels[:, 20 + width:] = 2
+    palette = np.array([left, stripe_rgb, right], np.uint8)
+    return labels, palette, lab_image(palette[labels])
+
+
+def test_flat_mid_grey_pinstripe_between_black_and_white_stays():
+    labels, palette, lab = _stripe_scene((128, 128, 128), 2)
+    assert len(absorb_slivers(labels, palette, lab, scale=1.0)[1]) == 3
+
+
+def test_rim_darker_than_its_fill_next_to_white_stays():
+    fill = (238, 143, 203)
+    rim = (214, 115, 180)  # 7.7 dE2000 darker than the fill: the e (11) petal rim
+    assert 6.5 < _de(fill, rim) < 9.0
+    labels, palette, lab = _stripe_scene(rim, 1, left=fill, right=(253, 253, 253))
+    assert len(absorb_slivers(labels, palette, lab, scale=1.0)[1]) == 3
+
+
+def test_ringing_ribbon_slightly_beyond_the_darker_side_is_absorbed():
+    fill = (238, 143, 203)
+    ribbon = (236, 140, 201)  # ~1 dE beyond the fill, away from white: JPEG/SR ringing
+    labels, palette, lab = _stripe_scene(ribbon, 1, left=fill, right=(253, 253, 253))
+    assert len(absorb_slivers(labels, palette, lab, scale=1.0)[1]) == 2
+
+
+def test_pale_on_pale_edge_is_two_regions_before_the_merge_too():
+    """Control: the bar scene is two regions with the merge disabled, so the pale-on-pale test
+    exercises the merge refusing, not the clustering."""
+    size, factor = 160, 4
+    hi = np.empty((size * factor, size * factor, 3))
+    hi[:] = GROUND
+    yy, xx = np.mgrid[0:size * factor, 0:size * factor] / factor
+    hi[(np.abs(xx - 80) < 50) & (np.abs(yy - 80) < 14)] = NEAR
+    rgb = hi.reshape(size, factor, size, factor, 3).mean((1, 3))
+    rm = segment(_img(_noisy_rgba(rgb)), SegmentParams(region_merge_delta_e=0.0))
+    assert len(rm.palette_rgb) == 2
+
+
+def test_sliver_that_cannot_be_split_cleanly_is_kept():
+    """A sliver pixel whose colour says A but which only touches B and another sliver piece
+    that goes to B: the A piece is cut off from A, flips to B... unless B is also unreachable.
+    Here a 1 px ribbon isolates a pixel enclosed by a third region: the split returns None."""
+    from engine.stages.segment_regions import _split_sliver
+    window = np.full((5, 7), 2, np.int32)  # region 2 everywhere (a third colour)
+    window[:, 0] = 0  # A on the left edge
+    window[:, 6] = 3  # B on the right edge
+    window[2, 3] = 1  # a one-pixel sliver touching neither A nor B
+    lab = np.zeros((5, 7, 3), np.float32)
+    assert _split_sliver(window, lab, 1, 0, 3, np.zeros(3), np.ones(3) * 50) is None
+
+
+def test_segment_is_deterministic():
+    size = 160
+    blend = ndimage.gaussian_filter(_blob_mask(size).astype(float), 4.0)[..., None]
+    rgb = np.array(GROUND) * (1 - blend) + np.array(NEAR) * blend
+    px = _noisy_rgba(rgb)
+    a, b = segment(_img(px), SegmentParams()), segment(_img(px.copy()), SegmentParams())
+    assert np.array_equal(a.labels, b.labels) and np.array_equal(a.palette_rgb, b.palette_rgb)

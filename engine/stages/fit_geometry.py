@@ -7,6 +7,7 @@ from dataclasses import replace
 
 import numpy as np
 
+from engine.geometry.adaptive_fit import fit_curve_adaptive
 from engine.geometry.corners import dense_samples, find_corners, samples_at_scale, smooth_dense
 from engine.geometry.crossing_guard import SpanPlan, guard_crossings, plan_spans
 from engine.geometry.primitives import detect_primitive
@@ -258,6 +259,14 @@ def _fit_closed(
     return FittedCurve(curve.id, segments, primitive=primitive), plan
 
 
+def _raw_samples(
+    curve: BoundaryCurve, context: EdgeContext | None
+) -> tuple[tuple[Point, ...], tuple[Point, ...]]:
+    plain = dense_samples(curve.points, curve.closed)
+    raw = plain if context is None else subpixel_dense(curve, context)
+    return raw, plain
+
+
 def _fit_smooth(
     curve: BoundaryCurve, params: FitParams, scale: float, context: EdgeContext | None
 ) -> _Fit:
@@ -266,6 +275,10 @@ def _fit_smooth(
     min_length = MIN_CLOSED_LENGTH_PX if curve.closed else MIN_OPEN_LENGTH_PX
     if _length(curve.points) < min_length * scale:
         return _fit_curve(curve), None
+    if params.adaptive:
+        samples = _raw_samples(curve, context)
+        fitted = fit_curve_adaptive(curve, samples, params, scale, CORNER_WINDOW, CORNERLESS_SPANS)
+        return fitted, None
     fit = _fit_closed if curve.closed else _fit_open
     return fit(curve, params, scale, context)
 
