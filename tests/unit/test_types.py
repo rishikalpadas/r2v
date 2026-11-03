@@ -65,13 +65,33 @@ def test_raster_image_accepts_numpy_scale():
     assert RasterImage(np.zeros((2, 2, 4), np.uint8), (2, 2), scale=np.float64(2.0)).scale == 2.0
 
 
-@pytest.mark.parametrize(
-    "scale", [0, 0.0, -1.0, float("nan"), float("inf"), -float("inf"), True, False, "4", None, 1j]
-)
-def test_raster_image_rejects_bad_scale(scale):
+@pytest.mark.parametrize("scale", [0, 0.0, -1.0, float("nan"), float("inf"), -float("inf")])
+def test_raster_image_rejects_bad_scale_value(scale):
     import numpy as np
 
     from engine.types import RasterImage
 
     with pytest.raises(ValueError, match="scale"):
         RasterImage(np.zeros((2, 2, 4), np.uint8), (2, 2), scale=scale)
+
+
+@pytest.mark.parametrize("scale", [True, False, "4", None, 1j])
+def test_raster_image_rejects_bad_scale_type(scale):
+    import numpy as np
+
+    from engine.types import RasterImage
+
+    with pytest.raises(TypeError, match="scale"):
+        RasterImage(np.zeros((2, 2, 4), np.uint8), (2, 2), scale=scale)
+
+
+@pytest.mark.parametrize("scale", [4, 2.0, "np"])
+def test_raster_image_stores_scale_as_float(scale):
+    import numpy as np
+
+    scale = np.float64(3.0) if scale == "np" else scale
+
+    from engine.types import RasterImage
+
+    image = RasterImage(np.zeros((2, 2, 4), np.uint8), (2, 2), scale=scale)
+    assert type(image.scale) is float and image.scale == float(scale)

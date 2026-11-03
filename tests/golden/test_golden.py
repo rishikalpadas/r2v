@@ -142,6 +142,10 @@ def test_regression_narrow_rects_stay_rects():
 
 
 # ---------------------------------------------------------------- processing scale 4
+# Measured at commit de88906: worst SSIM 0.9825 (flat_shapes_4), worst node ratio 1.24
+# (flat_shapes_7, 25 -> 31). Scaling complexity_weight with scale (x scale, scale^2, scale^3)
+# was measured too: it widens these margins (ratio <= 1.05) but cost fidelity on enhanced
+# input (scale^3: degraded SSIM -0.004..-0.006), so the weight stays unscaled.
 
 _SCALE = 4
 

@@ -27,10 +27,11 @@ class RasterImage:
         # Processing pixels per original pixel: every threshold in original pixels is multiplied
         # by it, so a bool, NaN, infinite or non-positive scale would silently corrupt them.
         scale = self.scale
-        if isinstance(scale, bool) or not isinstance(scale, Real) or not math.isfinite(scale):
-            raise ValueError(f"scale must be a finite number, got {scale!r}")
-        if not scale > 0:
-            raise ValueError(f"scale must be > 0, got {scale!r}")
+        if isinstance(scale, bool) or not isinstance(scale, Real):
+            raise TypeError(f"scale must be a real number, got {type(scale).__name__}")
+        if not math.isfinite(scale) or not scale > 0:
+            raise ValueError(f"scale must be finite and > 0, got {scale!r}")
+        object.__setattr__(self, "scale", float(scale))  # downstream always sees a float
 
 
 @dataclass(frozen=True)
