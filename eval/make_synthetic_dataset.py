@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from pathlib import Path
+
+from PIL import Image
 
 from eval.synthetic import (
     aa_disc,
@@ -18,6 +21,8 @@ SIZE = 256
 N_FLAT = 20
 N_AA = 4
 AA_DATASET_FACTOR = 4  # coarser than the unit-test default: keeps dataset generation fast
+DEGRADE_FACTOR = 2
+DEGRADE_JPEG_QUALITY = 75
 
 
 def make_dataset(root: Path, size: int = SIZE) -> Path:
@@ -32,7 +37,28 @@ def make_dataset(root: Path, size: int = SIZE) -> Path:
     for name, pixels in images.items():
         (logos / name).write_bytes(to_png_bytes(pixels))
     _write_aa_logos(Path(root) / "aa_logos", size)
+    _write_degraded(logos, Path(root) / "degraded")
     return Path(root)
+
+
+def _write_degraded(logos: Path, folder: Path) -> None:
+    """Logos composited over white, downscaled 2x (Lanczos) and saved as JPEG q75.
+
+    The full-size clean logo is copied to `clean/<stem>.png`; the benchmark scores each
+    degraded input against it rather than against the JPEG itself.
+    """
+    clean = folder / "clean"
+    clean.mkdir(parents=True, exist_ok=True)
+    for src in sorted(logos.glob("*.png")):
+        shutil.copyfile(src, clean / src.name)
+        with Image.open(src) as img:
+            rgba = img.convert("RGBA")
+        flat = Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba)
+        w, h = rgba.size
+        small = flat.convert("RGB").resize(
+            (w // DEGRADE_FACTOR, h // DEGRADE_FACTOR), Image.Resampling.LANCZOS
+        )
+        small.save(folder / f"{src.stem}.jpg", format="JPEG", quality=DEGRADE_JPEG_QUALITY)
 
 
 def _write_aa_logos(folder: Path, size: int) -> None:

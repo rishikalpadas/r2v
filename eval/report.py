@@ -26,9 +26,11 @@ def _summary_table(rows: list[dict]) -> str:
         for engine in sorted(groups[category]):
             ok = groups[category][engine]
             cells = "".join(f"<td>{_mean([float(r[m]) for r in ok])}</td>" for m in METRICS)
-            body.append(f"<tr><td>{html.escape(engine)}</td><td>{len(ok)}</td>{cells}</tr>")
+            ref = "/".join(sorted({r.get("reference") or "input" for r in ok}))
+            body.append(f"<tr><td>{html.escape(engine)}</td><td>{len(ok)}</td>{cells}"
+                        f"<td>{html.escape(ref)}</td></tr>")
         out.append(f"<h2>{html.escape(category)}</h2><table><tr><th>engine</th><th>n</th>"
-                   f"{head}</tr>{''.join(body)}</table>")
+                   f"{head}<th>reference</th></tr>{''.join(body)}</table>")
     return "".join(out) or "<p>No successful results.</p>"
 
 
@@ -47,6 +49,8 @@ def _per_image(rows: list[dict]) -> str:
     for (category, image), group in sorted(by_image.items()):
         stem = Path(image).stem
         figs = [_img(f"renders/original/{category}/{stem}.png", "original")]
+        if any(r.get("reference") == "clean" for r in group):
+            figs.append(_img(f"renders/clean/{category}/{stem}.png", "clean target"))
         for r in group:
             if r["status"] == "ok":
                 figs.append(_img(f"renders/{r['engine']}/{category}/{stem}.png", r["engine"]))
@@ -58,6 +62,11 @@ def _per_image(rows: list[dict]) -> str:
     return "".join(out)
 
 
+_NOTE = ("<p>Metrics compare each render with its <em>reference</em>: the input image, or the "
+         "clean source (<code>&lt;category&gt;/clean/&lt;stem&gt;.png</code>, rendered at its "
+         "size) when the input is a degraded copy of it.</p>")
+
+
 def write_report(results_csv: Path) -> Path:
     results_csv = Path(results_csv)
     with results_csv.open(newline="", encoding="utf-8") as f:
@@ -66,7 +75,7 @@ def write_report(results_csv: Path) -> Path:
            "<style>body{font-family:sans-serif;margin:1.5rem}table{border-collapse:collapse}"
            "td,th{border:1px solid #bbb;padding:.2rem .5rem;text-align:right}"
            ".row{display:flex;flex-wrap:wrap;gap:1rem}figure{margin:0}</style></head><body>"
-           f"<h1>Benchmark report</h1>{_summary_table(rows)}<h2>Per image</h2>"
+           f"<h1>Benchmark report</h1>{_NOTE}{_summary_table(rows)}<h2>Per image</h2>"
            f"{_per_image(rows)}</body></html>")
     dest = results_csv.parent / "report.html"
     dest.write_text(doc, encoding="utf-8")

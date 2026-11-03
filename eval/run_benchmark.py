@@ -15,7 +15,8 @@ from eval.metrics import count_nodes, edge_f1, mean_delta_e, render_svg, ssim
 CATEGORIES = ("logos", "aa_logos", "line_art", "scans", "photos", "degraded")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".gif"}
 COLUMNS = ["category", "image", "engine", "status", "ssim", "delta_e",
-           "edge_f1", "nodes", "paths", "runtime_s"]
+           "edge_f1", "nodes", "paths", "runtime_s", "reference"]
+CLEAN_DIR = "clean"  # <category>/clean/<stem>.png: clean scoring target for a degraded input
 
 __all__ = ["RUNNERS", "run_benchmark", "main"]
 
@@ -32,9 +33,15 @@ def _images(dataset: Path) -> list[tuple[str, Path]]:
     return found
 
 
+def _clean_target(path: Path) -> Path | None:
+    target = path.parent / CLEAN_DIR / f"{path.stem}.png"
+    return target if target.is_file() else None
+
+
 def _row(category: str, path: Path, engine: str, status: str, **extra) -> dict:
     row = dict.fromkeys(COLUMNS, "")
-    row.update(category=category, image=path.name, engine=engine, status=status)
+    row.update(category=category, image=path.name, engine=engine, status=status,
+               reference="clean" if _clean_target(path) else "input")
     row.update(extra)
     return row
 
@@ -68,20 +75,29 @@ def _evaluate(category: str, path: Path, engine: str, original: np.ndarray, out:
                 runtime_s=f"{runtime:.4f}", **{k: f"{v:.6f}" for k, v in metrics.items()})
 
 
+def _save(pixels: np.ndarray, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(pixels, "RGBA").save(dest)
+
+
 def run_benchmark(dataset: Path, out: Path, engines: list[str]) -> Path:
     dataset, out = Path(dataset), Path(out)
     out.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
     for category, path in _images(dataset):
+        clean = _clean_target(path)
         try:
             original = np.array(Image.open(path).convert("RGBA"), dtype=np.uint8)
+            target = (np.array(Image.open(clean).convert("RGBA"), dtype=np.uint8)
+                      if clean else original)
         except Exception:
             rows.extend(_row(category, path, e, "error") for e in engines)
             continue
-        orig_dest = out / "renders" / "original" / category / f"{path.stem}.png"
-        orig_dest.parent.mkdir(parents=True, exist_ok=True)
-        Image.fromarray(original, "RGBA").save(orig_dest)
-        rows.extend(_evaluate(category, path, e, original, out) for e in engines)
+        _save(original, out / "renders" / "original" / category / f"{path.stem}.png")
+        if clean:
+            _save(target, out / "renders" / CLEAN_DIR / category / f"{path.stem}.png")
+        # each render is scored against `target` (clean source if any), at the target's size
+        rows.extend(_evaluate(category, path, e, target, out) for e in engines)
     csv_path = out / "results.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNS)
