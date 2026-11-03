@@ -65,7 +65,7 @@ def test_enhance_ran_real_models(rows):
     for _, _, on in rows:
         report = on["report"]
         assert report["fallback_reason"] is None, report
-        assert report["device"] == "cuda"
+        assert report["device_used"] == "cuda"
         assert report["effective_scale"] == 4
         assert report["model_used"].startswith("fbcnn_color+")  # JPEG input is deblocked
 
@@ -82,3 +82,11 @@ def test_enhance_node_growth_bounded(rows):
     on = np.mean([r[2]["nodes"] for r in rows])
     print(f"\nmean nodes off {off:.1f} on {on:.1f} ({on / off:.2f}x)")
     assert on <= MAX_NODE_GROWTH * off
+
+
+def test_enhance_does_not_shift_colours(rows):
+    # the GAN shifts flat colours; the low-frequency colour correction must undo that
+    off = np.mean([r[1]["de"] for r in rows])
+    on = np.mean([r[2]["de"] for r in rows])
+    print(f"\nmean dE off {off:.3f} on {on:.3f}")
+    assert on <= off

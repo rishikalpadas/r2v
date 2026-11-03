@@ -33,12 +33,15 @@ class EnhanceParams:
     tile: int = 512
     device: Literal["auto", "cuda", "cpu"] = "auto"
     max_output_side: int = 8192
+    # 2**24 px: segment/trace/fit RAM and time grow with output area. 2**23 would leave a
+    # 1600x1411 input at 1x (2x is 9.0 MP); 2**24 still allows 2x up to 2048x2048.
+    max_output_pixels: int = 16_777_216
 
     def __post_init__(self) -> None:
         for name in ("enabled", "deblock", "denoise"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a bool")
-        for name in ("scale", "tile", "max_output_side"):
+        for name in ("scale", "tile", "max_output_side", "max_output_pixels"):
             if not _is_int(getattr(self, name)):
                 raise ValueError(f"{name} must be an integer")
         for name in ("sr_model_flat", "sr_model_general"):
@@ -53,6 +56,8 @@ class EnhanceParams:
             raise ValueError(f"device must be one of {DEVICES}")
         if self.max_output_side < 1:
             raise ValueError("max_output_side must be >= 1")
+        if self.max_output_pixels < 1:
+            raise ValueError("max_output_pixels must be >= 1")
 
 
 @dataclass(frozen=True)

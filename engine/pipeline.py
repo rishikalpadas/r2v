@@ -36,7 +36,6 @@ class PipelineState:
     report: Mapping[str, object] | None = None  # the last stage's extra report params
 
 
-
 def _need(value, what: str, stage: str):
     if value is None:
         raise StageError(stage, f"missing {what}; stage order is invalid")

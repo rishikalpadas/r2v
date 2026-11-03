@@ -6,6 +6,7 @@ numpy-in/numpy-out callables.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from typing import Callable
 
@@ -26,20 +27,29 @@ MIN_ML_SIDE = 16  # below this short side the models have too little context: bi
 FLAT_MAX_COLORS = 64  # unique colours after 5-bit quantization that still count as flat art
 ALPHA_THRESHOLD = 128
 OVERLAP = 32
+# Low-frequency colour correction after SR: GAN upscalers shift flat colours, so the SR output's
+# colour, blurred at this sigma (px at 1x), is pulled back to the blurred pre-SR source.
+COLOUR_SIGMA = 1.5
 
 
 def _report(**values: object) -> dict[str, object]:
     out: dict[str, object] = dict.fromkeys(
-        ("model_used", "fallback_reason", "final_tile", "effective_scale", "device",
-         "skipped_reason")
+        ("model_used", "fallback_reason", "final_tile", "effective_scale", "device_used",
+         "skipped_reason", "cap_reason")
     )
     out.update(values)
     return out
 
 
-def effective_scale(params: EnhanceParams, width: int, height: int) -> int:
-    """params.scale, reduced so the long side stays within max_output_side; at least 1."""
-    return max(1, min(params.scale, params.max_output_side // max(width, height)))
+def effective_scale(params: EnhanceParams, width: int, height: int) -> tuple[int, str | None]:
+    """(scale, cap_reason): params.scale reduced so the output fits max_output_side and
+    max_output_pixels, at least 1. cap_reason names the binding cap, None when uncapped."""
+    by_side = params.max_output_side // max(width, height)
+    by_area = math.isqrt(params.max_output_pixels // (width * height))
+    s = max(1, min(params.scale, by_side, by_area))
+    if s >= params.scale:
+        return s, None
+    return s, "max_output_side" if by_side <= by_area else "max_output_pixels"
 
 
 def _is_exact_colour(px: np.ndarray, max_colors: int) -> bool:
@@ -100,12 +110,25 @@ def _rescaled(model_fn: Callable[[np.ndarray], np.ndarray], s: int) -> Callable:
         h, w = rgb.shape[:2]
         return _resize(model_fn(rgb), (w * s, h * s), Image.Resampling.BOX).astype(np.float32)
 
+    run.tiling = getattr(model_fn, "tiling", None)  # type: ignore[attr-defined]
     return run
+
+
+def _colour_correct(out: np.ndarray, src: np.ndarray, s: int) -> np.ndarray:
+    """out += upsample(blur(src) - blur(box_downsample(out))): keeps SR edges, restores the
+    source's low-frequency colour. out is (h*s)x(w*s)x3, src hxwx3, both float32 0..1."""
+    h, w = src.shape[:2]
+    down = out.reshape(h, s, w, s, 3).mean(axis=(1, 3))
+    sigma = (COLOUR_SIGMA, COLOUR_SIGMA, 0)
+    diff = ndimage.gaussian_filter(src, sigma) - ndimage.gaussian_filter(down, sigma)
+    up = _resize(diff.astype(np.float32), (w * s, h * s), Image.Resampling.BILINEAR)
+    return np.clip(out + up, 0.0, 1.0)
 
 
 def _ml_rgb(rgb: np.ndarray, alpha: np.ndarray, image: RasterImage, params: EnhanceParams,
             s: int, device: str) -> tuple[np.ndarray, list[str], int]:
-    """Run deblock (JPEG only) -> denoise (if enabled) -> SR. Returns (uint8 RGB, names, tile)."""
+    """Run deblock (JPEG only) -> denoise (if enabled) -> SR -> colour correction.
+    Returns (uint8 RGB, model names, the SR model's final tile)."""
     steps = []
     if params.deblock and image.source_format == "JPEG":
         steps.append(DEBLOCK_MODEL)
@@ -113,26 +136,24 @@ def _ml_rgb(rgb: np.ndarray, alpha: np.ndarray, image: RasterImage, params: Enha
         steps.append(DENOISE_MODEL)
     x = rgb.astype(np.float32) / 255.0
     names: list[str] = []
-    tiles: list[int] = []
 
-    def apply(name: str, scale: int | None = None) -> np.ndarray:
-        model = load_model(name, device)
+    def apply(name: str, scale: int | None = None) -> tuple[np.ndarray, int]:
+        model = load_model(name, device)  # cached and shared: never mutate it
         fn, out_scale = model, model.scale
         if scale is not None and scale != model.scale:
             fn, out_scale = _rescaled(model, scale), scale
         tile = params.tile * 2 if model.tiling == "DISCOURAGED" else params.tile
-        fn.tiling = model.tiling  # type: ignore[attr-defined]
         result = run_tiled(fn, x, out_scale, tile, overlap=OVERLAP)
         names.append(name)
-        tiles.append(result.final_tile)
-        return result.image
+        return result.image, result.final_tile
 
     for name in steps:
-        x = apply(name)
+        x, _ = apply(name)
     restored = np.clip(np.rint(x * 255.0), 0, 255).astype(np.uint8)
     sr = params.sr_model_flat if _is_flat(restored, alpha) else params.sr_model_general
-    x = apply(sr, s)
-    return np.clip(np.rint(x * 255.0), 0, 255).astype(np.uint8), names, min(tiles)
+    out, tile = apply(sr, s)
+    out = _colour_correct(out, x, s)
+    return np.clip(np.rint(out * 255.0), 0, 255).astype(np.uint8), names, tile
 
 
 def _fallback_reason(exc: Exception) -> str:
@@ -154,29 +175,28 @@ def enhance(
     h, w = px.shape[:2]
     if not params.enabled:
         return image, _report(effective_scale=1, skipped_reason="disabled")
-    s = effective_scale(params, w, h)
+    s, cap = effective_scale(params, w, h)
     if s == 1:
-        return image, _report(effective_scale=1, skipped_reason="scale 1")
+        return image, _report(effective_scale=1, skipped_reason="scale 1", cap_reason=cap)
     if max_colors is not None and _is_exact_colour(px, max_colors):
         return image, _report(effective_scale=1, skipped_reason="exact colours")
 
     alpha = px[..., 3]
     rgb = _fill_transparent(px[..., :3], alpha)
-    report = _report(effective_scale=s, model_used="bicubic")
+    report = _report(effective_scale=s, model_used="bicubic", cap_reason=cap)
     out_rgb = None
     if min(h, w) < MIN_ML_SIDE:
         report["fallback_reason"] = "too small"
-    elif not ml_available():
-        report["fallback_reason"] = "ml unavailable"
     else:
-        device = pick_device(params.device)
-        report["device"] = device
         try:
-            out_rgb, names, tile = _ml_rgb(rgb, alpha, image, params, s, device)
+            if not ml_available():
+                report["fallback_reason"] = "ml unavailable"
+            else:
+                report["device_used"] = device = pick_device(params.device)
+                out_rgb, names, tile = _ml_rgb(rgb, alpha, image, params, s, device)
+                report.update(model_used="+".join(names), final_tile=tile)
         except Exception as exc:  # noqa: BLE001 - any ML failure falls back to bicubic
             report["fallback_reason"] = _fallback_reason(exc)
-        else:
-            report.update(model_used="+".join(names), final_tile=tile)
     if out_rgb is None:
         out_rgb = _bicubic(rgb, s)
     pixels = np.concatenate([out_rgb, _upscale_alpha(alpha, s)[..., None]], axis=2)
