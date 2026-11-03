@@ -115,8 +115,12 @@ def vectorize(
     return run_pipeline(load_image(image_bytes), resolved)
 
 
-def run_pipeline(image: RasterImage, preset: Preset) -> VectorizeResult:
-    """Run `preset`'s stages on an already loaded image."""
+def run_stages(
+    image: RasterImage, preset: Preset
+) -> tuple[PipelineState, tuple[StageReport, ...]]:
+    """Run `preset`'s stages and return the final state (regions, graph, fitted curves, doc)
+    with the per-stage reports. `run_pipeline` is this plus the document check; analysis tools
+    (e.g. `eval.defects`) use it to see the intermediate geometry behind a document."""
     state = PipelineState(image=image, preset=preset)
     reports: list[StageReport] = []
     for name in preset.stages:
@@ -128,6 +132,12 @@ def run_pipeline(image: RasterImage, preset: Preset) -> VectorizeResult:
         reports.append(
             StageReport(stage=name, duration_s=duration, params=params, debug_images={})
         )
+    return state, tuple(reports)
+
+
+def run_pipeline(image: RasterImage, preset: Preset) -> VectorizeResult:
+    """Run `preset`'s stages on an already loaded image."""
+    state, reports = run_stages(image, preset)
     if state.doc is None:
         raise StageError("export", "pipeline produced no document")
-    return VectorizeResult(doc=state.doc, reports=tuple(reports))
+    return VectorizeResult(doc=state.doc, reports=reports)

@@ -81,6 +81,44 @@ python -m eval.run_benchmark --dataset eval/dataset_synthetic --out eval/reports
 - `runtime_s`: wall time per image.
 - `status`: `ok`, or `skipped` (engine unavailable) / error.
 
+## Defect report
+
+Automatic detectors for visible output defects (quality roadmap Q1), so many images can be
+checked without hand inspection.
+
+```
+python -m eval.run_defects --images eval/dataset/logos --out eval/reports/defects
+python -m eval.run_defects --images eval/dataset_synthetic --out eval/reports/defects_synth --enhance off
+python -m eval.run_defects --out eval/reports/after --compare eval/reports/defects/defects.csv
+```
+
+Every image in `--images` (and one level of sub-folders, skipping `clean/` and `reference/`)
+is converted with the default preset (`--enhance on|off`, default on). The run writes:
+
+- `defects.csv`: one row per image with each detector's score (0 is clean, higher is worse),
+  `combined`, ssim, delta_e, edge_f1, nodes, paths, runtime_s and `status`/`error`. A failing
+  image is recorded as `error` and the run carries on.
+- `report.html`: images worst-first by `combined` = sum of score / `NORM` per detector
+  (`eval/run_defects.py`). For each image, the top `--top` (3) spots per detector are shown as
+  5x crops: source pixels, output, output with path outlines.
+- `svg/<image>.svg` and `crops/<image>/<detector>_<k>.png`.
+
+With `--compare <defects.csv>`, the report shows per-image and per-detector deltas (this run
+minus the other run) and the change in the means.
+
+| detector          | finds                                                              | score                    |
+|-------------------|--------------------------------------------------------------------|--------------------------|
+| `crossings`       | proper crossings between drawn curves, away from shared junctions  | count                    |
+| `specks`          | output shapes under 12 px² (original px)                           | count                    |
+| `wobble`          | curve windows whose turning exceeds a faired copy's and changes sign repeatedly (corners excluded) | summed excess (rad) |
+| `thin_bands`      | bands up to 6.5 px wide whose width varies about its own trend     | summed width std (px)    |
+| `junction_spikes` | sharp turns/hooks within 4 px of a shared junction that the source path does not make | summed excess (rad) |
+| `worst_patches`   | 24 px windows with the worst dE2000 / SSIM between render and source | mean of the worst 5    |
+
+The detectors live in `eval/defects.py` as pure functions on geometry in original px; each
+threshold is a named constant with its reason. They read the pipeline's final state through
+`engine.pipeline.run_stages`, which does not change the output.
+
 ## Known limitations
 
 - potrace is optional; the CLI is not installed here, so its rows are `skipped`.
