@@ -1,21 +1,25 @@
 """Automatic defect detectors for vector output (quality roadmap step Q1).
 
-Each `detect_*` function is pure: it takes plain geometry (or two rasters) in original-image
-pixels and returns a `DetectorResult`, a score (higher is worse, 0 is clean) plus `Spot`s
-(boxes in original-image px with a severity), worst first. `geometry_from_state` turns the
-pipeline's final state (see `engine.pipeline.run_stages`) into that geometry.
+Each `detect_*` function is pure: it takes plain geometry (or rasters) in original-image pixels
+and returns a `DetectorResult`, a score (higher is worse, 0 is clean) plus `Spot`s (boxes in
+original-image px with a severity), worst first. `geometry_from_state` turns the pipeline's
+final state (see `engine.pipeline.run_stages`) into that geometry.
 
-| detector                 | score                                             |
-|--------------------------|---------------------------------------------------|
-| `detect_crossings`       | proper crossings between fitted curves (count)    |
-| `detect_specks`          | output shapes below `SPECK_AREA_PX` (count)       |
-| `detect_wobble`          | excess turning (rad) of flagged windows, summed   |
-| `detect_thin_bands`      | width std (px) of flagged band windows, summed    |
-| `detect_junction_spikes` | excess turning (rad) of flagged junction ends     |
-| `detect_worst_patches`   | mean badness of the worst `PATCH_TOP_K` windows   |
+| detector                 | score                                                         |
+|--------------------------|---------------------------------------------------------------|
+| `detect_crossings`       | proper crossings between drawn curves (count)                 |
+| `detect_specks`          | output shapes below `SPECK_AREA_PX` (count)                   |
+| `detect_wobble`          | excess over the flag line, in flag units x window lengths     |
+| `detect_thin_bands`      | same, for band width std (halved: each band is seen from both sides) |
+| `detect_junction_spikes` | excess turning (rad) of flagged junction ends                 |
+| `detect_straightness`    | same as wobble, for deviation of a straight fit from the source edge |
+| `detect_worst_patches`   | mean badness of the worst `PATCH_TOP_K` windows               |
 
-Thresholds are named constants below, each with the reason for its value. They were tuned so
-the synthetic clean shapes do not flag and the known happiness.jpg defects do.
+Sliding-window scores are continuous: each window adds max(0, value / flag - 1) times its share
+of the curve length, so a score does not jump when a window boundary moves; the flag threshold
+only decides which windows become spots. Thresholds are named constants below, each with the
+reason for its value, tuned so clean synthetic shapes do not flag and the known happiness.jpg
+defects do.
 """
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.ndimage import gaussian_filter1d, uniform_filter
+from scipy.ndimage import gaussian_filter1d, map_coordinates, uniform_filter
 from scipy.spatial import cKDTree
 from skimage.color import deltaE_ciede2000, rgb2lab
 from skimage.metrics import structural_similarity
@@ -55,7 +59,7 @@ CROSSING_CLEARANCE_PX = 1.0
 # and segment.min_region_px (4 processing px) lets 1-6 px^2 noise regions through.
 SPECK_AREA_PX = 12.0
 
-# Wobble.
+# Wobble: short wiggles (turning excess over a faired copy).
 WOBBLE_STEP_PX = 0.5  # arc-length resampling step; fine enough to see a 3 px wiggle
 WOBBLE_MIN_CURVE_PX = 12.0  # shorter curves are tiny shapes, not "long edges" (= fit's closed minimum)
 WOBBLE_FAIR_SIGMA_PX = 6.0  # fairing scale: removes wiggles up to ~15-20 px wavelength (4 missed the L edge of happiness), keeps letter-scale curves
@@ -63,9 +67,31 @@ WOBBLE_CORNER_RAD = math.radians(40.0)  # turn within 1.5 px that counts as a tr
 WOBBLE_CORNER_GAP = 2  # samples dropped either side of a corner (its turn is split over ~2 samples)
 WOBBLE_MIN_PIECE_PX = 6.0  # corner-to-corner pieces shorter than this are serifs/ticks, not edges
 WOBBLE_WINDOW_PX = 24.0  # local window: about two to three wiggles of a visible wobble
+WOBBLE_STRIDE = 4  # samples (2 px) between sliding windows: spots and scores move smoothly
 WOBBLE_FLAT_RAD = math.radians(0.25)  # per-sample turn treated as straight (radius > 115 px)
 WOBBLE_MIN_SIGN_CHANGES = 2  # one inflection is a clean S-curve; wobble alternates repeatedly
 WOBBLE_FLAG_RAD = math.radians(20.0)  # excess turning per window that is visibly wavy
+WOBBLE_MIN_AMPLITUDE_PX = 0.2  # wiggles closer than this to the faired curve are invisible at 1x
+# Wobble: long low-amplitude bends (reviewer's measure; the inner L edge of happiness).
+BEND_WINDOW_PX = 40.0  # long enough to hold a 30-40 px wave the fairing scale leaves alone
+BEND_MAX_TURN_RAD = math.radians(20.0)  # windows that turn more are real curves, not bent lines
+BEND_CURVATURE_SIGMA_PX = 4.0  # curvature smoothing before counting inflections
+BEND_FLAT_CURVATURE = 1.5e-3  # 1/px; flatter is straight (radius > 650 px) and carries no sign
+BEND_RESIDUAL_PX = 0.3  # quadratic-fit residual that reads as a bend at 1x
+BEND_MAX_RESIDUAL_PX = 1.0  # larger residuals are drawn S-shapes (script and letter curves on happiness hit the old 1.5 cap); the L inner edge is 0.92
+
+# Straightness against the source edge (segmentation, not fit).
+STRAIGHT_WINDOW_PX = 60.0  # long straight runs only; short ones are too noisy to judge
+STRAIGHT_STRIDE_PX = 5.0
+STRAIGHT_MAX_TURN_RAD = math.radians(5.0)  # source edge turning end to end; the L's outer edge reads 3.9 deg
+STRAIGHT_MAX_FIT_TURN_RAD = math.radians(40.0)  # fitted windows past a corner are not compared
+STRAIGHT_STEP_PX = 1.0  # samples along the window
+STRAIGHT_PROFILE_PX = 3.0  # source profile half-length across the edge
+STRAIGHT_MIN_CONTRAST = 30.0  # grey levels; weaker edges give no reliable position
+STRAIGHT_SOURCE_RMS_PX = 0.35  # the source edge itself must be straight (JPEG noise ~0.2 px)
+STRAIGHT_BORDER_PX = 4.0  # windows this close to the image edge are skipped: the profile is clipped
+#                            there (happiness' 1-3 px frame lines read up to 2 px off)
+STRAIGHT_FLAG_PX = 0.4  # how much farther the fit strays from the source's line than the source does
 
 # Uneven thin bands.
 BAND_STEP_PX = 1.0  # width sample spacing along each curve
@@ -73,16 +99,21 @@ BAND_MAX_PX = 6.5  # spec said ~4; the black letter outlines of happiness (LOOKS
 BAND_END_TRIM_PX = 2.0  # drop run ends: corners and tips change width legitimately there
 BAND_MIN_RUN_PX = 8.0  # shorter thin runs are corners/tips, not bands
 BAND_WINDOW_PX = 30.0  # local window for width variation
+BAND_STRIDE = 3  # samples between sliding windows
 BAND_TREND_SIGMA_PX = 4.0  # width trend scale: a straight taper (wedge, tip) is trend, not unevenness
 BAND_STD_FLAG_PX = 0.3  # std of width about its trend that reads as uneven at 1x (a third of a px)
+BAND_SIDES = 2.0  # every band is measured from both of its sides; the score is divided by this
 _RAY_EPS = 0.05  # hits closer than this are the ray's own or a touching curve, not a width
 
 # Junction spikes.
 JUNCTION_STEP_PX = 0.25  # resampling step near curve ends
 JUNCTION_REACH_PX = 4.0  # "within a few px" of the junction
 JUNCTION_TURN_RAD = math.radians(60.0)  # excess end turning that makes a visible spike/hook
-JUNCTION_RAW_SIGMA_PX = 1.0  # smoothing of the crack path before reading its own end turning:
-#                               removes pixel steps, keeps a true tip (synthetic wedges flagged without it)
+# The source's own end turning is the NET heading change of its crack path (smoothed by
+# JUNCTION_RAW_SIGMA_PX) over the reach. Pixel stairs alternate and cancel in a net sum, so the
+# baseline barely depends on the processing scale; the sum of |turn| used before left 25-42 deg
+# of stair noise at scale 1 against 6-7 deg at scale 4. A true tip or corner still counts.
+JUNCTION_RAW_SIGMA_PX = 1.0
 
 # Worst patches.
 PATCH_PX = 24  # window side; about a letter stroke plus its edges at 1x
@@ -110,10 +141,14 @@ class DetectorResult:
 
 @dataclass(frozen=True, eq=False)  # holds ndarrays
 class CurveGeom:
-    """One boundary curve as output: `points` is its fitted polyline in original px (closed
-    curves repeat the first point last). Walking it, `left` is on the left as in
-    `engine.types.BoundaryCurve`. `smooth` is False for curves kept as exact pixel polylines
-    (canvas edge, too short); `primitive` is the drawn primitive's outline, if one replaces it."""
+    """One boundary curve as drawn, in original px.
+
+    `points` is the drawn outline: the fitted polyline, or the primitive's outline when the
+    curve is drawn only as a primitive (closed curves repeat the first point last). Walking it,
+    `left` is on the left as in `engine.types.BoundaryCurve`. `smooth` is False for curves kept
+    as exact pixel polylines (canvas edge, too short). `primitive` is the drawn primitive's
+    outline, if export draws one for this curve; `segments_drawn` says whether the fitted
+    segments are drawn too (as another region's loop). `raw` is the crack-grid path."""
 
     id: int
     points: np.ndarray
@@ -122,7 +157,8 @@ class CurveGeom:
     closed: bool
     smooth: bool = True
     primitive: np.ndarray | None = None
-    raw: np.ndarray | None = None  # the curve's crack-grid path (original px), if known
+    raw: np.ndarray | None = None
+    segments_drawn: bool = True
 
 
 @dataclass(frozen=True)
@@ -138,7 +174,8 @@ class Geometry:
     scale: float  # processing px per original px
 
 
-DETECTORS = ("crossings", "specks", "wobble", "thin_bands", "junction_spikes", "worst_patches")
+DETECTORS = ("crossings", "specks", "wobble", "thin_bands", "junction_spikes", "straightness",
+             "worst_patches")
 
 
 # ---------------------------------------------------------------- polyline helpers
@@ -181,8 +218,8 @@ def _length(pts: np.ndarray) -> float:
     return float(np.hypot(*np.diff(pts, axis=0).T).sum()) if len(pts) > 1 else 0.0
 
 
-def _sign_changes(turns: np.ndarray, flat: float) -> int:
-    signs = np.sign(turns[np.abs(turns) > flat])
+def _sign_changes(values: np.ndarray, flat: float) -> int:
+    signs = np.sign(values[np.abs(values) > flat])
     return int(np.count_nonzero(signs[1:] != signs[:-1])) if len(signs) > 1 else 0
 
 
@@ -192,6 +229,8 @@ def _fair(pts: np.ndarray, sigma: float, closed: bool) -> np.ndarray:
     if closed:
         return np.stack([gaussian_filter1d(pts[:, i], sigma, mode="wrap") for i in (0, 1)], axis=1)
     pad = min(len(pts) - 1, int(math.ceil(4 * sigma)))
+    if pad < 1:
+        return pts.copy()
     head = 2 * pts[0] - pts[pad:0:-1]
     tail = 2 * pts[-1] - pts[-2 : -pad - 2 : -1]
     ext = np.vstack([head, pts, tail])
@@ -199,13 +238,40 @@ def _fair(pts: np.ndarray, sigma: float, closed: bool) -> np.ndarray:
     return out[pad : pad + len(pts)]
 
 
-def _merge_runs(items: list[tuple[int, float, np.ndarray, str]]) -> list[Spot]:
-    """Merge consecutive flagged windows (index, severity, points, note) into spots."""
+def _windows(n: int, size: int, stride: int) -> list[tuple[int, int]]:
+    """Sliding windows [a, b) over n samples; one window when n <= size."""
+    if n <= size:
+        return [(0, n)] if n else []
+    starts = list(range(0, n - size + 1, stride))
+    if starts[-1] != n - size:
+        starts.append(n - size)
+    return [(a, a + size) for a in starts]
+
+
+def _window_weight(n: int, size: int, count: int) -> float:
+    """Each window's share of the piece length in window units: the windows of a piece add up
+    to n / size, however many there are, so the score is an integral along the curve."""
+    return (n / size) / count if count else 0.0
+
+
+def _merge_overlapping(items: list[tuple[int, int, float, np.ndarray, str]]) -> list[Spot]:
+    """Merge flagged windows (start, end, severity, points, note) that overlap into spots;
+    a spot keeps its worst window's severity and note."""
     spots: list[Spot] = []
-    for _, group in itertools.groupby(enumerate(items), key=lambda e: e[1][0] - e[0]):
-        group = [g for _, g in group]
-        pts = np.vstack([g[2] for g in group])
-        spots.append(Spot(_bbox(pts, 0.5), float(sum(g[1] for g in group)), group[0][3]))
+    group: list = []
+
+    def flush():
+        if group:
+            worst = max(group, key=lambda g: g[2])
+            pts = np.vstack([g[3] for g in group])
+            spots.append(Spot(_bbox(pts, 0.5), float(worst[2]), worst[4]))
+
+    for item in sorted(items, key=lambda g: g[0]):
+        if group and item[0] >= max(g[1] for g in group):
+            flush()
+            group = []
+        group.append(item)
+    flush()
     return spots
 
 
@@ -224,9 +290,10 @@ def detect_crossings(
     tracks: list[Track] = []
     ends: dict[int, tuple] = {}
     for c in curves:
-        pts = _dedupe(c.points)
-        if len(pts) >= 2:
-            tracks.append(Track(c.id, FITTED, pts, np.zeros(len(pts) - 1, np.int64)))
+        if c.segments_drawn:
+            pts = _dedupe(c.points)
+            if len(pts) >= 2:
+                tracks.append(Track(c.id, FITTED, pts, np.zeros(len(pts) - 1, np.int64)))
         if c.primitive is not None and len(c.primitive) >= 2:
             tracks.append(
                 Track(c.id, PRIMITIVE, c.primitive, np.zeros(len(c.primitive) - 1, np.int64))
@@ -289,9 +356,12 @@ def detect_specks(shapes: Sequence[ShapeGeom], min_area: float = SPECK_AREA_PX) 
 # ---------------------------------------------------------------- wobble
 
 
-def _corner_runs(turns: np.ndarray) -> list[tuple[int, int]]:
+def _corner_runs(turns: np.ndarray, ring: bool = False) -> list[tuple[int, int]]:
     """(first, last) turn indices of each run whose 3-sample turning reaches a corner."""
-    window = np.convolve(turns, np.ones(3), mode="same")
+    if ring and len(turns) >= 3:
+        window = turns + np.roll(turns, 1) + np.roll(turns, -1)
+    else:
+        window = np.convolve(turns, np.ones(3), mode="same")
     hot = np.abs(window) >= WOBBLE_CORNER_RAD
     runs, start = [], None
     for i, h in enumerate(hot):
@@ -313,10 +383,11 @@ def _pieces(pts: np.ndarray, closed: bool) -> list[tuple[np.ndarray, bool]]:
         ring = pts[:-1]
         m = len(ring)
         turns = _turns(np.vstack([ring[-1:], ring, ring[:1]]))  # turn at every ring vertex
-        runs = _corner_runs(turns)
+        runs = _corner_runs(turns, ring=True)
         if not runs:
             return [(ring, True)]
-        first = runs[0][0]  # rotate so the ring starts at a corner, then cut it open there
+        # rotate so the ring starts just before a corner run, then cut it open there
+        first = runs[0][0] if not (runs[0][0] == 0 and runs[-1][1] == m - 1) else runs[-1][0]
         ring, turns = np.roll(ring, -first, axis=0), np.roll(turns, -first)
         pts = np.vstack([ring, ring[:1]])
         vert_runs = [*_corner_runs(turns), (m, m)]  # ring vertex k = turn k; m closes the ring
@@ -333,45 +404,91 @@ def _pieces(pts: np.ndarray, closed: bool) -> list[tuple[np.ndarray, bool]]:
     return [(p, False) for p in pieces]
 
 
-def _piece_windows(piece: np.ndarray, closed: bool) -> list[tuple[int, float, np.ndarray, str]]:
-    """Flagged windows of one piece: (window index, excess turning rad, points, note)."""
-    if _length(piece) < WOBBLE_MIN_PIECE_PX or len(piece) < 5:
-        return []
-    sigma = WOBBLE_FAIR_SIGMA_PX / WOBBLE_STEP_PX
-    faired = _fair(piece, sigma, closed)
-    if closed:
+def _wiggle_windows(piece: np.ndarray, ring: bool) -> tuple[float, list]:
+    """(score, flagged windows) of short wiggles on one piece: excess turning over a faired copy
+    per `WOBBLE_WINDOW_PX` window, gated by sign changes and visible amplitude."""
+    faired = _fair(piece, WOBBLE_FAIR_SIGMA_PX / WOBBLE_STEP_PX, ring)
+    if ring:
         ext = lambda p: np.vstack([p[-1:], p, p[:1]])  # noqa: E731 - turn at every vertex
         t_raw, t_fair, verts = _turns(ext(piece)), _turns(ext(faired)), piece
+        dev = np.hypot(*(piece - faired).T)
     else:
         t_raw, t_fair, verts = _turns(piece), _turns(faired), piece[1:-1]
+        dev = np.hypot(*(piece - faired).T)[1:-1]
     excess = np.abs(t_raw) - np.abs(t_fair)
-    n_win = max(1, int(round(len(excess) * WOBBLE_STEP_PX / WOBBLE_WINDOW_PX)))
-    flagged = []
-    for k, idx in enumerate(np.array_split(np.arange(len(excess)), n_win)):
-        if not len(idx):
+    size = int(round(WOBBLE_WINDOW_PX / WOBBLE_STEP_PX))
+    wins = _windows(len(excess), size, WOBBLE_STRIDE)
+    weight = _window_weight(len(excess), size, len(wins))
+    score, flagged = 0.0, []
+    for a, b in wins:
+        ex = float(excess[a:b].sum())
+        if ex <= 0 or float(dev[a:b].max()) < WOBBLE_MIN_AMPLITUDE_PX:
             continue
-        ex = float(excess[idx].sum())
-        changes = _sign_changes(t_raw[idx], WOBBLE_FLAT_RAD)
-        if ex >= WOBBLE_FLAG_RAD and changes >= WOBBLE_MIN_SIGN_CHANGES:
-            length = len(idx) * WOBBLE_STEP_PX
-            note = (f"excess {math.degrees(ex):.0f} deg, "
-                    f"{changes / length * 100:.0f} sign changes/100px")
-            flagged.append((k, ex, verts[idx], note))
-    return flagged
+        changes = _sign_changes(t_raw[a:b], WOBBLE_FLAT_RAD)
+        if changes < WOBBLE_MIN_SIGN_CHANGES:
+            continue
+        score += max(0.0, ex / WOBBLE_FLAG_RAD - 1.0) * weight
+        if ex >= WOBBLE_FLAG_RAD:
+            note = (f"wiggle: excess {math.degrees(ex):.0f} deg, amplitude "
+                    f"{dev[a:b].max():.2f} px, {changes} sign changes")
+            flagged.append((a, b, ex / WOBBLE_FLAG_RAD, verts[a:b], note))
+    return score, flagged
+
+
+def _bend_windows(piece: np.ndarray) -> tuple[float, list]:
+    """(score, flagged windows) of long low-amplitude bends: `BEND_WINDOW_PX` windows that turn
+    little overall, inflect at least twice, and leave a quadratic-fit residual between
+    `BEND_RESIDUAL_PX` and `BEND_MAX_RESIDUAL_PX`."""
+    size = int(round(BEND_WINDOW_PX / WOBBLE_STEP_PX))
+    if len(piece) < size:
+        return 0.0, []
+    k = gaussian_filter1d(_turns(piece) / WOBBLE_STEP_PX, BEND_CURVATURE_SIGMA_PX / WOBBLE_STEP_PX,
+                          mode="nearest")
+    k = np.r_[0.0, k, 0.0]  # curvature per vertex
+    wins = _windows(len(piece), size, WOBBLE_STRIDE)
+    weight = _window_weight(len(piece), size, len(wins))
+    score, flagged = 0.0, []
+    for a, b in wins:
+        kw = k[a:b]
+        if abs(kw.sum() * WOBBLE_STEP_PX) > BEND_MAX_TURN_RAD:
+            continue
+        if _sign_changes(kw, BEND_FLAT_CURVATURE) < 2:
+            continue
+        w = piece[a:b]
+        chord = w[-1] - w[0]
+        length = math.hypot(*chord)
+        if length < 1e-9:
+            continue
+        t = chord / length
+        u, v = (w - w[0]) @ t, (w - w[0]) @ np.array([-t[1], t[0]])
+        if np.any(np.diff(u) <= 0):
+            continue
+        r = float(np.abs(v - np.polyval(np.polyfit(u, v, 2), u)).max())
+        if r > BEND_MAX_RESIDUAL_PX:
+            continue
+        score += max(0.0, r / BEND_RESIDUAL_PX - 1.0) * weight
+        if r >= BEND_RESIDUAL_PX:
+            flagged.append((a, b, r / BEND_RESIDUAL_PX, w, f"bend: {r:.2f} px off a smooth arc"))
+    return score, flagged
 
 
 def detect_wobble(curves: Sequence[CurveGeom]) -> DetectorResult:
-    """Jitter along smooth curves.
+    """Jitter and wavy bends along smooth curves.
 
-    Each curve is resampled every `WOBBLE_STEP_PX`, split at true corners (turning of at least
-    `WOBBLE_CORNER_RAD` within 3 samples, which are excluded), and each piece is compared with a
-    Gaussian-faired copy of itself. Per `WOBBLE_WINDOW_PX` window, excess turning = sum|turn| -
-    sum|faired turn|: near 0 for circles, clean S-curves and straight runs (monotone turning
-    survives fairing), large for wiggles. A window is flagged when its excess reaches
-    `WOBBLE_FLAG_RAD` and its curvature changes sign at least `WOBBLE_MIN_SIGN_CHANGES` times.
-    Score = total excess of flagged windows (rad); consecutive flagged windows form one spot.
+    Each curve is resampled every `WOBBLE_STEP_PX` and split at true corners (turning of at
+    least `WOBBLE_CORNER_RAD` within 3 samples, which are excluded). On each piece:
+
+    - wiggles: per sliding `WOBBLE_WINDOW_PX` window, excess turning = sum|turn| - sum|faired
+      turn| against a Gaussian-faired copy (near 0 for circles, S-curves and straight runs),
+      counted when the curvature changes sign `WOBBLE_MIN_SIGN_CHANGES` times and the piece
+      strays `WOBBLE_MIN_AMPLITUDE_PX` from its faired copy;
+    - bends: see `_bend_windows`.
+
+    Score = sum over windows of max(0, value / flag - 1) x the window's share of the length
+    (unitless); windows at or above the flag become spots (overlapping ones merged).
     """
     spots: list[Spot] = []
+    score = 0.0
     for c in curves:
         if not c.smooth or OUTSIDE in (c.left, c.right) or _length(c.points) < WOBBLE_MIN_CURVE_PX:
             continue
@@ -380,11 +497,115 @@ def detect_wobble(curves: Sequence[CurveGeom]) -> DetectorResult:
             continue
         closed = c.closed and np.allclose(pts[0], pts[-1])
         for piece, ring in _pieces(pts, closed):
-            flagged = _piece_windows(piece, ring)
-            spots.extend(
-                Spot(s.box, s.severity, f"curve {c.id}: {s.note}") for s in _merge_runs(flagged)
-            )
-    return _sorted(sum(s.severity for s in spots), spots)
+            if _length(piece) < WOBBLE_MIN_PIECE_PX or len(piece) < 5:
+                continue
+            s1, f1 = _wiggle_windows(piece, ring)
+            s2, f2 = _bend_windows(piece) if not ring else _bend_windows(np.vstack([piece, piece[:1]]))
+            score += s1 + s2
+            for s in _merge_overlapping(f1) + _merge_overlapping(f2):
+                spots.append(Spot(s.box, s.severity, f"curve {c.id} {s.note}"))
+    return _sorted(score, spots)
+
+
+# ---------------------------------------------------------------- straightness
+
+
+def _luma(px: np.ndarray) -> np.ndarray:
+    alpha = px[..., 3].astype(np.float64) / 255.0
+    rgb = px[..., :3].astype(np.float64) * alpha[..., None] + 255.0 * (1.0 - alpha[..., None])
+    return rgb @ np.array([0.299, 0.587, 0.114])
+
+
+def _source_edge(luma: np.ndarray, pts: np.ndarray, normal: np.ndarray) -> np.ndarray:
+    """Sub-pixel source edge position along `normal` through each point (NaN where the source
+    has no clear edge there): the mid-level crossing of the luminance profile nearest the point."""
+    offs = np.arange(-STRAIGHT_PROFILE_PX, STRAIGHT_PROFILE_PX + 1e-9, 0.25)
+    xy = pts[:, None, :] + offs[None, :, None] * normal[:, None, :]
+    prof = map_coordinates(luma, [xy[..., 1] - 0.5, xy[..., 0] - 0.5], order=1, mode="nearest")
+    lo, hi = prof[:, :3].mean(axis=1), prof[:, -3:].mean(axis=1)
+    out = np.full(len(pts), np.nan)
+    for i in np.flatnonzero(np.abs(hi - lo) >= STRAIGHT_MIN_CONTRAST):
+        f = prof[i] - (lo[i] + hi[i]) / 2
+        cross = np.flatnonzero(np.sign(f[:-1]) * np.sign(f[1:]) < 0)
+        if not len(cross):
+            continue
+        j = cross[np.argmin(np.abs(offs[cross]))]
+        out[i] = offs[j] + (offs[j + 1] - offs[j]) * f[j] / (f[j] - f[j + 1])
+    return out
+
+
+def _turn_between(a: np.ndarray, b: np.ndarray) -> float:
+    """Angle between the total-least-squares directions of two point runs."""
+    if len(a) < 3 or len(b) < 3:
+        return math.pi
+    da = np.linalg.svd(a - a.mean(axis=0), full_matrices=False)[2][0]
+    db = np.linalg.svd(b - b.mean(axis=0), full_matrices=False)[2][0]
+    return math.acos(min(1.0, abs(float(da @ db))))
+
+
+def detect_straightness(curves: Sequence[CurveGeom], source: np.ndarray) -> DetectorResult:
+    """Straight source edges drawn bent.
+
+    Along smooth curves, the source edge is read across each sample (`_source_edge`). Sliding
+    `STRAIGHT_WINDOW_PX` windows where that source edge is straight (line-fit RMS at most
+    `STRAIGHT_SOURCE_RMS_PX`, turning less than `STRAIGHT_MAX_TURN_RAD` end to end) are
+    straight edges; the window's value is how much farther the fitted outline strays from the
+    source's line than the source edge itself does, flagged at `STRAIGHT_FLAG_PX`. The straightness gate is on the source, not
+    the fit: a fit that bends off a straight source edge is exactly the defect. Windows whose
+    fit turns more than `STRAIGHT_MAX_FIT_TURN_RAD` (past a corner) are skipped. This measures where segmentation followed edge
+    noise, so it is kept apart from `detect_wobble`. `source` is HxWx4 in the curves' px.
+    """
+    luma = _luma(source)
+    size = int(round(STRAIGHT_WINDOW_PX / STRAIGHT_STEP_PX))
+    stride = max(1, int(round(STRAIGHT_STRIDE_PX / STRAIGHT_STEP_PX)))
+    spots: list[Spot] = []
+    score = 0.0
+    for c in curves:
+        if not c.smooth or OUTSIDE in (c.left, c.right) or _length(c.points) < STRAIGHT_WINDOW_PX:
+            continue
+        pts = _resample(c.points, STRAIGHT_STEP_PX)
+        tangent = np.gradient(pts, axis=0)
+        tangent /= np.maximum(np.hypot(*tangent.T), 1e-12)[:, None]
+        normal = np.stack([-tangent[:, 1], tangent[:, 0]], axis=1)
+        heading = np.unwrap(np.arctan2(tangent[:, 1], tangent[:, 0]))
+        edge = None
+        wins = _windows(len(pts), size, stride)
+        if len(pts) < size:
+            continue
+        weight = _window_weight(len(pts), size, len(wins))
+        flagged = []
+        h_img, w_img = luma.shape
+        for a, b in wins:
+            if np.ptp(heading[a:b]) > STRAIGHT_MAX_FIT_TURN_RAD:  # a corner inside
+                continue
+            win = pts[a:b]
+            if (win.min() < STRAIGHT_BORDER_PX or win[:, 0].max() > w_img - STRAIGHT_BORDER_PX
+                    or win[:, 1].max() > h_img - STRAIGHT_BORDER_PX):
+                continue
+            if edge is None:
+                edge = _source_edge(luma, pts, normal)
+            ok = np.isfinite(edge[a:b])
+            if ok.sum() < 0.8 * (b - a):
+                continue
+            src = pts[a:b][ok] + edge[a:b][ok, None] * normal[a:b][ok]
+            centre = src.mean(axis=0)
+            direction = np.linalg.svd(src - centre, full_matrices=False)[2][0]
+            line_n = np.array([-direction[1], direction[0]])
+            if float(np.sqrt((((src - centre) @ line_n) ** 2).mean())) > STRAIGHT_SOURCE_RMS_PX:
+                continue
+            if _turn_between(src[: len(src) // 4], src[-(len(src) // 4) :]) > STRAIGHT_MAX_TURN_RAD:
+                continue
+            # the fit's excess over the source's own spread: a faithfully fitted gentle arc
+            # (sagitta up to ~0.6 px at 5 deg over 60 px) is not a defect
+            dev = float(np.abs((pts[a:b] - centre) @ line_n).max()
+                        - np.abs((src - centre) @ line_n).max())
+            score += max(0.0, dev / STRAIGHT_FLAG_PX - 1.0) * weight
+            if dev >= STRAIGHT_FLAG_PX:
+                flagged.append((a, b, dev / STRAIGHT_FLAG_PX, pts[a:b],
+                                f"{dev:.2f} px off the straight source edge"))
+        for s in _merge_overlapping(flagged):
+            spots.append(Spot(s.box, s.severity, f"curve {c.id}: {s.note}"))
+    return _sorted(score, spots)
 
 
 # ---------------------------------------------------------------- thin bands
@@ -446,12 +667,11 @@ def _trend(w: np.ndarray, sigma: float) -> np.ndarray:
     return gaussian_filter1d(ext, sigma, mode="nearest")[pad : pad + len(w)]
 
 
-def _band_windows(pts: np.ndarray, width: np.ndarray) -> list[tuple[int, float, np.ndarray, str]]:
+def _band_windows(pts: np.ndarray, width: np.ndarray) -> tuple[float, list]:
     thin = width <= BAND_MAX_PX
     trim = int(round(BAND_END_TRIM_PX / BAND_STEP_PX))
-    win = max(2, int(round(BAND_WINDOW_PX / BAND_STEP_PX)))
-    flagged = []
-    k = 0
+    size = max(2, int(round(BAND_WINDOW_PX / BAND_STEP_PX)))
+    score, flagged = 0.0, []
     for is_thin, group in itertools.groupby(range(len(thin)), key=lambda i: thin[i]):
         idx = np.fromiter(group, np.int64)
         if not is_thin:
@@ -459,18 +679,19 @@ def _band_windows(pts: np.ndarray, width: np.ndarray) -> list[tuple[int, float, 
         idx = idx[trim : len(idx) - trim]
         if len(idx) * BAND_STEP_PX < BAND_MIN_RUN_PX:
             continue
-        n_win = max(1, int(round(len(idx) / win)))
         run_w = width[idx]
         resid = run_w - _trend(run_w, BAND_TREND_SIGMA_PX / BAND_STEP_PX)
-        for part in np.array_split(np.arange(len(idx)), n_win):
-            w = run_w[part]
-            std = float(resid[part].std())
+        wins = _windows(len(idx), size, BAND_STRIDE)
+        weight = _window_weight(len(idx), size, len(wins))
+        for a, b in wins:
+            std = float(resid[a:b].std())
+            score += max(0.0, std / BAND_STD_FLAG_PX - 1.0) * weight / BAND_SIDES
             if std >= BAND_STD_FLAG_PX:
-                note = f"width {w.min():.1f}-{w.max():.1f} px, std {std:.2f}"
-                flagged.append((k, std, pts[idx[part]], note))
-            k += 1
-        k += 1  # a gap between runs breaks spot merging
-    return flagged
+                w = run_w[a:b]
+                note = f"width {w.min():.1f}-{w.max():.1f} px, std about trend {std:.2f}"
+                flagged.append((int(idx[a]), int(idx[b - 1]) + 1, std / BAND_STD_FLAG_PX,
+                                pts[idx[a:b]], note))
+    return score, flagged
 
 
 def detect_thin_bands(curves: Sequence[CurveGeom]) -> DetectorResult:
@@ -480,12 +701,14 @@ def detect_thin_bands(curves: Sequence[CurveGeom]) -> DetectorResult:
     region on each side; the distance to that region's next boundary is the band width there.
     Runs where the width is at most `BAND_MAX_PX` (trimmed by `BAND_END_TRIM_PX`, at least
     `BAND_MIN_RUN_PX` long) are bands. Width is compared with its own Gaussian trend
-    (`BAND_TREND_SIGMA_PX`, so a straight taper does not count) and each `BAND_WINDOW_PX` window
-    whose residual std reaches `BAND_STD_FLAG_PX` is flagged. Score = summed std of flagged
-    windows (px).
+    (`BAND_TREND_SIGMA_PX`, so a straight taper does not count); each sliding `BAND_WINDOW_PX`
+    window scores max(0, std / `BAND_STD_FLAG_PX` - 1) x its share of the run length, and flags
+    at the threshold. Every band is seen from both of its sides, so the score is divided by
+    `BAND_SIDES`; spots stay per side (a band can show two overlapping spots).
     """
     segs = _Segments(curves)
     spots: list[Spot] = []
+    score = 0.0
     for c in curves:
         pts = _resample(c.points, BAND_STEP_PX)
         if len(pts) < 3:
@@ -500,9 +723,11 @@ def detect_thin_bands(curves: Sequence[CurveGeom]) -> DetectorResult:
                 continue
             width = segs.cast(pts, sign * left_normal, region)
             width[~good] = np.inf
-            for s in _merge_runs(_band_windows(pts, width)):
-                spots.append(Spot(s.box, s.severity, f"region {region}: {s.note}"))
-    return _sorted(sum(s.severity for s in spots), spots)
+            s, flagged = _band_windows(pts, width)
+            score += s
+            for spot in _merge_overlapping(flagged):
+                spots.append(Spot(spot.box, spot.severity, f"region {region}: {spot.note}"))
+    return _sorted(score, spots)
 
 
 # ---------------------------------------------------------------- junction spikes
@@ -512,15 +737,27 @@ def _abs_turn(pts: np.ndarray) -> float:
     return float(np.abs(_turns(pts)).sum()) if len(pts) >= 3 else 0.0
 
 
+def _raw_end_turn(raw: np.ndarray, reach: int) -> float:
+    """Net heading change |sum turn| over the first `reach` samples of the crack path smoothed
+    by `JUNCTION_RAW_SIGMA_PX`. Pixel stairs alternate and cancel in the net sum at any scale;
+    a true tip or corner near the junction does not."""
+    dense = _resample(_dedupe(raw), JUNCTION_STEP_PX)
+    if len(dense) < 3:
+        return 0.0
+    smooth = _fair(dense, JUNCTION_RAW_SIGMA_PX / JUNCTION_STEP_PX, False)
+    return abs(float(_turns(smooth[: reach + 2]).sum()))
+
+
 def detect_junction_spikes(curves: Sequence[CurveGeom]) -> DetectorResult:
     """Sharp turns or short hooks within `JUNCTION_REACH_PX` of a curve's end at a junction
     shared with another curve.
 
     Per end: near = sum|turn| over the first `JUNCTION_REACH_PX` of the fitted curve; baseline =
-    the larger of the curve's own turning rate over the next 2x reach (times the reach) and, when
-    `raw` is known, the end turning of the lightly smoothed crack path. A spike is near -
-    baseline >= `JUNCTION_TURN_RAD`. Score = summed excess (rad). Only smoothly fitted curves are
-    checked (exact pixel polylines turn 90 deg at every step by design).
+    the larger of the curve's own turning rate over the next 2x reach (times the reach) and,
+    when `raw` is known, the net heading change of the smoothed crack path over the reach
+    (`_raw_end_turn`: a true tip or corner turns there too; pixel stairs cancel).
+    A spike is near - baseline >= `JUNCTION_TURN_RAD`. Score = summed excess (rad). Only
+    smoothly fitted curves are checked (exact pixel polylines turn 90 deg at every step).
     """
     ends = Counter()
     for c in curves:
@@ -541,12 +778,9 @@ def detect_junction_spikes(curves: Sequence[CurveGeom]) -> DetectorResult:
             far_pts = dense[reach : 3 * reach + 1]
             far_len = _length(far_pts)
             baseline = _abs_turn(far_pts) / far_len * JUNCTION_REACH_PX if far_len > 1 else 0.0
-            if c.raw is not None:  # a true sharp tip in the source turns there too
+            if c.raw is not None and len(c.raw) >= 2:
                 raw = c.raw if np.allclose(c.raw[0], pts[0]) else c.raw[::-1]
-                raw = _resample(raw, JUNCTION_STEP_PX)
-                if len(raw) >= 3:
-                    raw = _fair(raw, JUNCTION_RAW_SIGMA_PX / JUNCTION_STEP_PX, False)
-                    baseline = max(baseline, _abs_turn(raw[: reach + 2]))
+                baseline = max(baseline, _raw_end_turn(raw, reach))
             excess = near - baseline
             box = _bbox(dense[: reach + 2], 0.5)
             if excess >= JUNCTION_TURN_RAD and (c.id, box) not in seen:  # short curves: once
@@ -604,23 +838,29 @@ def detect_worst_patches(
 # ---------------------------------------------------------------- pipeline state -> geometry
 
 
-def _primitive_curves(state) -> set[int]:
-    """Curves whose primitive the stacked document draws: a region whose only loop is that
-    single closed curve (see `export._single_primitive`)."""
-    out = set()
-    for loops in state.graph.region_loops.values():
-        if len(loops) == 1 and len(loops[0]) == 1:
-            out.add(loops[0][0][0])
-    return out
+def _signed_area(pts: np.ndarray) -> float:
+    return _shoelace(pts) if len(pts) >= 3 else 0.0
 
 
 def geometry_from_state(state) -> Geometry:
-    """Detector geometry, in original px, from a finished `engine.pipeline.PipelineState`."""
+    """Detector geometry, in original px, from a finished `engine.pipeline.PipelineState`.
+
+    Which curves are drawn as primitives and which as path segments is export's own decision
+    (`export.plan_layers`), so the geometry is what the document draws."""
+    from engine.stages.export import plan_layers
     from engine.stages.fit_geometry import MIN_CLOSED_LENGTH_PX, MIN_OPEN_LENGTH_PX
 
     scale = state.image.scale
     fitted = {f.curve_id: f for f in state.fitted}
-    drawn_primitives = _primitive_curves(state) if state.preset.export.layer_mode == "stacked" else set()
+    plans = plan_layers(state.regions, state.graph, state.fitted, state.preset.export)
+    primitive_ids = {p.primitive_curve for p in plans if p.primitive_curve is not None}
+    segment_ids = {
+        cid
+        for p in plans
+        if not p.underlay and p.primitive_curve is None
+        for loop in p.loops
+        for cid, _ in loop
+    }
     curves = []
     for c in state.graph.curves:
         f = fitted[c.id]
@@ -630,21 +870,32 @@ def geometry_from_state(state) -> Geometry:
         smooth = (state.preset.fit.enabled and OUTSIDE not in (c.left, c.right)
                   and _length(raw) >= min_len * scale)
         prim = None
-        if f.primitive is not None and c.id in drawn_primitives:
+        drawn_segments = c.id in segment_ids
+        if c.id in primitive_ids:
             prim = sample_shape(f.primitive, GEOM_SAMPLE_ERROR_PX * scale) / scale
-        curves.append(CurveGeom(c.id, pts, c.left, c.right, c.closed, smooth, prim, raw / scale))
+            # walk it the curve's way round so `left` / `right` still hold
+            if np.sign(_signed_area(prim)) != np.sign(_signed_area(raw)):
+                prim = prim[::-1].copy()
+            if not drawn_segments:
+                pts, smooth = prim, True
+        curves.append(CurveGeom(c.id, pts, c.left, c.right, c.closed, smooth, prim, raw / scale,
+                                drawn_segments))
     return Geometry(tuple(curves), shapes_from_doc(state.doc), scale)
 
 
 def detect_all(
-    geometry: Geometry, source: np.ndarray, render: np.ndarray
+    geometry: Geometry, source: np.ndarray, render: np.ndarray,
+    edge_source: np.ndarray | None = None,
 ) -> dict[str, DetectorResult]:
-    """Every detector; `source` and `render` are HxWx4 at the same size, in original px."""
+    """Every detector. `source` and `render` are HxWx4 at one size for the patch comparison;
+    `edge_source` (default `source`) is the input image in the geometry's px for straightness."""
     return {
         "crossings": detect_crossings(geometry.curves),
         "specks": detect_specks(geometry.shapes),
         "wobble": detect_wobble(geometry.curves),
         "thin_bands": detect_thin_bands(geometry.curves),
         "junction_spikes": detect_junction_spikes(geometry.curves),
+        "straightness": detect_straightness(
+            geometry.curves, source if edge_source is None else edge_source),
         "worst_patches": detect_worst_patches(source, render),
     }

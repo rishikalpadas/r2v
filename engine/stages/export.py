@@ -1,7 +1,7 @@
 """Export stage: assemble a VectorDoc from fitted curves and serialise it to SVG."""
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from xml.sax.saxutils import quoteattr
 
 from engine.presets import ExportParams
@@ -161,6 +161,54 @@ def _to_original_units(
     )
 
 
+@dataclass(frozen=True)
+class LayerPlan:
+    """One painted layer: `region` at `z` drawn from `loops`, as the canvas underlay, as the
+    primitive of curve `primitive_curve`, or (neither) as a path of the loops' fitted segments."""
+
+    z: int
+    region: int
+    loops: tuple[LoopRef, ...]
+    underlay: bool
+    primitive_curve: int | None
+
+
+def plan_layers(
+    regions: RegionMap,
+    graph: BoundaryGraph,
+    fitted: tuple[FittedCurve, ...],
+    params: ExportParams,
+) -> tuple[LayerPlan, ...]:
+    """How `build_doc` draws each region, in paint order. Analysis tools use it to know which
+    curves end up as primitives and which as path segments."""
+    by_id = {f.curve_id: f for f in fitted}
+    points = {c.id: c.points for c in graph.curves}
+    sides = {c.id: c.right for c in graph.curves}
+    curve_sides = {c.id: (c.left, c.right) for c in graph.curves}
+    stacked = params.layer_mode == "stacked"
+
+    # Paint larger enclosed areas first so a nested region always lands on top of its container
+    # (pixel counts would mis-order a thin ring around a large disc).
+    ordered = sorted(
+        (r for r, loops in graph.region_loops.items() if loops and 0 <= r < len(regions.palette_rgb)),
+        key=lambda r: (-_loop_area(graph.region_loops[r][0], points), r),
+    )
+    plans: list[LayerPlan] = []
+    for z, region in enumerate(ordered):
+        loops = _emitted_loops(region, graph, stacked, sides)
+        if stacked and z == 0 and _needs_canvas_underlay(loops[0], graph):
+            plans.append(LayerPlan(z, region, loops, True, None))
+            continue
+        shape = (
+            _single_primitive(region, loops[0], by_id, stacked, curve_sides)
+            if len(loops) == 1
+            else None
+        )
+        curve = loops[0][0][0] if shape is not None else None
+        plans.append(LayerPlan(z, region, loops, False, curve))
+    return tuple(plans)
+
+
 def build_doc(
     regions: RegionMap,
     graph: BoundaryGraph,
@@ -174,35 +222,17 @@ def build_doc(
     grid's size."""
     w, h = original_size or (regions.labels.shape[1], regions.labels.shape[0])
     by_id = {f.curve_id: f for f in fitted}
-    points = {c.id: c.points for c in graph.curves}
-    sides = {c.id: c.right for c in graph.curves}
-    curve_sides = {c.id: (c.left, c.right) for c in graph.curves}
-    stacked = params.layer_mode == "stacked"
-
-    # Paint larger enclosed areas first so a nested region always lands on top of its container
-    # (pixel counts would mis-order a thin ring around a large disc).
-    ordered = sorted(
-        (r for r, loops in graph.region_loops.items() if loops and 0 <= r < len(regions.palette_rgb)),
-        key=lambda r: (-_loop_area(graph.region_loops[r][0], points), r),
-    )
     paths: list[Path] = []
     primitives: list[Primitive] = []
-    for z, region in enumerate(ordered):
-        loops = _emitted_loops(region, graph, stacked, sides)
-        fill = SolidFill(tuple(int(c) for c in regions.palette_rgb[region]))
-        if stacked and z == 0 and _needs_canvas_underlay(loops[0], graph):
-            paths.append(Path((_canvas_frame(w * scale, h * scale),), fill, z))
-            continue
-        shape = (
-            _single_primitive(region, loops[0], by_id, stacked, curve_sides)
-            if len(loops) == 1
-            else None
-        )
-        if shape is not None:
-            primitives.append(Primitive(shape, fill, z))
-            continue
-        contours = tuple(_loop_segments(loop, by_id) for loop in loops)
-        paths.append(Path(contours, fill, z))
+    for plan in plan_layers(regions, graph, fitted, params):
+        fill = SolidFill(tuple(int(c) for c in regions.palette_rgb[plan.region]))
+        if plan.underlay:
+            paths.append(Path((_canvas_frame(w * scale, h * scale),), fill, plan.z))
+        elif plan.primitive_curve is not None:
+            primitives.append(Primitive(by_id[plan.primitive_curve].primitive, fill, plan.z))
+        else:
+            contours = tuple(_loop_segments(loop, by_id) for loop in plan.loops)
+            paths.append(Path(contours, fill, plan.z))
     out_paths, out_primitives = _to_original_units(paths, primitives, scale)
     return VectorDoc(
         width=w,

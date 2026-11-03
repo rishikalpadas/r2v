@@ -13,6 +13,8 @@ import argparse
 import csv
 import html
 import re
+import subprocess
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -25,8 +27,10 @@ from eval.defects import DETECTORS, DetectorResult, Spot, detect_all, geometry_f
 from eval.metrics import count_nodes, edge_f1, mean_delta_e, render_svg, ssim
 from eval.run_benchmark import CLEAN_DIR, IMAGE_SUFFIXES
 
+# `image` is the path relative to the --images root (posix), the key --compare matches on.
 COLUMNS = ["image", "status", "error", "combined", *DETECTORS,
-           "ssim", "delta_e", "edge_f1", "nodes", "paths", "runtime_s", "reference"]
+           "ssim", "delta_e", "edge_f1", "nodes", "paths", "runtime_s", "reference",
+           "enhance", "scale", "git_sha"]
 METRICS = ("ssim", "delta_e", "edge_f1", "nodes", "runtime_s")
 SKIP_DIRS = {CLEAN_DIR, "reference"}
 
@@ -35,9 +39,10 @@ SKIP_DIRS = {CLEAN_DIR, "reference"}
 NORM = {
     "crossings": 1.0,  # every crossing is a visible spike through a band
     "specks": 5.0,  # a handful of specks is one noticeable blemish
-    "wobble": 2.0,  # ~6 flagged wobble windows (each >= 20 deg excess)
-    "thin_bands": 2.0,  # ~6 uneven band windows (each >= 0.3 px std)
+    "wobble": 2.0,  # e.g. two window lengths at twice the flag line
+    "thin_bands": 2.0,  # same units as wobble
     "junction_spikes": 3.0,  # ~3 clear spikes
+    "straightness": 2.0,  # same units as wobble
     "worst_patches": 3.0,  # worst windows at ~3 units (e.g. dE 6, or SSIM 0.7)
 }
 TOP_N = 3  # spots shown per detector per image
@@ -64,14 +69,26 @@ def _images(folder: Path) -> list[tuple[str, Path]]:
 
 
 def _safe(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name).with_suffix("").as_posix())
+    """File-safe output name; keeps the extension so a.png and a.jpg do not collide."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name).as_posix())
 
 
-def _scaled(result: DetectorResult, k: float) -> DetectorResult:
-    if k == 1.0:
+def _scaled(result: DetectorResult, k: tuple[float, float]) -> DetectorResult:
+    kx, ky = k
+    if (kx, ky) == (1.0, 1.0):
         return result
-    spots = tuple(Spot(tuple(v * k for v in s.box), s.severity, s.note) for s in result.spots)
+    spots = tuple(Spot((s.box[0] * kx, s.box[1] * ky, s.box[2] * kx, s.box[3] * ky),
+                       s.severity, s.note) for s in result.spots)
     return DetectorResult(result.score, spots)
+
+
+def git_sha() -> str:
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+                             text=True, timeout=10, cwd=Path(__file__).resolve().parent)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
 
 
 def _crop_box(box, w: int, h: int) -> tuple[int, int, int, int]:
@@ -101,7 +118,8 @@ def _render_view(svg: str, view, size, extra: str = "") -> Image.Image:
     return tile.convert("RGB")
 
 
-def _write_crop(dest: Path, target: np.ndarray, svg: str, k: float, spot: Spot) -> None:
+def _write_crop(dest: Path, target: np.ndarray, svg: str, k: tuple[float, float],
+                spot: Spot) -> None:
     h, w = target.shape[:2]
     x0, y0, x1, y1 = _crop_box(spot.box, w, h)
     size = ((x1 - x0) * CROP_ZOOM, (y1 - y0) * CROP_ZOOM)
@@ -109,9 +127,10 @@ def _write_crop(dest: Path, target: np.ndarray, svg: str, k: float, spot: Spot) 
     src_tile = Image.new("RGBA", src.size, (255, 255, 255, 255))
     src_tile.alpha_composite(src)
     src_tile = src_tile.convert("RGB").resize(size, Image.Resampling.NEAREST)
-    view = (x0 / k, y0 / k, (x1 - x0) / k, (y1 - y0) / k)
+    kx, ky = k
+    view = (x0 / kx, y0 / ky, (x1 - x0) / kx, (y1 - y0) / ky)
     out = _render_view(svg, view, size)
-    lines = _render_view(svg, view, size, OUTLINE_STYLE.format(w=1.0 / (CROP_ZOOM * k)))
+    lines = _render_view(svg, view, size, OUTLINE_STYLE.format(w=1.0 / (CROP_ZOOM * min(k))))
     gap = 6
     sheet = Image.new("RGB", (size[0] * 3 + gap * 2, size[1]), (128, 128, 128))
     bx = [(v - o) * CROP_ZOOM for v, o in zip(spot.box, (x0, y0, x0, y0))]
@@ -126,7 +145,8 @@ def _load_rgba(path: Path) -> np.ndarray:
     return np.array(Image.open(path).convert("RGBA"), dtype=np.uint8)
 
 
-def analyse_image(name: str, path: Path, out: Path, enhance: bool, top: int) -> dict:
+def analyse_image(name: str, path: Path, out: Path, enhance: bool, top: int,
+                  sha: str = "") -> dict:
     """Convert one image, run every detector, write its SVG and crops; returns its CSV row
     plus `_spots` (detector -> spot list with crop paths) for the report."""
     from engine.loader import load_image
@@ -149,18 +169,20 @@ def analyse_image(name: str, path: Path, out: Path, enhance: bool, top: int) -> 
     clean = path.parent / CLEAN_DIR / f"{path.stem}.png"
     target = _load_rgba(clean) if clean.is_file() else image.pixels
     h, w = target.shape[:2]
-    k = w / image.original_size[0]  # reference px per input px
+    k = (w / image.original_size[0], h / image.original_size[1])  # reference px per input px
     render = render_svg(svg, w, h)
     if render.shape[:2] != (h, w):
         render = np.array(Image.fromarray(render, "RGBA").resize((w, h), Image.Resampling.LANCZOS))
     geometry = geometry_from_state(state)
     results = {d: (r if d == "worst_patches" else _scaled(r, k))
-               for d, r in detect_all(geometry, target, render).items()}
+               for d, r in detect_all(geometry, target, render, image.pixels).items()}
     nodes, paths = count_nodes(svg)
     row = {"image": name, "status": "ok", "error": "",
            "ssim": f"{ssim(target, render):.6f}", "delta_e": f"{mean_delta_e(target, render):.6f}",
            "edge_f1": f"{edge_f1(target, render):.6f}", "nodes": nodes, "paths": paths,
-           "runtime_s": f"{runtime:.3f}", "reference": "clean" if clean.is_file() else "input"}
+           "runtime_s": f"{runtime:.3f}", "reference": "clean" if clean.is_file() else "input",
+           "enhance": "on" if enhance else "off", "scale": f"{state.image.scale:g}",
+           "git_sha": sha}
     for d, r in results.items():
         row[d] = f"{r.score:.4f}"
     row["combined"] = f"{combined(row):.4f}"
@@ -218,6 +240,30 @@ def _ranking(rows: list[dict], compare: dict | None) -> str:
         body.append(f'<tr><td class="l"><a href="#{anchor}">{html.escape(r["image"])}</a></td>'
                     f"<td>{html.escape(r['status'])}</td>{cells}</tr>")
     return f"<table><tr>{head}</tr>{''.join(body)}</table>"
+
+
+def compare_warnings(rows: list[dict], compare: dict | None) -> list[str]:
+    """Reasons a --compare is not like for like: no shared images, or different settings."""
+    if compare is None:
+        return []
+    out = []
+    shared = [r for r in rows if r["image"] in compare]
+    if not shared:
+        out.append("0 shared images with the compare run (rows are keyed by the path relative "
+                   "to --images; were both runs given the same root?)")
+    mine = {r.get("enhance", "") for r in rows} - {""}
+    theirs = {r.get("enhance", "") for r in compare.values()} - {""}
+    if mine and theirs and mine != theirs:  # a run-level setting: check it even with 0 shared
+        out.append(f"enhance differs: this run {'/'.join(sorted(mine))}, "
+                   f"compare run {'/'.join(sorted(theirs))}")
+    for key in ("scale",):
+        differ = [r["image"] for r in shared
+                  if r["status"] == "ok" and compare[r["image"]].get("status") == "ok"
+                  and str(r.get(key, "")) != str(compare[r["image"]].get(key, ""))]
+        if differ:
+            out.append(f"{key} differs from the compare run for {len(differ)} image(s), "
+                       f"e.g. {differ[0]}")
+    return out
 
 
 def _totals(rows: list[dict], compare: dict | None) -> str:
@@ -283,8 +329,10 @@ _NOTE = ("<p>Images are sorted worst-first by <em>combined</em> = Σ detector sc
 def write_report(rows: list[dict], out: Path, compare: dict | None) -> Path:
     order = sorted(rows, key=lambda r: (r["status"] != "ok", -float(r["combined"] or 0)))
     title = "Defect report"
+    warn = "".join(f'<p class="err">Warning: {html.escape(w)}</p>'
+                   for w in compare_warnings(order, compare))
     doc = (f'<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>'
-           f"<style>{_STYLE}</style></head><body><h1>{title}</h1>{_NOTE}"
+           f"<style>{_STYLE}</style></head><body><h1>{title}</h1>{_NOTE}{warn}"
            f"{_totals(order, compare)}<h2>Ranking</h2>{_ranking(order, compare)}"
            f"<h2>Per image (worst first)</h2>{''.join(_image_section(r) for r in order)}"
            "</body></html>")
@@ -299,23 +347,30 @@ def write_report(rows: list[dict], out: Path, compare: dict | None) -> Path:
 def run_defects(images: Path, out: Path, enhance: bool = True, top: int = TOP_N,
                 compare: Path | None = None) -> tuple[Path, Path]:
     images, out = Path(images), Path(out)
+    if not images.is_dir():
+        raise NotADirectoryError(f"--images is not a directory: {images}")
     out.mkdir(parents=True, exist_ok=True)
+    sha = git_sha()
     rows = []
-    for name, path in _images(images):
-        try:
-            row = analyse_image(name, path, out, enhance, top)
-        except Exception as exc:  # noqa: BLE001 - one bad image must not stop the run
-            row = dict.fromkeys(COLUMNS, "")
-            row.update(image=name, status="error",
-                       error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}")
-        rows.append(row)
-        print(f"{name}: {row['status']} combined={row.get('combined', '')}", flush=True)
     csv_path = out / "defects.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(sorted(rows, key=lambda r: r["image"]))
+        for name, path in _images(images):
+            try:
+                row = analyse_image(name, path, out, enhance, top, sha)
+            except Exception as exc:  # noqa: BLE001 - one bad image must not stop the run
+                row = dict.fromkeys(COLUMNS, "")
+                row.update(image=name, status="error", enhance="on" if enhance else "off",
+                           git_sha=sha,
+                           error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=3)}")
+            writer.writerow(row)  # written as each image finishes, so a long run keeps its rows
+            f.flush()
+            rows.append(row)
+            print(f"{name}: {row['status']} combined={row.get('combined', '')}", flush=True)
     before = _read_csv(compare) if compare else None
+    for warning in compare_warnings(rows, before):
+        print(f"warning: {warning}", file=sys.stderr)
     return csv_path, write_report(rows, out, before)
 
 
@@ -328,6 +383,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--top", type=int, default=TOP_N, help="spots shown per detector")
     parser.add_argument("--compare", type=Path, help="another run's defects.csv")
     args = parser.parse_args(argv)
+    if not args.images.is_dir():
+        parser.error(f"--images is not a directory: {args.images}")
+    if args.compare is not None and not args.compare.is_file():
+        parser.error(f"--compare is not a file: {args.compare}")
     csv_path, report = run_defects(args.images, args.out, args.enhance == "on", args.top,
                                    args.compare)
     print(f"defects: {csv_path}\nreport: {report}")

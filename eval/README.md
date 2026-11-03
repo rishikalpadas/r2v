@@ -95,29 +95,40 @@ python -m eval.run_defects --out eval/reports/after --compare eval/reports/defec
 Every image in `--images` (and one level of sub-folders, skipping `clean/` and `reference/`)
 is converted with the default preset (`--enhance on|off`, default on). The run writes:
 
-- `defects.csv`: one row per image with each detector's score (0 is clean, higher is worse),
-  `combined`, ssim, delta_e, edge_f1, nodes, paths, runtime_s and `status`/`error`. A failing
-  image is recorded as `error` and the run carries on.
+- `defects.csv`: one row per image, written as each image finishes. `image` is the path
+  relative to `--images`; then each detector's score (0 is clean, higher is worse),
+  `combined`, ssim, delta_e, edge_f1, nodes, paths, runtime_s, reference, `enhance`, `scale`
+  (processing scale) and `git_sha`, plus `status`/`error`. A failing image is recorded as
+  `error` and the run carries on.
 - `report.html`: images worst-first by `combined` = sum of score / `NORM` per detector
   (`eval/run_defects.py`). For each image, the top `--top` (3) spots per detector are shown as
   5x crops: source pixels, output, output with path outlines.
-- `svg/<image>.svg` and `crops/<image>/<detector>_<k>.png`.
+- `svg/<image>.svg` and `crops/<image>/<detector>_<k>.png` (`<image>` keeps its extension).
 
-With `--compare <defects.csv>`, the report shows per-image and per-detector deltas (this run
-minus the other run) and the change in the means.
+With `--compare <defects.csv>`, rows are matched on `image` (so give both runs the same
+`--images` root) and the report shows per-image and per-detector deltas (this run minus the
+other) and the change in the means. It warns when no rows are shared, when `enhance` differs,
+or when an image's processing `scale` differs.
 
 | detector          | finds                                                              | score                    |
 |-------------------|--------------------------------------------------------------------|--------------------------|
 | `crossings`       | proper crossings between drawn curves, away from shared junctions  | count                    |
 | `specks`          | output shapes under 12 px² (original px)                           | count                    |
-| `wobble`          | curve windows whose turning exceeds a faired copy's and changes sign repeatedly (corners excluded) | summed excess (rad) |
-| `thin_bands`      | bands up to 6.5 px wide whose width varies about its own trend     | summed width std (px)    |
+| `wobble`          | wiggles (turning beyond a faired copy, repeated sign changes, ≥ 0.2 px off it) and long sub-pixel bends (40 px windows, quadratic residual 0.3-1 px); corners excluded | sliding-window excess over the flag line |
+| `thin_bands`      | bands up to 6.5 px wide whose width varies about its own trend     | same, halved (each band is seen from both sides) |
 | `junction_spikes` | sharp turns/hooks within 4 px of a shared junction that the source path does not make | summed excess (rad) |
+| `straightness`    | fits that stray from a straight source edge (60 px windows, read from the source pixels) | sliding-window excess over the flag line |
 | `worst_patches`   | 24 px windows with the worst dE2000 / SSIM between render and source | mean of the worst 5    |
+
+Sliding-window scores add max(0, value / flag - 1) per window, weighted by the window's share
+of the curve length, so a score changes smoothly with the geometry; the flag only decides which
+windows become spots. `straightness` measures segmentation (did the outline follow a straight
+source edge?) rather than fitting, so it is kept apart from `wobble`.
 
 The detectors live in `eval/defects.py` as pure functions on geometry in original px; each
 threshold is a named constant with its reason. They read the pipeline's final state through
-`engine.pipeline.run_stages`, which does not change the output.
+`engine.pipeline.run_stages` and ask export which curves it draws as primitives
+(`engine.stages.export.plan_layers`); neither changes the output.
 
 ## Known limitations
 
