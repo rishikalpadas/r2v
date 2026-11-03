@@ -140,7 +140,7 @@ def _fit_piece(
             return [_to_bezier(pts[0], ctrl, pts[-1])]
 
     k = min(3, split, len(d) - 1 - split) if min_chord > 0 else 1
-    centre = _unit(d[split + k] - d[split - k])
+    centre = _unit(d[split - k] - d[split + k])
     if not centre.any():
         chord = d[-1] - d[0]
         centre = _unit(np.array([-chord[1], chord[0]]))

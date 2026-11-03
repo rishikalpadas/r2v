@@ -175,6 +175,8 @@ def _detect_ellipse(arr: np.ndarray, scale: float) -> Ellipse | None:
     if ell is None:
         return None
     ell = (ell[0] + float(centre[0]), ell[1] + float(centre[1]), *ell[2:])
+    if ell[3] < 2.0 * scale or ell[2] / max(ell[3], 1e-6) > 6.0:
+        return None
     if _ellipse_max_deviation(arr, ell) > ELLIPSE_TOL_PX * scale:
         return None
     return Ellipse(*ell)
