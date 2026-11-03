@@ -163,21 +163,25 @@ class MultiscaleCorners(NamedTuple):
     coarse_angles: tuple[float, ...]
 
 
-def _track_window(i: int, n: int, closed: bool) -> np.ndarray:
-    """Sample indices within TRACK_RADIUS of i (an open curve's end points excluded)."""
-    idx = np.arange(i - TRACK_RADIUS, i + TRACK_RADIUS + 1)
+def _track_window(i: int, n: int, closed: bool, radius: int = TRACK_RADIUS) -> np.ndarray:
+    """Sample indices within `radius` of i (an open curve's end points excluded)."""
+    idx = np.arange(i - radius, i + radius + 1)
     return idx % n if closed else idx[(idx > 0) & (idx < n - 1)]
 
 
-def _coarse_response(angles: np.ndarray, i: int, n: int, closed: bool) -> float:
-    """Largest coarse turning angle within TRACK_RADIUS of sample i (NaN where undefined)."""
-    window = angles[_track_window(i, n, closed)]
+def _coarse_response(
+    angles: np.ndarray, i: int, n: int, closed: bool, radius: int = TRACK_RADIUS
+) -> float:
+    """Largest coarse turning angle within `radius` of sample i (NaN where undefined)."""
+    window = angles[_track_window(i, n, closed, radius)]
     return float(np.nanmax(window)) if np.isfinite(window).any() else math.nan
 
 
-def _track_to_fine(fine_angles: np.ndarray, i: int, n: int, closed: bool) -> int:
-    """Index of the strongest fine-scale turn within TRACK_RADIUS of coarse corner i."""
-    idx = _track_window(i, n, closed)
+def _track_to_fine(
+    fine_angles: np.ndarray, i: int, n: int, closed: bool, radius: int = TRACK_RADIUS
+) -> int:
+    """Index of the strongest fine-scale turn within `radius` of coarse corner i."""
+    idx = _track_window(i, n, closed, radius)
     window = fine_angles[idx]
     return int(idx[int(np.nanargmax(window))]) if np.isfinite(window).any() else i
 
@@ -201,6 +205,7 @@ def find_corners_multiscale(
     fine_sigma: float,
     coarse_sigma: float,
     fine_window: int = 2,
+    track_radius: int = TRACK_RADIUS,
 ) -> MultiscaleCorners:
     """Corners that persist from the fine scale up to the coarse scale.
 
@@ -216,6 +221,7 @@ def find_corners_multiscale(
       close to an open curve's end for the coarse window), which the coarse scale cannot judge.
 
     Indices are fine-scale positions; corners closer than `fine_window` collapse into one.
+    `track_radius` (samples) replaces TRACK_RADIUS, e.g. converted with `samples_at_scale`.
     """
     pts = tuple((float(x), float(y)) for x, y in raw)
     n = len(pts)
@@ -231,7 +237,7 @@ def find_corners_multiscale(
     coarse_pts = smooth_dense(pts, closed, coarse_sigma)
     coarse_angles = _turning_angles(np.asarray(coarse_pts, np.float64), closed, window)
     tracked = [
-        _track_to_fine(fine_angles, i, n, closed)
+        _track_to_fine(fine_angles, i, n, closed, track_radius)
         for i in find_corners(coarse_pts, closed, angle_deg, window)
         if closed or 0 < i < n - 1
     ]
@@ -239,7 +245,7 @@ def find_corners_multiscale(
     def response(i: int) -> float:  # NaN: an end, or the coarse window does not fit at i
         if i in ends or math.isnan(coarse_angles[i]):
             return math.nan
-        return _coarse_response(coarse_angles, i, n, closed)
+        return _coarse_response(coarse_angles, i, n, closed, track_radius)
 
     confirmed = [i for i in fine if i not in ends and not response(i) <= angle_deg]
     corners = sorted(ends + _dedupe_close(tracked + confirmed, fine_angles, fine_window))

@@ -14,7 +14,7 @@ from collections.abc import Sequence
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
-from engine.geometry.corners import find_corners, smooth_dense
+from engine.geometry.corners import find_corners, samples_at_scale, smooth_dense
 from engine.types import Point
 
 NOISE_FLOOR_PX = 0.15  # below this, sample jitter is beneath what the fit tolerance resolves
@@ -48,37 +48,43 @@ def _normals(arr: np.ndarray, closed: bool) -> np.ndarray:
     return np.column_stack([-tangent[:, 1], tangent[:, 0]]) / length[:, None]
 
 
-def _usable(n: int, corners: Sequence[int], closed: bool) -> np.ndarray:
+def _usable(n: int, corners: Sequence[int], closed: bool, scale: float = 1.0) -> np.ndarray:
     """Mask of samples away from strong corners (and, for open curves, from the end points)."""
     keep = np.ones(n, bool)
+    exclude = samples_at_scale(CORNER_EXCLUDE, scale)
     for c in corners:
-        idx = np.arange(c - CORNER_EXCLUDE, c + CORNER_EXCLUDE + 1)
+        idx = np.arange(c - exclude, c + exclude + 1)
         keep[idx % n if closed else idx[(idx >= 0) & (idx < n)]] = False
     if not closed:
-        edge = int(NOISE_SMOOTH_SIGMA)  # the smoothed copy is pinned near the ends
+        edge = int(NOISE_SMOOTH_SIGMA * scale)  # the smoothed copy is pinned near the ends
         keep[:edge] = keep[n - edge :] = False
     return keep
 
 
-def estimate_noise(dense: Sequence[Point], closed: bool) -> float:
+def estimate_noise(dense: Sequence[Point], closed: bool, scale: float = 1.0) -> float:
     """Robust std (processing px) of the samples' normal jitter, at least NOISE_FLOOR_PX.
 
     `dense` is a raw (unsmoothed) dense sample sequence in the `corners.dense_samples` layout,
-    ideally already moved to sub-pixel edge positions.
+    ideally already moved to sub-pixel edge positions. The sample counts and sigmas above are
+    at scale 1 and are converted to `scale` (one sample per processing pixel), so they keep
+    covering the same original-pixel length.
     """
     n = len(dense)
-    if n < MIN_NOISE_SAMPLES:
+    min_samples = samples_at_scale(MIN_NOISE_SAMPLES, scale)
+    if n < min_samples:
         return NOISE_FLOOR_PX
     raw = tuple((float(x), float(y)) for x, y in dense)
     arr = np.asarray(raw, np.float64)
-    smooth = np.asarray(smooth_dense(raw, closed, NOISE_SMOOTH_SIGMA), np.float64)
-    probe = smooth_dense(raw, closed, CORNER_PROBE_SIGMA)
-    strong = find_corners(probe, closed, STRONG_CORNER_DEG, CORNER_PROBE_WINDOW)
+    sigma = NOISE_SMOOTH_SIGMA * scale
+    smooth = np.asarray(smooth_dense(raw, closed, sigma), np.float64)
+    probe = smooth_dense(raw, closed, CORNER_PROBE_SIGMA * scale)
+    window = samples_at_scale(CORNER_PROBE_WINDOW, scale)
+    strong = find_corners(probe, closed, STRONG_CORNER_DEG, window)
     if not closed:
         strong = strong[1:-1]  # open-curve ends are reported as corners; they are handled below
-    keep = _usable(n, strong, closed)
-    if keep.sum() < MIN_NOISE_SAMPLES:
+    keep = _usable(n, strong, closed, scale)
+    if keep.sum() < min_samples:
         return NOISE_FLOOR_PX
     resid = np.einsum("ij,ij->i", arr - smooth, _normals(smooth, closed))[keep]
     spread = _MAD_TO_STD * float(np.median(np.abs(resid - np.median(resid))))
-    return max(NOISE_FLOOR_PX, spread / _residual_scale(NOISE_SMOOTH_SIGMA))
+    return max(NOISE_FLOOR_PX, spread / _residual_scale(sigma))

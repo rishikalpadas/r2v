@@ -63,6 +63,7 @@ def _snap_corners(
     """
     out = list(dense)
     n = len(dense)
+    side = samples_at_scale(SNAP_SIDE, scale)
     for c in corners:
         x, y = dense[c]
         best = min(original, key=lambda p: (p[0] - x) ** 2 + (p[1] - y) ** 2)
@@ -70,8 +71,8 @@ def _snap_corners(
             continue
         if outward_of is not None:
             raw, closed = outward_of
-            a, b = ((c - SNAP_SIDE) % n, (c + SNAP_SIDE) % n) if closed else (
-                max(0, c - SNAP_SIDE), min(n - 1, c + SNAP_SIDE))
+            a, b = ((c - side) % n, (c + side) % n) if closed else (
+                max(0, c - side), min(n - 1, c + side))
             ends = np.asarray(raw[a], np.float64), np.asarray(raw[b], np.float64)
             if _inward(best, np.asarray(raw[c], np.float64), *ends):
                 continue
@@ -193,7 +194,8 @@ def place_corners(
     no usable intersection, it is grid-snapped by `_snap_corners` exactly as without sub-pixel
     input (leaving the smoothed sample would keep the corner rounded in). Each entry of `lines`
     is tried in turn until one gives an intersection. With `outward_snap` a grid vertex inside
-    the raw corner sample is refused (see `_snap_corners`).
+    the raw corner sample is refused (see `_snap_corners`). Lengths and sample counts are
+    converted at `scale`.
     """
     raw, plain = samples
     order = list(all_corners)
@@ -201,7 +203,8 @@ def place_corners(
     for c in corners:
         neighbours = corner_neighbours(order, order.index(c), len(dense), closed)
         for side_lines in lines:
-            reach = samples_at_scale(side_lines.gap, scale) + samples_at_scale(side_lines.samples, scale)
+            reach = samples_at_scale(side_lines.gap, scale) + samples_at_scale(
+                side_lines.samples, scale)
             if not _has_subpixel_samples(raw, plain, c, closed, reach):
                 continue
             hit = _subpixel_corner(dense, raw, c, neighbours, scale, side_lines)
@@ -209,7 +212,8 @@ def place_corners(
                 hits[c] = hit
                 break
     snapped = [c for c in corners if c not in hits]
-    out = _snap_corners(dense, snapped, original, scale, (raw, closed) if outward_snap else None)
+    outward = (raw, closed) if outward_snap else None
+    out = _snap_corners(dense, snapped, original, scale, outward)
     for c, hit in hits.items():
         out[c] = hit
     return out

@@ -15,6 +15,8 @@ the jitter. Here every step is scaled to the curve's own measured noise (`estima
 6. joins that are not corners (the splits of a corner-free ring) are made G1.
 
 All lengths are processing pixels; one dense sample is one processing pixel of boundary.
+Every sample count below is at scale 1 (one sample per original-image pixel) and is converted
+with `samples_at_scale`, so it keeps covering the same original-pixel length on enhanced input.
 """
 from __future__ import annotations
 
@@ -33,8 +35,10 @@ from engine.geometry.corner_placement import (
     place_corners,
 )
 from engine.geometry.corners import (
+    TRACK_RADIUS,
     even_breaks,
     find_corners_multiscale,
+    samples_at_scale,
     smooth_between,
     smooth_dense,
 )
@@ -89,11 +93,16 @@ class _Curve:
     judge: FitParams  # params with a noise-limited tolerance, for comparing alternative fits
     noise: float
     subpixel: bool = False  # samples were moved off the crack grid (anti-aliased input)
+    scale: float = 1.0  # processing scale: sample counts are converted with it
+
+    def count(self, samples: int) -> int:
+        """A sample count at scale 1 as the count covering the same length here."""
+        return samples_at_scale(samples, self.scale)
 
     @property
     def tangent_samples(self) -> int:
         """Bezier end tangents are read over this many samples (see END_TANGENT_SAMPLES)."""
-        return END_TANGENT_SAMPLES if self.subpixel else 1
+        return self.count(END_TANGENT_SAMPLES) if self.subpixel else 1
 
 
 def _fit(curve: _Curve, points: Sequence[Point], params: FitParams) -> tuple[Segment, ...]:
@@ -163,8 +172,9 @@ def _try_merge(curve: _Curve, state: _Merge, k: int) -> _Merge:
     corners = state.corners
     c = corners[k]
     a, b = corner_neighbours(corners, k, n, curve.closed)
-    lo, hi = max(a, c - JUDGE_REACH), min(b, c + JUDGE_REACH)
-    if min(c - lo, hi - c) < MIN_JUDGE_SAMPLES:
+    reach = curve.count(JUDGE_REACH)
+    lo, hi = max(a, c - reach), min(b, c + reach)
+    if min(c - lo, hi - c) < curve.count(MIN_JUDGE_SAMPLES):
         return state
     if not _corner_is_fake(curve, state.pinned, c, lo, hi):
         return state
@@ -179,7 +189,7 @@ def _try_merge(curve: _Curve, state: _Merge, k: int) -> _Merge:
         seq[i % n] = p
     inner = left if curve.closed else left[1:-1]
     ends = [i for i in {a % n, b % n} if i in inner]
-    seq = collapse_behind(seq, ends, left, curve.closed, BEHIND_REACH)
+    seq = collapse_behind(seq, ends, left, curve.closed, curve.count(BEHIND_REACH))
     return _Merge(tuple(pinned), tuple(seq), left)
 
 
@@ -197,8 +207,9 @@ def _merge_spans(curve: _Curve, state: _Merge, angles: dict[int, float]) -> _Mer
 
 def _side_line(curve: _Curve, a: int, b: int) -> np.ndarray | None:
     """Raw samples of run a..b without the corner-blended ones at its ends, if enough remain."""
-    side = _run(curve.raw, a + LINE_CORNER_TRIM, b - LINE_CORNER_TRIM)
-    return np.asarray(side, np.float64) if len(side) >= MIN_LINE_SIDE_SAMPLES else None
+    trim = curve.count(LINE_CORNER_TRIM)
+    side = _run(curve.raw, a + trim, b - trim)
+    return np.asarray(side, np.float64) if len(side) >= curve.count(MIN_LINE_SIDE_SAMPLES) else None
 
 
 def _sharpen_line_corners(
@@ -275,14 +286,13 @@ def _cornerless(curve: _Curve, spans: int) -> tuple[tuple[Segment, ...], list[in
     return tuple(chain), joins
 
 
-def _clear_of_ends(corners: Sequence[int], n: int, closed: bool) -> list[int]:
-    """Corners without the inner ones within JUNCTION_GRID_SAMPLES of an open curve's ends.
+def _clear_of_ends(corners: Sequence[int], n: int, closed: bool, k: int) -> list[int]:
+    """Corners without the inner ones within `k` samples of an open curve's ends.
 
     The junction is already a vertex; a corner right next to it only adds a sliver or hairpin.
     """
     if closed:
         return list(corners)
-    k = JUNCTION_GRID_SAMPLES
     return [i for i in corners if i in (0, n - 1) or k <= i <= n - 1 - k]
 
 
@@ -297,7 +307,7 @@ def _place(
         inner, corners, (curve.raw, plain), original, curve.closed, scale, SIDE_LINES,
         outward_snap=curve.subpixel,
     )
-    return collapse_behind(seq, inner, corners, curve.closed, BEHIND_REACH)
+    return collapse_behind(seq, inner, corners, curve.closed, curve.count(BEHIND_REACH))
 
 
 def _placed(
@@ -324,12 +334,12 @@ def _placed(
 
 
 def _grid_near_junctions(
-    raw: tuple[Point, ...], plain: tuple[Point, ...], closed: bool
+    raw: tuple[Point, ...], plain: tuple[Point, ...], closed: bool, k: int
 ) -> tuple[Point, ...]:
-    """`raw` with the samples within JUNCTION_GRID_SAMPLES of an open curve's ends on the grid."""
+    """`raw` with the samples within `k` of an open curve's ends on the crack grid."""
     if closed:
         return raw
-    n, k = len(raw), JUNCTION_GRID_SAMPLES
+    n = len(raw)
     return tuple(plain[i] if i < k or i >= n - k else p for i, p in enumerate(raw))
 
 
@@ -355,19 +365,22 @@ def fit_curve_adaptive(
     without sub-pixel input). `params` are in processing pixels. Open-curve end points (shared
     junctions) are kept exactly; a closed chain starts at a corner and closes exactly.
     """
+    junction = samples_at_scale(JUNCTION_GRID_SAMPLES, scale)
     plain = tuple(samples[1])
-    raw = _grid_near_junctions(tuple(samples[0]), plain, curve.closed)
+    raw = _grid_near_junctions(tuple(samples[0]), plain, curve.closed, junction)
     closed, n = curve.closed, len(raw)
-    noise = estimate_noise(raw, closed)
+    noise = estimate_noise(raw, closed, scale)
     adapted = _adapt(params, noise)
     judge = replace(adapted, tolerance_px=TOL_PER_NOISE * noise)
-    c = _Curve(raw, closed, adapted, judge, noise, subpixel=raw != plain)
+    c = _Curve(raw, closed, adapted, judge, noise, subpixel=raw != plain, scale=scale)
     coarse = max(COARSE_PER_SIGMA * params.smooth_sigma, COARSE_PER_NOISE * noise)
     found = find_corners_multiscale(
-        raw, closed, params.corner_angle_deg, params.smooth_sigma, coarse, corner_window
+        raw, closed, params.corner_angle_deg, params.smooth_sigma, coarse,
+        c.count(corner_window), c.count(TRACK_RADIUS),
     )
     angles = dict(zip(found.indices, found.coarse_angles))
-    seq, corners = _placed(c, plain, curve.points, _clear_of_ends(found.indices, n, closed), scale)
+    clear = _clear_of_ends(found.indices, n, closed, junction)
+    seq, corners = _placed(c, plain, curve.points, clear, scale)
     inner = set(corners if closed else corners[1:-1])
     pinned = tuple(seq[i] if i in inner else p for i, p in enumerate(raw))
     merged = _merge_spans(c, _Merge(pinned, tuple(seq), tuple(corners)), angles)

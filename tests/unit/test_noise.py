@@ -51,3 +51,18 @@ def test_clean_edges_estimate_the_floor():
 def test_short_curves_estimate_the_floor():
     assert estimate_noise(_line(n=10, sigma=1.0), False) == NOISE_FLOOR_PX
     assert estimate_noise((), True) == NOISE_FLOOR_PX
+
+
+def test_sample_counts_scale_with_processing_scale():
+    # 24 samples: enough at scale 1 (MIN_NOISE_SAMPLES 16), fewer than the 32 needed at scale 2.
+    line = _line(n=24, sigma=1.0)
+    assert estimate_noise(line, False) > NOISE_FLOOR_PX
+    assert estimate_noise(line, False, scale=2.0) == NOISE_FLOOR_PX
+
+
+@pytest.mark.parametrize("sigma", [0.3, 0.8])
+def test_estimate_at_scale_reads_jitter_of_the_same_original_length(sigma):
+    # A 4x circle at scale 4: the smoothing spans the same original length, so it still
+    # separates jitter from shape.
+    ring = _circle(n=1000, r=160.0, sigma=sigma)
+    assert estimate_noise(ring, True, scale=4.0) == pytest.approx(sigma, rel=0.3)

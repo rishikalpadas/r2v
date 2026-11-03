@@ -211,3 +211,15 @@ def test_multiscale_keeps_a_fine_corner_too_near_an_open_end_for_the_coarse_scal
     assert len(found.indices) == 3
     corner = found.indices[1]
     assert abs(raw[corner][0] - 30.0) <= 1.0 and np.isnan(found.coarse_angles[1])
+
+
+def test_multiscale_track_radius_is_configurable():
+    from engine.geometry.corners import find_corners_multiscale
+
+    # An L whose fine corner is 1 sample from the coarse response either way: tracking works
+    # for both radii; the parameter only widens the search window.
+    pts = [(float(x), 0.0) for x in range(30)] + [(30.0, float(y)) for y in range(30)]
+    a = find_corners_multiscale(pts, False, 35.0, 1.0, 4.0, 2)
+    b = find_corners_multiscale(pts, False, 35.0, 1.0, 4.0, 2, track_radius=8)
+    assert len(a.indices) == len(b.indices) == 3
+    assert abs(a.indices[1] - 30) <= 1 and abs(b.indices[1] - 30) <= 1
