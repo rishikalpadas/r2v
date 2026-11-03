@@ -211,7 +211,9 @@ LEGACY_SCENES = {
     "aa_disc": aa_disc,
 }
 # Fingerprints of `fit_geometry(..., FitParams())` before adaptive fitting existed (master 2f293c9,
-# i.e. with fix-3 segmentation; flat_shapes are unchanged from d1f3181).
+# i.e. with fix-3 segmentation; flat_shapes are unchanged from d1f3181). flat_shapes_6 and _9
+# re-recorded on the M4 rebase: 2f293c9 itself gives these values in the current environment
+# (the old ones fail on the unrebased branch too); M4 7e959c6 gives the same.
 LEGACY_FINGERPRINTS = {
     "flat_shapes_0": "c319cabe2c17ef50",
     "flat_shapes_1": "f4f6a10d441d486b",
@@ -219,10 +221,10 @@ LEGACY_FINGERPRINTS = {
     "flat_shapes_3": "666bae0d9c254367",
     "flat_shapes_4": "e9bae56143436573",
     "flat_shapes_5": "ddc75123d21722c8",
-    "flat_shapes_6": "3bb1827fdd870ac0",
+    "flat_shapes_6": "2342b7aee5c31f45",
     "flat_shapes_7": "92f6b40b56d2b81f",
     "flat_shapes_8": "5c1291687cf08695",
-    "flat_shapes_9": "38e3018e7ef2de6b",
+    "flat_shapes_9": "becda307d3d6ddda",
     "aa_shapes_0": "746534025274d358",
     "aa_shapes_1": "566cd5310ac89655",
     "aa_shapes_2": "16f14b497adb4022",

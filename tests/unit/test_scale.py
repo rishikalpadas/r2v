@@ -187,7 +187,8 @@ def test_corner_window_covers_the_same_original_length(monkeypatch, scale):
         return corners.find_corners(points, closed, angle_deg, window)
 
     monkeypatch.setattr("engine.stages.fit_geometry.find_corners", spy)
-    fit_geometry(_closed_square_graph(round(20 * scale)), FitParams(), scale=scale)
+    graph = _closed_square_graph(round(20 * scale))
+    fit_geometry(graph, FitParams(adaptive=False), scale=scale)  # the fixed fit's find_corners
     assert seen == [round(CORNER_WINDOW * scale)]
 
 

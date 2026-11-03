@@ -204,7 +204,8 @@ def test_missing_weights_fall_back_deterministically():
     assert out.pixels.shape == (128, 128, 4)
 
 
-# Pre-M4 digests: sha256(to_svg(vectorize(to_png_bytes(px)).doc)) on the code before Task 4.
+# Pre-M4 digests: sha256(to_svg(vectorize(to_png_bytes(px)).doc)) on the code before Task 4,
+# whose fit is today's `fit.adaptive=False`.
 PRE_M4 = [
     (lambda: flat_shapes(0), "dfbd4f6332566d6ff0af6499ba4a570b6bb1fc228dd0d24d89cfb610b4ba7830"),
     (lambda: aa_shapes(0, 256, 4), "c971f9d6bd5d9e940c2d791d9ab9d7bc2c7649959a4c23ec3f9dbb440a9f0269"),
@@ -213,7 +214,7 @@ PRE_M4 = [
 
 @pytest.mark.parametrize("make, digest", PRE_M4, ids=["flat_shapes0", "aa_shapes0"])
 def test_enhance_disabled_is_m3_identical(make, digest):
-    svg = to_svg(vectorize(to_png_bytes(make()), overrides={"enhance.enabled": False}).doc)
+    svg = to_svg(vectorize(to_png_bytes(make()), overrides={"enhance.enabled": False, "fit.adaptive": False}).doc)
     assert hashlib.sha256(svg.encode()).hexdigest() == digest
 
 

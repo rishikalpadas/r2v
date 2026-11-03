@@ -150,28 +150,31 @@ def test_regression_narrow_rects_stay_rects():
 _SCALE = 4
 
 
-def _scaled_pair(pixels: np.ndarray) -> tuple[str, str]:
+def _scaled_pair(pixels: np.ndarray, adaptive: bool = True) -> tuple[str, str]:
     """(scale-1 SVG, SVG of the same image nearest-upscaled 4x and run at scale 4), enhance off."""
     h, w = pixels.shape[:2]
-    preset = apply_overrides(PRESETS["logo"], {"enhance.enabled": False})
+    overrides = {"enhance.enabled": False, "fit.adaptive": adaptive}
+    preset = apply_overrides(PRESETS["logo"], overrides)
     base = to_svg(run_pipeline(RasterImage(pixels, (w, h)), preset).doc)
     up = np.repeat(np.repeat(pixels, _SCALE, axis=0), _SCALE, axis=1)
     scaled = to_svg(run_pipeline(RasterImage(up, (w, h), scale=float(_SCALE)), preset).doc)
     return base, scaled
 
 
+@pytest.mark.parametrize("adaptive", [False, True], ids=["fixed", "adaptive"])
 @pytest.mark.parametrize(
     "pixels",
     [*(flat_shapes(seed) for seed in range(10)), circle()],
     ids=[*(f"flat_shapes_{seed}" for seed in range(10)), "circle"],
 )
-def test_scale4_matches_scale1(pixels):
+def test_scale4_matches_scale1(pixels, adaptive):
     h, w = pixels.shape[:2]
-    base, scaled = _scaled_pair(pixels)
+    base, scaled = _scaled_pair(pixels, adaptive)
     assert ssim(render_svg(base, w, h), render_svg(scaled, w, h)) >= 0.98
     assert count_nodes(scaled)[0] <= 1.3 * count_nodes(base)[0]
 
 
-def test_scale4_circle_stays_primitive():
-    _, scaled = _scaled_pair(circle())
+@pytest.mark.parametrize("adaptive", [False, True], ids=["fixed", "adaptive"])
+def test_scale4_circle_stays_primitive(adaptive):
+    _, scaled = _scaled_pair(circle(), adaptive)
     assert any(el.tag.endswith("circle") for el in ET.fromstring(scaled))
