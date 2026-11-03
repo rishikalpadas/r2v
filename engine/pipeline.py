@@ -9,6 +9,7 @@ from engine.errors import InputError, StageError
 from engine.geometry.subpixel import make_edge_context
 from engine.loader import load_image
 from engine.presets import Preset, apply_overrides, resolve_preset
+from engine.stages.enhance import enhance
 from engine.stages.export import build_doc
 from engine.stages.fit_geometry import fit_geometry
 from engine.stages.segment import segment
@@ -32,12 +33,19 @@ class PipelineState:
     graph: BoundaryGraph | None = None
     fitted: tuple[FittedCurve, ...] | None = None
     doc: VectorDoc | None = None
+    report: Mapping[str, object] | None = None  # the last stage's extra report params
 
 
 def _need(value, what: str, stage: str):
     if value is None:
         raise StageError(stage, f"missing {what}; stage order is invalid")
     return value
+
+
+def _run_enhance(state: PipelineState) -> PipelineState:
+    # segment's max_colors decides exact-colour input, which enhance passes through unchanged
+    image, report = enhance(state.image, state.preset.enhance, state.preset.segment.max_colors)
+    return replace(state, image=image, report=report)
 
 
 def _run_segment(state: PipelineState) -> PipelineState:
@@ -71,6 +79,7 @@ def _run_export(state: PipelineState) -> PipelineState:
 
 # Stage name -> runner. Later tasks swap entries (e.g. "fit").
 STAGES: Mapping[str, Callable[[PipelineState], PipelineState]] = {
+    "enhance": _run_enhance,
     "segment": _run_segment,
     "trace": _run_trace,
     "fit": _run_fit,
@@ -113,13 +122,11 @@ def run_pipeline(image: RasterImage, preset: Preset) -> VectorizeResult:
     for name in preset.stages:
         start = time.perf_counter()
         state = _run_stage(name, state)
+        duration = time.perf_counter() - start
+        params = {**_stage_params(name, preset), **(state.report or {})}
+        state = replace(state, report=None)
         reports.append(
-            StageReport(
-                stage=name,
-                duration_s=time.perf_counter() - start,
-                params=_stage_params(name, preset),
-                debug_images={},
-            )
+            StageReport(stage=name, duration_s=duration, params=params, debug_images={})
         )
     if state.doc is None:
         raise StageError("export", "pipeline produced no document")

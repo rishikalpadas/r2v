@@ -19,7 +19,7 @@ def test_convert_scores_result():
     assert result.svg.startswith("<svg")
     assert result.ssim is not None and result.ssim >= 0.95
     assert result.nodes > 0 and result.paths > 0
-    assert set(result.stage_seconds) == {"segment", "trace", "fit", "export"}
+    assert set(result.stage_seconds) == {"enhance", "segment", "trace", "fit", "export"}
 
 
 def test_cli_writes_svg(tmp_path, capsys):

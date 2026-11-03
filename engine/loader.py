@@ -44,6 +44,7 @@ def load_image(data: bytes | bytearray | memoryview) -> RasterImage:
                 raise InputError(
                     "unsupported image format; use PNG, JPEG, WebP, BMP, TIFF or GIF"
                 )
+            source_format = img.format
             width, height = img.size
             if max(width, height) > MAX_SIDE:
                 raise InputError(
@@ -55,4 +56,4 @@ def load_image(data: bytes | bytearray | memoryview) -> RasterImage:
         raise
     except Exception as exc:  # Pillow raises many types; never leak details
         raise InputError(_DECODE_MSG) from exc
-    return RasterImage(pixels=pixels, original_size=(width, height))
+    return RasterImage(pixels=pixels, original_size=(width, height), source_format=source_format)

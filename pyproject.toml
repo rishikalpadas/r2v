@@ -18,10 +18,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov", "hypothesis", "vtracer"]
+gpu = ["torch", "spandrel"]
 
 [tool.setuptools.packages.find]
 include = ["engine*", "eval*", "app*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["slow: takes more than a few seconds (large-image performance checks)"]
+markers = [
+    "slow: takes more than a few seconds (large-image performance checks)",
+    "gpu: needs a CUDA GPU (skipped when torch.cuda.is_available() is false)",
+]

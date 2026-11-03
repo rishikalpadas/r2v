@@ -48,7 +48,9 @@ def test_reports_per_stage():
     result = vectorize(to_png_bytes(circle()))
     assert [r.stage for r in result.reports] == list(PRESETS["logo"].stages)
     assert all(r.duration_s >= 0 for r in result.reports)
-    assert result.reports[0].params["max_colors"] == 16
+    by_stage = {r.stage: r.params for r in result.reports}
+    assert by_stage["segment"]["max_colors"] == 16
+    assert by_stage["enhance"]["scale"] == 4
 
 
 def test_auto_equals_logo():

@@ -6,6 +6,9 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from engine import to_svg, vectorize
+from engine.pipeline import run_pipeline
+from engine.presets import PRESETS, apply_overrides
+from engine.types import RasterImage
 from eval.metrics import alpha_agreement, count_nodes, mean_delta_e, render_svg, ssim
 from eval.synthetic import circle, flat_shapes, solid, to_png_bytes, transparent_logo
 
@@ -136,3 +139,39 @@ def test_regression_narrow_rects_stay_rects():
     pixels[12:51, 11:15] = (*_COLORS[1], 255)
     _, render = _roundtrip(pixels)
     assert ssim(pixels, render) >= 0.95
+
+
+# ---------------------------------------------------------------- processing scale 4
+# Measured at commit de88906: worst SSIM 0.9825 (flat_shapes_4), worst node ratio 1.24
+# (flat_shapes_7, 25 -> 31). Scaling complexity_weight with scale (x scale, scale^2, scale^3)
+# was measured too: it widens these margins (ratio <= 1.05) but cost fidelity on enhanced
+# input (scale^3: degraded SSIM -0.004..-0.006), so the weight stays unscaled.
+
+_SCALE = 4
+
+
+def _scaled_pair(pixels: np.ndarray) -> tuple[str, str]:
+    """(scale-1 SVG, SVG of the same image nearest-upscaled 4x and run at scale 4), enhance off."""
+    h, w = pixels.shape[:2]
+    preset = apply_overrides(PRESETS["logo"], {"enhance.enabled": False})
+    base = to_svg(run_pipeline(RasterImage(pixels, (w, h)), preset).doc)
+    up = np.repeat(np.repeat(pixels, _SCALE, axis=0), _SCALE, axis=1)
+    scaled = to_svg(run_pipeline(RasterImage(up, (w, h), scale=float(_SCALE)), preset).doc)
+    return base, scaled
+
+
+@pytest.mark.parametrize(
+    "pixels",
+    [*(flat_shapes(seed) for seed in range(10)), circle()],
+    ids=[*(f"flat_shapes_{seed}" for seed in range(10)), "circle"],
+)
+def test_scale4_matches_scale1(pixels):
+    h, w = pixels.shape[:2]
+    base, scaled = _scaled_pair(pixels)
+    assert ssim(render_svg(base, w, h), render_svg(scaled, w, h)) >= 0.98
+    assert count_nodes(scaled)[0] <= 1.3 * count_nodes(base)[0]
+
+
+def test_scale4_circle_stays_primitive():
+    _, scaled = _scaled_pair(circle())
+    assert any(el.tag.endswith("circle") for el in ET.fromstring(scaled))

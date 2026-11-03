@@ -7,7 +7,7 @@ from dataclasses import replace
 
 import numpy as np
 
-from engine.geometry.corners import dense_samples, find_corners, smooth_dense
+from engine.geometry.corners import dense_samples, find_corners, samples_at_scale, smooth_dense
 from engine.geometry.primitives import detect_primitive
 from engine.geometry.segment_fit import fit_span, snap_axis
 from engine.geometry.subpixel import EdgeContext, subpixel_dense
@@ -21,13 +21,16 @@ _COLLINEAR_EPS = 1e-9
 MIN_CLOSED_LENGTH_PX = 12.0
 MIN_OPEN_LENGTH_PX = 4.0
 CORNER_SNAP_PX = 1.5  # a corner moves to the nearest original vertex within this distance
-CORNER_WINDOW = 2  # find_corners window: 3 merges the two corners of a 4 px wide end
-CORNERLESS_SPANS = 4  # a closed curve without corners is split into this many spans
+# Sample counts below are dense samples at scale 1 (one per original-image pixel); at a larger
+# processing scale there is one sample per processing pixel, so they are converted with
+# `samples_at_scale` where used and keep covering the same original-pixel length.
+CORNER_WINDOW = 2  # samples; find_corners window: 3 merges the two corners of a 4 px wide end
+CORNERLESS_SPANS = 4  # a closed curve without corners is split into this many spans (unscaled)
 # Sub-pixel corners: a corner goes where lines fitted to the sub-pixel samples on its two sides
 # meet. Samples right next to the corner are skipped: their pixels blend both sides.
 CORNER_LINE_SAMPLES = 4  # samples per side for each line fit
 CORNER_LINE_GAP = 1  # samples skipped on each side of the corner index
-MIN_CORNER_LINE_SAMPLES = 2
+MIN_CORNER_LINE_SAMPLES = 2  # samples
 MIN_CORNER_LINE_ANGLE_DEG = 20.0  # flatter corners make the intersection ill-conditioned
 
 
@@ -139,10 +142,11 @@ def _subpixel_corner(
     """
     n = len(raw)
     prev, nxt = neighbours
-    reach = CORNER_LINE_GAP + CORNER_LINE_SAMPLES
-    before = range(max(prev + 1, c - reach), c - CORNER_LINE_GAP)
-    after = range(c + CORNER_LINE_GAP + 1, min(nxt, c + reach + 1))
-    if min(len(before), len(after)) < MIN_CORNER_LINE_SAMPLES:
+    gap = samples_at_scale(CORNER_LINE_GAP, scale)
+    reach = gap + samples_at_scale(CORNER_LINE_SAMPLES, scale)
+    before = range(max(prev + 1, c - reach), c - gap)
+    after = range(c + gap + 1, min(nxt, c + reach + 1))
+    if min(len(before), len(after)) < samples_at_scale(MIN_CORNER_LINE_SAMPLES, scale):
         return None
     side_a = np.asarray([raw[i % n] for i in before], np.float64)
     side_b = np.asarray([raw[i % n] for i in after], np.float64)
@@ -157,11 +161,11 @@ def _subpixel_corner(
 
 
 def _has_subpixel_samples(
-    raw: Sequence[Point], plain: Sequence[Point], c: int, closed: bool
+    raw: Sequence[Point], plain: Sequence[Point], c: int, closed: bool, scale: float
 ) -> bool:
     """True when any raw sample within reach of corner `c` was moved off the crack grid."""
     n = len(raw)
-    reach = CORNER_LINE_GAP + CORNER_LINE_SAMPLES
+    reach = samples_at_scale(CORNER_LINE_GAP, scale) + samples_at_scale(CORNER_LINE_SAMPLES, scale)
     window = range(c - reach, c + reach + 1)
     if closed:
         return any(raw[i % n] != plain[i % n] for i in window)
@@ -188,7 +192,7 @@ def _place_corners(
     order = list(all_corners)
     hits: dict[int, Point] = {}
     for c in corners:
-        if not _has_subpixel_samples(raw, plain, c, closed):
+        if not _has_subpixel_samples(raw, plain, c, closed, scale):
             continue
         neighbours = _corner_neighbours(order, order.index(c), len(dense), closed)
         hit = _subpixel_corner(dense, raw, c, neighbours, scale)
@@ -224,7 +228,8 @@ def _fit_open(
     curve: BoundaryCurve, params: FitParams, scale: float, context: EdgeContext | None
 ) -> FittedCurve:
     dense, samples = _samples(curve, params.smooth_sigma, context)
-    corners = find_corners(dense, closed=False, angle_deg=params.corner_angle_deg, window=CORNER_WINDOW)
+    window = samples_at_scale(CORNER_WINDOW, scale)
+    corners = find_corners(dense, closed=False, angle_deg=params.corner_angle_deg, window=window)
     inner = corners[1:-1]  # the end points are already the exact junctions
     snapped = _place_corners(dense, inner, corners, samples, curve.points, False, scale)
     return FittedCurve(curve.id, _fit_spans(snapped, corners, params), primitive=None)
@@ -235,7 +240,8 @@ def _fit_closed(
 ) -> FittedCurve:
     ring, samples = _samples(curve, params.smooth_sigma, context)
     n = len(ring)
-    corners = find_corners(ring, closed=True, angle_deg=params.corner_angle_deg, window=CORNER_WINDOW)
+    window = samples_at_scale(CORNER_WINDOW, scale)
+    corners = find_corners(ring, closed=True, angle_deg=params.corner_angle_deg, window=window)
     start = corners[0] if corners else 0
     # Rotate so the chain starts (and, by repeating the start sample, ends) at a corner.
     snapped = _place_corners(ring, corners, corners, samples, curve.points, True, scale)
@@ -287,7 +293,9 @@ def fit_geometry(
     corners are placed from them; otherwise samples stay on the crack grid.
 
     `graph` is in processing pixels (original pixels x `scale`); every length threshold in
-    `params` and in this module is in original pixels and is converted here.
+    `params` and in this module is in original pixels and is converted here, and every
+    sample-count window is converted with `samples_at_scale`. `params.complexity_weight` is
+    deliberately left unscaled: scaling it by scale**3 cost fidelity on enhanced input.
     """
     if not params.enabled:
         return polyline_fit(graph)

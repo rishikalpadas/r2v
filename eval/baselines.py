@@ -19,14 +19,21 @@ SUBPROCESS_TIMEOUT_S = 60
 POTRACE_THRESHOLD = 128
 
 
-def run_ours(path: Path) -> str | None:
+def run_ours(path: Path, overrides: dict | None = None) -> str | None:
     try:
         from engine import to_svg, vectorize
     except ModuleNotFoundError as exc:
         if exc.name != "engine":  # a broken engine is an error; only a missing one is a skip
             raise
         raise NotImplementedError("engine is not installed") from exc
+    if overrides:
+        return to_svg(vectorize(path.read_bytes(), overrides=overrides).doc)
     return to_svg(vectorize(path.read_bytes()).doc)
+
+
+def run_ours_noenhance(path: Path) -> str | None:
+    """`ours` with the Enhance stage switched off, for enhance on/off comparisons."""
+    return run_ours(path, overrides={"enhance.enabled": False})
 
 
 def run_vtracer(path: Path) -> str | None:
@@ -64,6 +71,7 @@ def run_reference(path: Path) -> str | None:
 
 RUNNERS: dict[str, Runner] = {
     "ours": run_ours,
+    "ours_noenhance": run_ours_noenhance,
     "vtracer": run_vtracer,
     "potrace": run_potrace,
     "reference": run_reference,

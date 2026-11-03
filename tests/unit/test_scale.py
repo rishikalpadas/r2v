@@ -159,3 +159,60 @@ def test_fit_tolerance_measured_in_original_pixels(monkeypatch):
     graph = _closed_square_graph(10)
     fit_geometry(graph, FitParams(tolerance_px=0.75), scale=2.0)
     assert seen and all(t == pytest.approx(1.5) for t in seen)
+
+
+# ---------------------------------------------------------------- sample-count windows
+
+
+@pytest.mark.parametrize(
+    ("count", "scale", "expected"), [(2, 1.0, 2), (4, 1.0, 4), (2, 4.0, 8), (3, 2.5, 8), (1, 0.25, 1)]
+)
+def test_samples_at_scale(count, scale, expected):
+    from engine.geometry.corners import samples_at_scale
+
+    assert samples_at_scale(count, scale) == expected
+
+
+@pytest.mark.parametrize("scale", [1.0, 4.0])
+def test_corner_window_covers_the_same_original_length(monkeypatch, scale):
+    from engine.geometry import corners
+    from engine.stages.fit_geometry import CORNER_WINDOW
+
+    seen = []
+
+    def spy(points, closed, angle_deg, window):
+        seen.append(window)
+        return corners.find_corners(points, closed, angle_deg, window)
+
+    monkeypatch.setattr("engine.stages.fit_geometry.find_corners", spy)
+    fit_geometry(_closed_square_graph(round(20 * scale)), FitParams(), scale=scale)
+    assert seen == [round(CORNER_WINDOW * scale)]
+
+
+def test_square_corners_found_at_scale4():
+    # 40 px square at scale 4: sigma 4 spreads each turn over ~16 samples, so a 2-sample
+    # window saw only a fraction of it. Four line sides need all four corners.
+    (fitted,) = fit_geometry(_closed_square_graph(160), FitParams(), scale=4.0)
+    assert len(fitted.segments) == 4 and all(isinstance(s, Line) for s in fitted.segments)
+
+
+def test_subpixel_corner_side_samples_scale():
+    from engine.stages.fit_geometry import _subpixel_corner
+
+    # Two samples on each side past the gap: enough at scale 1, too few at scale 2.
+    raw = [(x + 0.5, 0.2) for x in range(4)] + [(4.2, y + 0.5) for y in range(4)]
+    assert _subpixel_corner(raw, raw, 4, (-1, 8), 1.0) == pytest.approx((4.2, 0.2))
+    assert _subpixel_corner(raw, raw, 4, (-1, 8), 2.0) is None
+
+
+def test_primitive_side_trim_scales():
+    from engine.geometry.primitives import CORNER_TRIM, _sides
+
+    arr = np.column_stack([np.arange(40.0), np.zeros(40)])
+    (side_1,) = _sides(arr, (0,), 1.0)
+    (side_2,) = _sides(arr, (0,), 2.0)
+    assert len(side_1) == 41 - 2 * CORNER_TRIM
+    assert len(side_2) == 41 - 4 * CORNER_TRIM
+    # 21 samples: 5 left after trimming 8 per end, fewer than MIN_SIDE_POINTS x 2 = 6.
+    assert _sides(arr[:20], (0,), 1.0) is not None
+    assert _sides(arr[:20], (0,), 2.0) is None

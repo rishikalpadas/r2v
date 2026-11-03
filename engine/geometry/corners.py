@@ -27,6 +27,17 @@ from engine.types import Point
 _MIN_CLOSED_POINTS = 3
 
 
+def samples_at_scale(count: int, scale: float) -> int:
+    """A count of dense samples at scale 1 as the count covering the same length at `scale`.
+
+    Dense samples are one per processing pixel, so a window of `count` samples spans `count`
+    original pixels only when multiplied by the processing scale. Exactly `count` at scale 1.
+    Pipeline scales are integers (enhance factors 1-4), so the product is exact; for other
+    scales a half-integer product rounds half to even (Python `round`), e.g. 2.5 -> 2.
+    """
+    return max(1, round(count * scale))
+
+
 def unit_pieces(a: Point, b: Point) -> int:
     """Number of unit-length pieces segment a->b is resampled into (at least one)."""
     return max(1, round(math.hypot(b[0] - a[0], b[1] - a[1])))
