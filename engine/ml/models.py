@@ -29,6 +29,8 @@ def _load_descriptor(path: Path) -> Any:
     return spandrel.ModelLoader().load_from_state_dict(state_dict)  # canonicalizes the dict
 
 
+# Defence in depth: spandrel 0.4.2's ImageModelDescriptor.__call__ pads and crops too, but
+# we do not rely on it (other descriptor versions or wrappers may not).
 def _pad(torch: Any, t: Any, pad_w: int, pad_h: int) -> Any:
     """Pad right/bottom: reflect where possible (needs size - 1 >= pad), replicate the rest."""
     h, w = t.shape[-2:]
@@ -53,20 +55,32 @@ def _validate(rgb: Any) -> None:
         raise ValueError(f"rgb must be float32 in 0..1, got dtype {rgb.dtype}")
 
 
-@functools.lru_cache(maxsize=None)
+def _normalize_device(device: str) -> str:
+    return "cuda" if device == "cuda:0" else device
+
+
 def load_model(name: str, device: str) -> ModelFn:
-    """Load the manifest weight `name` onto `device` ("cuda" or "cpu"), cached per (name, device).
+    """Load the manifest weight `name` onto `device`, cached per (name, device).
+
+    Pass `pick_device()` output ("cuda" or "cpu"); "cuda:0" is treated as "cuda" so both
+    share one cache entry. `load_model.cache_clear()` empties the cache.
 
     Returns fn(rgb) -> rgb: HxWx3 float32 0..1 in, (H*scale)x(W*scale)x3 float32 0..1 out
     (a CPU numpy array). `fn.scale` is the model's upscale factor (4 for SR, 1 for
-    restoration). Inputs below the model's size requirements are padded (reflect, then
-    replicate) and the output cropped back. Runs fp16 on CUDA when the architecture
-    supports it, fp32 otherwise. GPU out-of-memory errors propagate unchanged so
+    restoration); `fn.tiling` is spandrel's tiling hint as a string ("SUPPORTED",
+    "DISCOURAGED" or "INTERNAL"). Inputs below the model's size requirements are padded
+    (reflect, then replicate) and the output cropped back. Runs fp16 on CUDA when the
+    architecture supports it, fp32 otherwise. GPU out-of-memory errors propagate unchanged so
     run_tiled can back off.
 
     Raises KeyError for an unknown name, FileNotFoundError when the weight is missing and
     ValueError when its sha256 does not match the manifest. Failures are not cached.
     """
+    return _load_cached(name, _normalize_device(device))
+
+
+@functools.lru_cache(maxsize=None)
+def _load_cached(name: str, device: str) -> ModelFn:
     path = weights.weight_path(name)
     if not path.is_file():
         raise FileNotFoundError(f"weight {name!r} not found at {path}; run: {_fetch_hint(name)}")
@@ -91,15 +105,21 @@ def load_model(name: str, device: str) -> ModelFn:
 
     def run(rgb: np.ndarray) -> np.ndarray:
         _validate(rgb)
+        if not rgb.flags.writeable:
+            rgb = rgb.copy()  # torch.from_numpy warns on read-only arrays
         h, w = rgb.shape[:2]
         with torch.inference_mode():
             t = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).unsqueeze(0)
             t = t.to(device=device, dtype=dtype)
             t = _pad(torch, t, _padding(w, minimum, multiple_of), _padding(h, minimum, multiple_of))
             out = descriptor(t)
-            out = out[..., : h * scale, : w * scale].clamp(0, 1)
+            out = out[..., : h * scale, : w * scale].clamp(0, 1)  # crop guard: drop our padding
             arr = out.squeeze(0).permute(1, 2, 0).float().cpu().numpy()
         return np.ascontiguousarray(arr, dtype=np.float32)
 
     run.scale = scale  # type: ignore[attr-defined]
+    run.tiling = descriptor.tiling.name  # type: ignore[attr-defined]
     return run
+
+
+load_model.cache_clear = _load_cached.cache_clear  # type: ignore[attr-defined]

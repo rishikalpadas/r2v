@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 import textwrap
+import types
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +32,7 @@ class _FakeDescriptor:
         self.scale = scale
         self.supports_half = supports_half
         self.size_requirements = _Req(minimum, multiple_of)
+        self.tiling = types.SimpleNamespace(name="DISCOURAGED")
         self.model = torch.nn.Upsample(scale_factor=scale, mode="nearest")
         self.overshoot = overshoot
         self.inputs = []
@@ -140,6 +143,7 @@ def test_wrapper_shapes(fake_file, monkeypatch):
     fn = models.load_model("fake", "cpu")
     assert loaded == [fake_file]
     assert fn.scale == 4
+    assert fn.tiling == "DISCOURAGED"
     out = fn(_rand(9, 13))
     assert isinstance(out, np.ndarray)
     assert out.shape == (36, 52, 3)
@@ -216,6 +220,32 @@ def test_cache_returns_same_object(fake_file, monkeypatch):
     assert len(loaded) == 1
 
 
+def test_cuda0_shares_cache_entry_with_cuda(fake_file, monkeypatch):
+    loaded = _patch_loader(monkeypatch, _FakeDescriptor())
+    assert models.load_model("fake", "cuda:0") is models.load_model("fake", "cuda")
+    assert models.load_model("fake", "cpu") is not models.load_model("fake", "cuda")
+    assert len(loaded) == 2
+
+
+def test_cache_clear_reloads(fake_file, monkeypatch):
+    loaded = _patch_loader(monkeypatch, _FakeDescriptor())
+    a = models.load_model("fake", "cpu")
+    models.load_model.cache_clear()
+    assert models.load_model("fake", "cpu") is not a
+    assert len(loaded) == 2
+
+
+def test_read_only_input_no_warning(fake_file, monkeypatch):
+    _patch_loader(monkeypatch, _FakeDescriptor(scale=1))
+    fn = models.load_model("fake", "cpu")
+    rgb = _rand(6, 5)
+    rgb.setflags(write=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = fn(rgb)
+    np.testing.assert_allclose(out, rgb, atol=1e-6)
+
+
 @pytest.mark.parametrize(
     "bad",
     [
@@ -264,6 +294,23 @@ def test_load_descriptor_uses_weights_only(tmp_path, monkeypatch):
     with pytest.raises(Exception):  # spandrel: unsupported architecture
         models._load_descriptor(path)
     assert seen.get("weights_only") is True
+
+
+def test_load_descriptor_unwraps_params_ema(tmp_path):
+    """Real-ESRGAN checkpoints nest weights under "params_ema"; load_from_state_dict canonicalizes."""
+    pytest.importorskip("spandrel")
+    from spandrel.architectures.ESRGAN.__arch.RRDB import RRDBNet
+
+    torch.manual_seed(0)
+    net = RRDBNet(num_filters=8, num_blocks=1, scale=4)
+    path = tmp_path / "tiny_esrgan.pth"
+    torch.save({"params_ema": net.state_dict()}, path)
+    desc = models._load_descriptor(path)
+    assert desc.architecture.name == "ESRGAN"
+    assert desc.scale == 4
+    x = torch.rand(1, 3, 6, 5)
+    with torch.inference_mode():
+        assert desc(x).shape == (1, 3, 24, 20)
 
 
 def _run_python(code):
