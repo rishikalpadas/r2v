@@ -532,7 +532,11 @@ def test_fill_corner_never_crosses_a_thin_outline(wedge, scale, monkeypatch):
 # scenes have no crossings, so the guard must leave their output byte-identical.
 NO_CROSSING_DIGESTS = [
     ("aa_shapes(0)", 2, "c87c4281c46b4c14"),
-    ("aa_shapes(3)", 4, "9d99fc179c8b42a6"),
+    # Re-recorded for Q2 (segment_regions): the anti-aliasing ribbons along the thin orange and
+    # teal shapes are now split between their two sides instead of staying as 1-px regions;
+    # checked by eye: same shapes, nodes 513 -> 78, the sub-pixel orange tail tip is ~2 px shorter
+    # (SSIM 0.9664 -> 0.9649, edge F1 0.937 -> 0.916). Still a scene without crossings.
+    ("aa_shapes(3)", 4, "d4fd84507df7ef46"),
     ("aa_disc()", 2, "5afe4b735dfc8a81"),
     ("ring_in_ring()", 4, "506a12e1486e5799"),
 ]

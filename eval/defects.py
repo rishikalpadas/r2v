@@ -148,7 +148,10 @@ class CurveGeom:
     `left` is on the left as in `engine.types.BoundaryCurve`. `smooth` is False for curves kept
     as exact pixel polylines (canvas edge, too short). `primitive` is the drawn primitive's
     outline, if export draws one for this curve; `segments_drawn` says whether the fitted
-    segments are drawn too (as another region's loop). `raw` is the crack-grid path."""
+    segments are drawn too (as another region's loop). `raw` is the crack-grid path.
+    `points_px` / `primitive_px` are `points` / `primitive` in processing px, as sampled (not
+    divided by the scale): crossings are tested on them, because dividing by a scale such as 3
+    turns an exact touch (a vertex lying on another curve) into a spurious proper crossing."""
 
     id: int
     points: np.ndarray
@@ -159,6 +162,8 @@ class CurveGeom:
     primitive: np.ndarray | None = None
     raw: np.ndarray | None = None
     segments_drawn: bool = True
+    points_px: np.ndarray | None = None
+    primitive_px: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -283,27 +288,34 @@ def _sorted(score: float, spots: list[Spot]) -> DetectorResult:
 
 
 def detect_crossings(
-    curves: Sequence[CurveGeom], clearance: float = CROSSING_CLEARANCE_PX
+    curves: Sequence[CurveGeom], clearance: float = CROSSING_CLEARANCE_PX, scale: float = 1.0
 ) -> DetectorResult:
     """Proper crossings between the drawn outlines of different curves, ignoring points within
-    `clearance` of a junction both curves end at (`crossing_guard.find_crossings`)."""
+    `clearance` of a junction both curves end at (`crossing_guard.find_crossings`).
+
+    With `scale` and every curve carrying `points_px`, the test runs in processing px (as the
+    engine's guard does) and spots are converted back to original px."""
+    px = scale != 1.0 and all(c.points_px is not None for c in curves)
+    k = scale if px else 1.0
     tracks: list[Track] = []
     ends: dict[int, tuple] = {}
     for c in curves:
+        points = c.points_px if px else c.points
+        primitive = c.primitive_px if px else c.primitive
         if c.segments_drawn:
-            pts = _dedupe(c.points)
+            pts = _dedupe(points)
             if len(pts) >= 2:
                 tracks.append(Track(c.id, FITTED, pts, np.zeros(len(pts) - 1, np.int64)))
-        if c.primitive is not None and len(c.primitive) >= 2:
+        if primitive is not None and len(primitive) >= 2:
             tracks.append(
-                Track(c.id, PRIMITIVE, c.primitive, np.zeros(len(c.primitive) - 1, np.int64))
+                Track(c.id, PRIMITIVE, primitive, np.zeros(len(primitive) - 1, np.int64))
             )
-        if not c.closed and len(c.points):
-            ends[c.id] = (tuple(map(float, c.points[0])), tuple(map(float, c.points[-1])))
-    found = find_crossings(tracks, ends, clearance)
+        if not c.closed and len(points):
+            ends[c.id] = (tuple(map(float, points[0])), tuple(map(float, points[-1])))
+    found = find_crossings(tracks, ends, clearance * k)
     spots = [
-        Spot((x.point[0] - 2, x.point[1] - 2, x.point[0] + 2, x.point[1] + 2), 1.0,
-             f"curves {x.a[0]} x {x.b[0]}")
+        Spot((x.point[0] / k - 2, x.point[1] / k - 2, x.point[0] / k + 2, x.point[1] / k + 2),
+             1.0, f"curves {x.a[0]} x {x.b[0]}")
         for x in found
     ]
     return _sorted(len(found), spots)
@@ -864,22 +876,24 @@ def geometry_from_state(state) -> Geometry:
     curves = []
     for c in state.graph.curves:
         f = fitted[c.id]
-        pts = sample_segments(f.segments, GEOM_SAMPLE_ERROR_PX * scale)[0] / scale
+        pts_px = sample_segments(f.segments, GEOM_SAMPLE_ERROR_PX * scale)[0]
+        pts = pts_px / scale
         raw = np.asarray(c.points, np.float64)
         min_len = MIN_CLOSED_LENGTH_PX if c.closed else MIN_OPEN_LENGTH_PX
         smooth = (state.preset.fit.enabled and OUTSIDE not in (c.left, c.right)
                   and _length(raw) >= min_len * scale)
-        prim = None
+        prim = prim_px = None
         drawn_segments = c.id in segment_ids
         if c.id in primitive_ids:
-            prim = sample_shape(f.primitive, GEOM_SAMPLE_ERROR_PX * scale) / scale
+            prim_px = sample_shape(f.primitive, GEOM_SAMPLE_ERROR_PX * scale)
             # walk it the curve's way round so `left` / `right` still hold
-            if np.sign(_signed_area(prim)) != np.sign(_signed_area(raw)):
-                prim = prim[::-1].copy()
+            if np.sign(_signed_area(prim_px)) != np.sign(_signed_area(raw)):
+                prim_px = prim_px[::-1].copy()
+            prim = prim_px / scale
             if not drawn_segments:
-                pts, smooth = prim, True
+                pts, pts_px, smooth = prim, prim_px, True
         curves.append(CurveGeom(c.id, pts, c.left, c.right, c.closed, smooth, prim, raw / scale,
-                                drawn_segments))
+                                drawn_segments, pts_px, prim_px))
     return Geometry(tuple(curves), shapes_from_doc(state.doc), scale)
 
 
@@ -890,7 +904,7 @@ def detect_all(
     """Every detector. `source` and `render` are HxWx4 at one size for the patch comparison;
     `edge_source` (default `source`) is the input image in the geometry's px for straightness."""
     return {
-        "crossings": detect_crossings(geometry.curves),
+        "crossings": detect_crossings(geometry.curves, scale=geometry.scale),
         "specks": detect_specks(geometry.shapes),
         "wobble": detect_wobble(geometry.curves),
         "thin_bands": detect_thin_bands(geometry.curves),

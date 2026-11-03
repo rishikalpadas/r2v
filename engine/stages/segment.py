@@ -16,6 +16,7 @@ from engine.stages.segment_palette import (
     _merge_intermixed,
     _to_lab,
 )
+from engine.stages.segment_regions import refine_regions
 from engine.types import TRANSPARENT, RasterImage, RegionMap
 
 OPAQUE_ALPHA = 128
@@ -252,6 +253,13 @@ def segment(image: RasterImage, params: SegmentParams) -> RegionMap:
     out[comp > 0] = region.ravel().astype(np.int32)
 
     palette_rgb = palette[comp_cluster[survivors]]
+    if noisy:
+        # Region-level cleanup of quantized input: near-identical shades, AA slivers, specks.
+        # Exact-colour input has none of these and keeps its exact segmentation.
+        out, palette_rgb = refine_regions(
+            out, palette_rgb, px[..., :3], image.scale,
+            params.region_merge_delta_e, params.speck_area_px,
+        )
     return RegionMap(
         labels=out,
         palette_rgb=palette_rgb,

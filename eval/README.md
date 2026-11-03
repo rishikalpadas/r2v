@@ -112,7 +112,7 @@ or when an image's processing `scale` differs.
 
 | detector          | finds                                                              | score                    |
 |-------------------|--------------------------------------------------------------------|--------------------------|
-| `crossings`       | proper crossings between drawn curves, away from shared junctions  | count                    |
+| `crossings`       | proper crossings between drawn curves, away from shared junctions (tested in processing px, as the engine's guard does) | count |
 | `specks`          | output shapes under 12 px² (original px)                           | count                    |
 | `wobble`          | wiggles (turning beyond a faired copy, repeated sign changes, ≥ 0.2 px off it) and long sub-pixel bends (40 px windows, quadratic residual 0.3-1 px); corners excluded | sliding-window excess over the flag line |
 | `thin_bands`      | bands up to 6.5 px wide whose width varies about its own trend     | same, halved (each band is seen from both sides) |

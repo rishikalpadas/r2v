@@ -239,6 +239,28 @@ def test_two_crossing_curves_are_found():
     assert _inside(res.spots[0].box, 10, 10)
 
 
+def test_exact_touch_is_not_a_crossing_at_scale_3():
+    """e (6).jpeg at scale 3: b's vertex (1177, 1396) lies exactly on a's segment and b stays on
+    one side (a touch). Divided by 3 the rounding made it two proper crossings; tested in
+    processing px, as the engine's guard does, it is none."""
+    a_px = np.array([(1182, 1398), (1181, 1404), (1175, 1392), (1178, 1391)], float)
+    b_px = np.array([(1178, 1391), (1177, 1396), (1182, 1398)], float)
+    a = CurveGeom(0, a_px / 3, 1, 2, False, points_px=a_px)
+    b = CurveGeom(1, b_px / 3, 1, 3, False, points_px=b_px)
+    assert detect_crossings([a, b], scale=3.0).score == 0
+    unscaled = [CurveGeom(0, a_px / 3, 1, 2, False), CurveGeom(1, b_px / 3, 1, 3, False)]
+    assert detect_crossings(unscaled).score == 2  # the old behaviour this guards against
+
+
+def test_crossing_spots_are_in_original_px_when_tested_in_processing_px():
+    a_px = np.array([(0, 0), (60, 60)], float)
+    b_px = np.array([(0, 60), (60, 0)], float)
+    curves = [CurveGeom(0, a_px / 3, 1, 2, False, points_px=a_px),
+              CurveGeom(1, b_px / 3, 1, 3, False, points_px=b_px)]
+    res = detect_crossings(curves, scale=3.0)
+    assert res.score == 1 and _inside(res.spots[0].box, 10, 10)
+
+
 def test_crossing_within_junction_clearance_is_ignored():
     # b leaves the shared junction (10, 10) and overshoots a by 0.5 px before turning away
     a = _open(0, [(0, 10), (10, 10)])

@@ -68,21 +68,30 @@ class SegmentParams:
     min_region_px: int = 4
     sample_px: int = 200_000
     seed: int = 0
+    # Quantized input only (engine.stages.segment_regions): adjacent regions closer than this
+    # dE2000 (complete linkage) merge when their shared boundary shows no edge in the source;
+    # the split shades of one flat fill measured 5.3-8.5 on the logos. 0 disables the merge.
+    region_merge_delta_e: float = 9.0
+    # Quantized input only: regions under this area (original px^2) merge into their most
+    # similar neighbour unless they contrast strongly with all of them; matches the defect
+    # report's speck size. 0 disables.
+    speck_area_px: float = 12.0
 
     def __post_init__(self) -> None:
         for name in ("max_colors", "min_region_px", "sample_px", "seed"):
             if not _is_int(getattr(self, name)):
                 raise ValueError(f"{name} must be an integer")
-        if not _is_finite_number(self.merge_delta_e):
-            raise ValueError("merge_delta_e must be a finite number")
+        for name in ("merge_delta_e", "region_merge_delta_e", "speck_area_px"):
+            if not _is_finite_number(getattr(self, name)):
+                raise ValueError(f"{name} must be a finite number")
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0")
         if self.seed < 0:
             raise ValueError("seed must be >= 0")
         if self.max_colors < 1:
             raise ValueError("max_colors must be >= 1")
         if self.min_region_px < 0:
             raise ValueError("min_region_px must be >= 0")
-        if self.merge_delta_e < 0:
-            raise ValueError("merge_delta_e must be >= 0")
         if self.sample_px < 1:
             raise ValueError("sample_px must be >= 1")
 
