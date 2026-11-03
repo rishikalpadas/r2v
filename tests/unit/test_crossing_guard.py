@@ -1,3 +1,4 @@
+import contextlib
 import math
 
 import numpy as np
@@ -6,6 +7,9 @@ import pytest
 from engine.geometry.bezier import sample
 from engine.geometry.crossing_guard import (
     FITTED,
+    LEVEL_CORNERS,
+    LEVEL_FIT,
+    LEVEL_RAW,
     PRIMITIVE,
     RAW,
     Track,
@@ -189,6 +193,25 @@ def _plan(points, breaks, corners):
     return plan_spans(_A, tuple(points), tuple(breaks), frozenset(corners), 0, _PARAMS, 1.0)
 
 
+@contextlib.contextmanager
+def _max_levels():
+    """Collect the highest span level of every repaired curve, per build."""
+    import engine.geometry.crossing_guard as cg
+
+    seen: list[int] = []
+    build = cg._Repair.build
+
+    def spy(self):
+        seen.append(max(self.levels))
+        return build(self)
+
+    cg._Repair.build = spy
+    try:
+        yield seen
+    finally:
+        cg._Repair.build = build
+
+
 def _crossings(curves, fitted):
     tracks = [_track(c.id, RAW, c.points) for c in curves]
     for f in fitted:
@@ -207,13 +230,90 @@ def test_repair_level_one_puts_the_corner_on_its_pixel_vertex():
     a_fit = FittedCurve(0, segs, None)
     assert _crossings([_A, b], [a_fit])  # today's fit crosses B
     b_fit = FittedCurve(1, (Line(*b.points),), None)
-    out = guard_crossings([_A, b], [a_fit, b_fit], {0: plan}, 1.0)
+    with _max_levels() as levels:
+        out = guard_crossings([_A, b], [a_fit, b_fit], {0: plan}, 1.0)
     fixed = out[0]
     assert not _crossings([_A, b], [fixed])
+    assert levels == [LEVEL_CORNERS]  # the first repair level was enough: never went RAW
     assert fixed.segments[0].p0 == _A.points[0] and fixed.segments[-1].p1 == _A.points[-1]
     corner_pts = {s.p1 for s in fixed.segments[:-1]}
     assert (0.0, 10.0) in corner_pts  # moved onto the pixel vertex, not the crack midpoint
-    assert out[1] is not None and out[1].segments == (Line(*b.points),)
+    assert out[1] is b_fit  # an exact neighbour is never touched
+
+
+def test_span_escalates_once_per_round_however_many_segments_cross():
+    # span 0 is fitted as a polyline through a shallow bulge: two of its segments cross B
+    dense = _dense_a()
+    for i in range(6, 10):
+        dense[i] = (-0.4, dense[i][1])
+    polyline = lambda pts, params: tuple(Line(p, q) for p, q in zip(pts, pts[1:]))  # noqa: E731
+    plan, segs = plan_spans(_A, tuple(dense), (0, 10, 21), frozenset({1}), 0, _PARAMS, 1.0, polyline)
+    b = BoundaryCurve(id=1, points=((-0.3, 2.0), (-0.3, 9.8)), left=3, right=1, closed=False)
+    a_fit = FittedCurve(0, segs, None)
+    assert len({h.a[2] for h in _crossings([_A, b], [a_fit])}) >= 2  # several crossing segments
+    with _max_levels() as levels:
+        out = guard_crossings([_A, b], [a_fit], {0: plan}, 1.0)
+    assert not _crossings([_A, b], out[:1])
+    assert levels == [LEVEL_CORNERS]  # a refit at full tolerance suffices: no level skipped
+
+
+def test_primitive_crossing_drops_the_primitive_and_spares_the_neighbour():
+    from engine.geometry.corners import dense_samples
+
+    sq = BoundaryCurve(
+        id=0,
+        points=((0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0), (0.0, 0.0)),
+        left=1, right=2, closed=True,
+    )
+    segs = tuple(Line(p, q) for p, q in zip(sq.points, sq.points[1:]))
+    b = BoundaryCurve(id=1, points=((-3.0, 9.0), (1.0, 13.0)), left=3, right=2, closed=False)
+    b_dense = dense_samples(b.points, False)
+    b_plan, b_segs = plan_spans(b, b_dense, (0, len(b_dense) - 1), frozenset(), 0, _PARAMS, 1.0)
+    b_fit = FittedCurve(1, b_segs, None)
+    out = guard_crossings([sq, b], [FittedCurve(0, segs, Circle(5.0, 5.0, 9.0)), b_fit], {1: b_plan}, 1.0)
+    assert out[0].primitive is None and out[0].segments == segs
+    assert out[1] is b_fit
+
+
+def test_corner_breaks_never_collapse_onto_one_vertex():
+    import engine.geometry.crossing_guard as cg
+
+    # corners at dense 10 (s=9.5) and 11 (s=10.5) straddle the one pixel vertex (0, 10)
+    plan, _ = _plan(_dense_a(), (0, 10, 11, 21), {1, 2})
+    for level in (LEVEL_CORNERS, LEVEL_RAW):
+        rep = cg._Repair(plan)
+        rep.levels = [level] * 3
+        segments = rep.build().segments
+        assert all(s.p0 != s.p1 for s in segments)
+        assert all(n >= 1 for n in rep._sizes)
+        assert segments[0].p0 == (0.0, 0.0) and segments[-1].p1 == (10.0, 10.0)
+
+
+def test_interior_points_past_a_moved_corner_are_dropped():
+    import engine.geometry.crossing_guard as cg
+
+    # the corner sample at dense 12 (s=11.5) moves back to the vertex (0, 10) at s=10; dense 11
+    # (s=10.5) now lies past the span's end and must not make it double back
+    tight = FitParams(tolerance_px=0.3)  # (0.5, 10) is 0.5 px off the true edge
+    plan, _ = plan_spans(_A, tuple(_dense_a()), (0, 12, 21), frozenset({1}), 0, tight, 1.0)
+    rep = cg._Repair(plan)
+    rep.levels = [LEVEL_CORNERS, LEVEL_FIT]
+    assert rep.build().segments[0] == Line((0.0, 0.0), (0.0, 10.0))
+
+
+def test_repair_loop_is_capped_and_warns(monkeypatch, caplog):
+    import engine.geometry.crossing_guard as cg
+
+    monkeypatch.setattr(cg, "MAX_GUARD_ROUNDS", 0)
+    dense = _dense_a()
+    dense[10] = (-1.5, 11.5)
+    plan, segs = _plan(dense, (0, 10, len(dense) - 1), {1})
+    b = BoundaryCurve(id=1, points=((-3.0, 9.0), (1.0, 13.0)), left=3, right=1, closed=False)
+    fitted = FittedCurve(0, segs, None)
+    with caplog.at_level("WARNING", logger="engine.geometry.crossing_guard"):
+        out = guard_crossings([_A, b], [fitted], {0: plan}, 1.0)
+    assert out[0] is fitted
+    assert "crossing" in caplog.text
 
 
 def test_repair_level_two_falls_back_to_the_crack_path():
