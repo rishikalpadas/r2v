@@ -46,3 +46,32 @@ def test_array_holding_types_compare_by_identity():
         assert a == a
         assert not (a == b)  # no element-wise ndarray comparison
         hash(a)
+
+
+@pytest.mark.parametrize("scale", [1, 1.0, 2.5, 4, 0.5])
+def test_raster_image_accepts_positive_finite_scale(scale):
+    import numpy as np
+
+    from engine.types import RasterImage
+
+    assert RasterImage(np.zeros((2, 2, 4), np.uint8), (2, 2), scale=scale).scale == scale
+
+
+def test_raster_image_accepts_numpy_scale():
+    import numpy as np
+
+    from engine.types import RasterImage
+
+    assert RasterImage(np.zeros((2, 2, 4), np.uint8), (2, 2), scale=np.float64(2.0)).scale == 2.0
+
+
+@pytest.mark.parametrize(
+    "scale", [0, 0.0, -1.0, float("nan"), float("inf"), -float("inf"), True, False, "4", None, 1j]
+)
+def test_raster_image_rejects_bad_scale(scale):
+    import numpy as np
+
+    from engine.types import RasterImage
+
+    with pytest.raises(ValueError, match="scale"):
+        RasterImage(np.zeros((2, 2, 4), np.uint8), (2, 2), scale=scale)

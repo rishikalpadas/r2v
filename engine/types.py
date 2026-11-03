@@ -1,8 +1,10 @@
 """Core immutable data types shared by all engine stages."""
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Real
 from typing import Literal
 
 import numpy as np
@@ -20,6 +22,15 @@ class RasterImage:
     scale: float = 1.0
     color_space: str = "sRGB"
     source_format: str | None = None  # Pillow format name of the decoded file ("JPEG", "PNG", ...)
+
+    def __post_init__(self) -> None:
+        # Processing pixels per original pixel: every threshold in original pixels is multiplied
+        # by it, so a bool, NaN, infinite or non-positive scale would silently corrupt them.
+        scale = self.scale
+        if isinstance(scale, bool) or not isinstance(scale, Real) or not math.isfinite(scale):
+            raise ValueError(f"scale must be a finite number, got {scale!r}")
+        if not scale > 0:
+            raise ValueError(f"scale must be > 0, got {scale!r}")
 
 
 @dataclass(frozen=True)

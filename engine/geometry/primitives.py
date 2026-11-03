@@ -15,6 +15,7 @@ import math
 import numpy as np
 from scipy.spatial import cKDTree
 
+from engine.geometry.corners import samples_at_scale
 from engine.types import Circle, Ellipse, Point, PrimitiveShape, Polygon, Rect
 
 RIGHT_ANGLE_TOL_DEG = 5.0
@@ -25,9 +26,11 @@ CIRCLE_TOL_FRAC = 0.03
 ELLIPSE_TOL_PX = 1.0
 MIN_POLY_CORNERS = 3
 MAX_POLY_CORNERS = 12
+# Sample counts at scale 1 (one dense sample per original-image pixel); detect_primitive
+# converts them with `samples_at_scale`, as smoothing (and so corner rounding) scales too.
 CORNER_TRIM = 4  # samples dropped at each side end: smoothing rounds the corners
-MIN_SIDE_POINTS = 3
-MIN_LOOP_POINTS = 8
+MIN_SIDE_POINTS = 3  # samples
+MIN_LOOP_POINTS = 8  # samples
 ELLIPSE_SAMPLES = 1440
 _PARALLEL_SIN = 1e-3
 
@@ -41,15 +44,17 @@ def _fit_line(pts: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
     return centroid, direction, float(dev)
 
 
-def _sides(arr: np.ndarray, corners: tuple[int, ...]) -> list[np.ndarray] | None:
+def _sides(arr: np.ndarray, corners: tuple[int, ...], scale: float) -> list[np.ndarray] | None:
     """Trimmed point runs between consecutive corners (cyclic); None if any run is too short."""
     n = len(arr)
     ordered = sorted(corners)
+    trim = samples_at_scale(CORNER_TRIM, scale)
+    min_points = samples_at_scale(MIN_SIDE_POINTS, scale)
     sides = []
     for a, b in zip(ordered, ordered[1:] + [ordered[0] + n]):
         run = arr[np.arange(a, b + 1) % n]
-        run = run[CORNER_TRIM : len(run) - CORNER_TRIM]
-        if len(run) < MIN_SIDE_POINTS:
+        run = run[trim : len(run) - trim]
+        if len(run) < min_points:
             return None
         sides.append(run)
     return sides
@@ -77,7 +82,7 @@ def _rect_angle(directions: list[np.ndarray]) -> float:
 def _detect_rect(arr: np.ndarray, corners: tuple[int, ...], scale: float) -> Rect | None:
     if len(corners) != 4:
         return None
-    sides = _sides(arr, corners)
+    sides = _sides(arr, corners, scale)
     if sides is None:
         return None
     fits = [_fit_line(s) for s in sides]
@@ -187,7 +192,7 @@ def _line_intersection(f1: tuple, f2: tuple) -> np.ndarray | None:
 def _detect_polygon(arr: np.ndarray, corners: tuple[int, ...], scale: float) -> Polygon | None:
     if not MIN_POLY_CORNERS <= len(corners) <= MAX_POLY_CORNERS:
         return None
-    sides = _sides(arr, corners)
+    sides = _sides(arr, corners, scale)
     if sides is None:
         return None
     fits = [_fit_line(s) for s in sides]
@@ -207,9 +212,10 @@ def detect_primitive(
 ) -> PrimitiveShape | None:
     """Return the first matching primitive (rect, circle, ellipse, polygon) or None.
 
-    `points` are in processing pixels (original pixels x `scale`).
+    `points` are in processing pixels (original pixels x `scale`), one dense sample per
+    processing pixel.
     """
-    if len(points) < MIN_LOOP_POINTS:
+    if len(points) < samples_at_scale(MIN_LOOP_POINTS, scale):
         return None
     arr = np.asarray(points, np.float64)
     rect = _detect_rect(arr, corners, scale)
