@@ -8,11 +8,12 @@ from dataclasses import replace
 import numpy as np
 
 from engine.geometry.corners import dense_samples, find_corners, samples_at_scale, smooth_dense
+from engine.geometry.crossing_guard import SpanPlan, guard_crossings, plan_spans
 from engine.geometry.primitives import detect_primitive
-from engine.geometry.segment_fit import fit_span, snap_axis
+from engine.geometry.segment_fit import fit_span
 from engine.geometry.subpixel import EdgeContext, subpixel_dense
 from engine.presets import FitParams
-from engine.types import OUTSIDE, BoundaryCurve, BoundaryGraph, FittedCurve, Line, Point, Segment
+from engine.types import OUTSIDE, BoundaryCurve, BoundaryGraph, FittedCurve, Line, Point
 
 _COLLINEAR_EPS = 1e-9
 # Lengths below are in original-image pixels and are multiplied by the processing scale where
@@ -204,14 +205,6 @@ def _place_corners(
     return out
 
 
-def _fit_spans(points: Sequence[Point], breaks: Sequence[int], params: FitParams) -> tuple[Segment, ...]:
-    """Fit each run points[breaks[k]..breaks[k+1]] and concatenate the chains."""
-    chain: list[Segment] = []
-    for a, b in zip(breaks, breaks[1:]):
-        chain.extend(fit_span(points[a : b + 1], params))
-    return snap_axis(chain, params)
-
-
 def _samples(
     curve: BoundaryCurve, sigma: float, context: EdgeContext | None
 ) -> tuple[tuple[Point, ...], tuple[tuple[Point, ...], tuple[Point, ...]]]:
@@ -224,20 +217,27 @@ def _samples(
     return smooth_dense(raw, curve.closed, sigma), (raw, plain)
 
 
+_Fit = tuple[FittedCurve, SpanPlan | None]  # the plan lets the crossing guard refit spans
+
+
 def _fit_open(
     curve: BoundaryCurve, params: FitParams, scale: float, context: EdgeContext | None
-) -> FittedCurve:
+) -> _Fit:
     dense, samples = _samples(curve, params.smooth_sigma, context)
     window = samples_at_scale(CORNER_WINDOW, scale)
     corners = find_corners(dense, closed=False, angle_deg=params.corner_angle_deg, window=window)
     inner = corners[1:-1]  # the end points are already the exact junctions
     snapped = _place_corners(dense, inner, corners, samples, curve.points, False, scale)
-    return FittedCurve(curve.id, _fit_spans(snapped, corners, params), primitive=None)
+    inner_breaks = frozenset(range(1, len(corners) - 1))
+    plan, segments = plan_spans(
+        curve, tuple(snapped), corners, inner_breaks, 0, params, scale, fit_span
+    )
+    return FittedCurve(curve.id, segments, primitive=None), plan
 
 
 def _fit_closed(
     curve: BoundaryCurve, params: FitParams, scale: float, context: EdgeContext | None
-) -> FittedCurve:
+) -> _Fit:
     ring, samples = _samples(curve, params.smooth_sigma, context)
     n = len(ring)
     window = samples_at_scale(CORNER_WINDOW, scale)
@@ -250,18 +250,22 @@ def _fit_closed(
         breaks = sorted((c - start) % n for c in corners) + [n]
     else:
         breaks = [n * k // CORNERLESS_SPANS for k in range(CORNERLESS_SPANS + 1)]
-    segments = _fit_spans(seq, breaks, params)
-    return FittedCurve(curve.id, segments, primitive=detect_primitive(ring, corners, scale))
+    corner_breaks = frozenset(range(len(breaks))) if corners else frozenset()
+    plan, segments = plan_spans(
+        curve, seq, tuple(breaks), corner_breaks, start, params, scale, fit_span
+    )
+    primitive = detect_primitive(ring, corners, scale)
+    return FittedCurve(curve.id, segments, primitive=primitive), plan
 
 
 def _fit_smooth(
     curve: BoundaryCurve, params: FitParams, scale: float, context: EdgeContext | None
-) -> FittedCurve:
+) -> _Fit:
     if OUTSIDE in (curve.left, curve.right):
-        return _fit_curve(curve)  # the canvas edge is exact already; smoothing would round it
+        return _fit_curve(curve), None  # the canvas edge is exact; smoothing would round it
     min_length = MIN_CLOSED_LENGTH_PX if curve.closed else MIN_OPEN_LENGTH_PX
     if _length(curve.points) < min_length * scale:
-        return _fit_curve(curve)
+        return _fit_curve(curve), None
     fit = _fit_closed if curve.closed else _fit_open
     return fit(curve, params, scale, context)
 
@@ -296,9 +300,15 @@ def fit_geometry(
     `params` and in this module is in original pixels and is converted here, and every
     sample-count window is converted with `samples_at_scale`. `params.complexity_weight` is
     deliberately left unscaled: scaling it by scale**3 cost fidelity on enhanced input.
+
+    Curves are fitted independently, so where a band is thinner than the fit's allowances a
+    fitted curve can cross its neighbour; `guard_crossings` then refits the offending spans
+    (output without crossings is unchanged).
     """
     if not params.enabled:
         return polyline_fit(graph)
     scaled = _processing_params(params, scale)
     ctx = context if params.subpixel else None
-    return tuple(_fit_smooth(c, scaled, scale, ctx) for c in graph.curves)
+    fits = [_fit_smooth(c, scaled, scale, ctx) for c in graph.curves]
+    plans = {fit.curve_id: plan for fit, plan in fits if plan is not None}
+    return guard_crossings(graph.curves, [fit for fit, _ in fits], plans, scale)

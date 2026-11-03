@@ -200,18 +200,23 @@ def _snap_deltas(line: Line, tol_rad: float, max_move: float) -> tuple[Point, Po
     return deltas
 
 
-def snap_axis(segments: Sequence[Segment], params: FitParams) -> tuple[Segment, ...]:
+def snap_axis(
+    segments: Sequence[Segment], params: FitParams, locked: frozenset[int] = frozenset()
+) -> tuple[Segment, ...]:
     """Snap near-axis interior Lines to exact horizontal/vertical.
 
     Only Lines that are neither the first nor the last segment qualify (their endpoints are
     interior corners); the neighbours' shared endpoints move identically. Lines next to an Arc
-    are left alone, as are lines whose snap would move an endpoint more than tolerance_px.
+    are left alone, as are lines whose snap would move an endpoint more than tolerance_px, and
+    lines that would move any segment whose index is in `locked`.
     """
     segs = list(segments)
     tol_rad = math.radians(params.axis_snap_deg)
     for i in range(1, len(segs) - 1):
         seg, prev, nxt = segs[i], segs[i - 1], segs[i + 1]
         if not isinstance(seg, Line) or isinstance(prev, Arc) or isinstance(nxt, Arc):
+            continue
+        if locked and not locked.isdisjoint((i - 1, i, i + 1)):
             continue
         deltas = _snap_deltas(seg, tol_rad, params.tolerance_px)
         if deltas is None:
