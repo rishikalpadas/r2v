@@ -17,6 +17,7 @@ OPTION_KEYS: Mapping[str, str] = {
     "layer_mode": "export.layer_mode",
     "fit": "fit.enabled",
     "tolerance": "fit.tolerance_px",
+    "skip_exact": "enhance.skip_exact",
 }
 
 

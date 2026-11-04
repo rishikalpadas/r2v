@@ -178,7 +178,7 @@ def enhance(
     s, cap = effective_scale(params, w, h)
     if s == 1:
         return image, _report(effective_scale=1, skipped_reason="scale 1", cap_reason=cap)
-    if max_colors is not None and _is_exact_colour(px, max_colors):
+    if params.skip_exact and max_colors is not None and _is_exact_colour(px, max_colors):
         return image, _report(effective_scale=1, skipped_reason="exact colours")
 
     alpha = px[..., 3]

@@ -36,9 +36,10 @@ class EnhanceParams:
     # 2**24 px: segment/trace/fit RAM and time grow with output area. 2**23 would leave a
     # 1600x1411 input at 1x (2x is 9.0 MP); 2**24 still allows 2x up to 2048x2048.
     max_output_pixels: int = 16_777_216
+    skip_exact: bool = False
 
     def __post_init__(self) -> None:
-        for name in ("enabled", "deblock", "denoise"):
+        for name in ("enabled", "deblock", "denoise", "skip_exact"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a bool")
         for name in ("scale", "tile", "max_output_side", "max_output_pixels"):
