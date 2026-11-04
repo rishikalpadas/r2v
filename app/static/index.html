@@ -30,6 +30,9 @@ main { padding: 12px 28px 40px; display: grid; gap: 16px; }
 .toolbar label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
 .toolbar output { font-family: var(--mono); color: var(--ink); min-width: 2.5ch; }
 input[type=range] { accent-color: var(--accent); width: 120px; }
+.badge { display: inline-flex; align-items: center; gap: 6px; font: 500 12px var(--sans); color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface)); padding: 5px 12px; border-radius: 20px;
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); letter-spacing: .02em; }
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
 .seg button { border: 0; background: transparent; color: var(--muted); padding: 5px 11px; font: 500 13px var(--sans); cursor: pointer; }
 .seg button[aria-pressed=true] { background: var(--ink); color: var(--bg); }
@@ -76,7 +79,7 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
 <body>
 <header>
   <h1>raster<b>2</b>vector</h1>
-  <p>Local preview · flat-art engine (milestones 1–3). Works best on logos, icons and flat illustrations.</p>
+  <p>AI-Powered Vectorization Engine · Auto-enhanced with Real-ESRGAN super-resolution &amp; smooth Béziers.</p>
 </header>
 <main>
   <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose or drop an image">
@@ -84,14 +87,11 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
   </div>
   <input type="file" id="file" accept="image/png,image/jpeg,image/webp,image/bmp,image/tiff,image/gif" hidden>
 
-  <div class="toolbar" role="group" aria-label="Conversion settings">
-    <label>Max colors <input type="range" id="colors" min="2" max="64" value="16"><output id="colorsOut">16</output></label>
-    <label>Tolerance <input type="range" id="tol" min="0.25" max="3" step="0.25" value="0.75"><output id="tolOut">0.75</output>px</label>
-    <label>Layers <span class="seg" id="layers"><button aria-pressed="true" data-v="stacked">Stacked</button><button aria-pressed="false" data-v="cutout">Cutout</button></span></label>
-    <label>Curves <span class="seg" id="fit"><button aria-pressed="true" data-v="1">Fitted</button><button aria-pressed="false" data-v="0">Pixel outline</button></span></label>
-    <span class="spacer"></span>
-    <label>Zoom <input type="range" id="zoom" min="0.25" max="8" step="0.25" value="1"><output id="zoomOut">1×</output></label>
+  <div class="toolbar" role="group" aria-label="Viewer controls">
+    <span class="badge">✦ Auto AI-Enhanced &amp; Smooth Fit</span>
     <label>Show <span class="seg" id="mode"><button aria-pressed="true" data-v="fill">Fill</button><button aria-pressed="false" data-v="outline">Outlines</button></span></label>
+    <label>Zoom <input type="range" id="zoom" min="0.25" max="8" step="0.25" value="1"><output id="zoomOut">1×</output></label>
+    <span class="spacer"></span>
     <button class="btn" id="download" disabled>Download SVG</button>
   </div>
 
@@ -114,7 +114,7 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  const state = { file: null, svg: null, w: 0, h: 0, layer: "stacked", fit: "1", mode: "fill", urls: [], req: 0 };
+  const state = { file: null, svg: null, w: 0, h: 0, mode: "fill", urls: [], req: 0 };
   const OUTLINE_STYLE = '<style>*{fill:none!important;stroke:#d2491d!important;stroke-width:1px!important;vector-effect:non-scaling-stroke}</style>';
 
   function setStatus(text, kind) { const s = $("status"); s.textContent = text; s.className = "status" + (kind ? " " + kind : ""); }
@@ -123,10 +123,12 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
   function setZoom(z) { document.documentElement.style.setProperty("--zoom", z); $("zoomOut").textContent = z + "×"; }
 
   function seg(id, key, onChange) {
-    $(id).addEventListener("click", e => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("click", e => {
       const b = e.target.closest("button"); if (!b) return;
       e.preventDefault();
-      $(id).querySelectorAll("button").forEach(x => x.setAttribute("aria-pressed", x === b));
+      el.querySelectorAll("button").forEach(x => x.setAttribute("aria-pressed", x === b));
       state[key] = b.dataset.v; onChange();
     });
   }
@@ -153,10 +155,9 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
   async function run() {
     if (!state.file) return;
     const id = ++state.req;
-    const q = new URLSearchParams({ max_colors: $("colors").value, tolerance: $("tol").value, layer_mode: state.layer, fit: state.fit });
-    setStatus("Converting…"); $("status").classList.add("busy");
+    setStatus("AI enhancing and vectorizing…"); $("status").classList.add("busy");
     try {
-      const resp = await fetch("/api/vectorize?" + q, { method: "POST", body: state.file, headers: { "Content-Type": "application/octet-stream" } });
+      const resp = await fetch("/api/vectorize", { method: "POST", body: state.file, headers: { "Content-Type": "application/octet-stream" } });
       const data = await resp.json();
       if (id !== state.req) return;
       if (!resp.ok) throw new Error(data.error || resp.statusText);
@@ -207,12 +208,8 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
   ["dragleave", "drop"].forEach(t => document.addEventListener(t, e => { e.preventDefault(); drop.classList.remove("over"); }));
   document.addEventListener("drop", e => load(e.dataTransfer.files[0]));
 
-  let timer;
-  const debounced = () => { clearTimeout(timer); timer = setTimeout(run, 250); };
-  $("colors").addEventListener("input", e => { $("colorsOut").textContent = e.target.value; debounced(); });
-  $("tol").addEventListener("input", e => { $("tolOut").textContent = e.target.value; debounced(); });
   $("zoom").addEventListener("input", e => setZoom(e.target.value));
-  seg("layers", "layer", run); seg("fit", "fit", run); seg("mode", "mode", renderVector);
+  seg("mode", "mode", renderVector);
 
   $("download").addEventListener("click", () => {
     const a = document.createElement("a");
