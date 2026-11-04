@@ -16,6 +16,7 @@ from engine.stages.segment_palette import (
     _merge_intermixed,
     _to_lab,
 )
+from engine.geometry.gradients import detect_and_merge_gradients
 from engine.stages.segment_regions import refine_regions
 from engine.types import TRANSPARENT, RasterImage, RegionMap
 
@@ -263,9 +264,16 @@ def segment(image: RasterImage, params: SegmentParams) -> RegionMap:
             out, palette_rgb, px[..., :3], image.scale,
             params.region_merge_delta_e, params.speck_area_px, lab=lab,
         )
+    gradients = {}
+    if noisy:
+        out, palette_rgb, gradients = detect_and_merge_gradients(
+            out, palette_rgb, px[..., :3], image.scale
+        )
     return RegionMap(
         labels=out,
         palette_rgb=palette_rgb,
         palette_lab=_to_lab(palette_rgb),
         adjacency=_adjacency(out),
+        gradient_regions=frozenset(gradients.keys()),
+        gradients=gradients,
     )

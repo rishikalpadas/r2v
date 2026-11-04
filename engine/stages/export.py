@@ -23,6 +23,9 @@ from engine.types import (
     PrimitiveShape,
     Rect,
     RegionMap,
+    Fill,
+    GradientStop,
+    LinearGradient,
     Segment,
     SolidFill,
     VectorDoc,
@@ -145,6 +148,18 @@ def _scale_shape(shape: PrimitiveShape, k: float) -> PrimitiveShape:
     return Polygon(tuple(_scale_point(p, k) for p in shape.points))
 
 
+def _scale_fill(fill: Fill, k: float) -> Fill:
+    if isinstance(fill, LinearGradient):
+        return replace(
+            fill,
+            x1=fill.x1 * k,
+            y1=fill.y1 * k,
+            x2=fill.x2 * k,
+            y2=fill.y2 * k,
+        )
+    return fill
+
+
 def _to_original_units(
     paths: list[Path], primitives: list[Primitive], scale: float
 ) -> tuple[tuple[Path, ...], tuple[Primitive, ...]]:
@@ -154,10 +169,17 @@ def _to_original_units(
     k = 1.0 / scale
     return (
         tuple(
-            replace(p, contours=tuple(tuple(_scale_segment(s, k) for s in c) for c in p.contours))
+            replace(
+                p,
+                contours=tuple(tuple(_scale_segment(s, k) for s in c) for c in p.contours),
+                fill=_scale_fill(p.fill, k),
+            )
             for p in paths
         ),
-        tuple(replace(p, shape=_scale_shape(p.shape, k)) for p in primitives),
+        tuple(
+            replace(p, shape=_scale_shape(p.shape, k), fill=_scale_fill(p.fill, k))
+            for p in primitives
+        ),
     )
 
 
@@ -225,7 +247,10 @@ def build_doc(
     paths: list[Path] = []
     primitives: list[Primitive] = []
     for plan in plan_layers(regions, graph, fitted, params):
-        fill = SolidFill(tuple(int(c) for c in regions.palette_rgb[plan.region]))
+        if plan.region in getattr(regions, "gradients", {}):
+            fill = regions.gradients[plan.region]
+        else:
+            fill = SolidFill(tuple(int(c) for c in regions.palette_rgb[plan.region]))
         if plan.underlay:
             paths.append(Path((_canvas_frame(w * scale, h * scale),), fill, plan.z))
         elif plan.primitive_curve is not None:
@@ -280,15 +305,25 @@ def _contour_d(contour: tuple[Segment, ...], n: int) -> str:
     return "".join(cmds)
 
 
+def _hex_rgb(rgb: tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
 def _hex(fill: SolidFill) -> str:
-    return "#{:02x}{:02x}{:02x}".format(*fill.rgb)
+    return _hex_rgb(fill.rgb)
+
+
+def _fill_attr(fill: Fill) -> str:
+    if isinstance(fill, LinearGradient):
+        return f'fill="url(#{fill.id})"'
+    return f'fill="{_hex(fill)}"'
 
 
 def _path_element(path: Path, doc: VectorDoc) -> str:
     d = "".join(_contour_d(c, doc.precision) for c in path.contours)
     holed = doc.layer_mode == "cutout" or len(path.contours) > 1
     rule = ' fill-rule="evenodd"' if holed else ""
-    return f'<path d={quoteattr(d)} fill="{_hex(path.fill)}"{rule}/>'
+    return f'<path d={quoteattr(d)} {_fill_attr(path.fill)}{rule}/>'
 
 
 def _rotation(angle_deg: float, x: float, y: float, n: int) -> str:
@@ -298,7 +333,7 @@ def _rotation(angle_deg: float, x: float, y: float, n: int) -> str:
 
 
 def _primitive_element(prim: Primitive, n: int) -> str:
-    shape, fill = prim.shape, f'fill="{_hex(prim.fill)}"'
+    shape, fill = prim.shape, _fill_attr(prim.fill)
     if isinstance(shape, Circle):
         return (f'<circle cx="{_num(shape.cx, n)}" cy="{_num(shape.cy, n)}" '
                 f'r="{_num(shape.r, n)}" {fill}/>')
@@ -314,7 +349,34 @@ def _primitive_element(prim: Primitive, n: int) -> str:
     return f'<polygon points="{pts}" {fill}/>'
 
 
+def _gradient_def(grad: LinearGradient, n: int) -> str:
+    stops = "".join(
+        f'<stop offset="{_num(s.offset * 100, n)}%" stop-color="{_hex_rgb(s.rgb)}"'
+        + (f' stop-opacity="{_num(s.opacity, n)}"' if s.opacity < 1.0 else "")
+        + "/>"
+        for s in grad.stops
+    )
+    return (
+        f'<linearGradient id="{grad.id}" '
+        f'x1="{_num(grad.x1, n)}" y1="{_num(grad.y1, n)}" '
+        f'x2="{_num(grad.x2, n)}" y2="{_num(grad.y2, n)}" '
+        f'gradientUnits="userSpaceOnUse">{stops}</linearGradient>'
+    )
+
+
 def to_svg(doc: VectorDoc) -> str:
+    seen_grads: dict[str, LinearGradient] = {}
+    for p in doc.paths:
+        if isinstance(p.fill, LinearGradient):
+            seen_grads[p.fill.id] = p.fill
+    for prim in doc.primitives:
+        if isinstance(prim.fill, LinearGradient):
+            seen_grads[prim.fill.id] = prim.fill
+
+    defs = ""
+    if seen_grads:
+        defs = f"<defs>{''.join(_gradient_def(g, doc.precision) for g in seen_grads.values())}</defs>"
+
     items = [
         (p.z_order, _path_element(p, doc))
         for p in doc.paths
@@ -324,5 +386,5 @@ def to_svg(doc: VectorDoc) -> str:
     body = "".join(el for _, el in sorted(items, key=lambda item: item[0]))
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{doc.width}" height="{doc.height}" '
-        f'viewBox="0 0 {doc.width} {doc.height}">{body}</svg>'
+        f'viewBox="0 0 {doc.width} {doc.height}">{defs}{body}</svg>'
     )

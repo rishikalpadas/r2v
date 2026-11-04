@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from types import MappingProxyType
 from dataclasses import dataclass
 from numbers import Real
 from typing import Literal
@@ -49,6 +50,7 @@ class RegionMap:
     palette_lab: np.ndarray  # Kx3 float64
     adjacency: frozenset[tuple[int, int]]
     gradient_regions: frozenset[int] = frozenset()
+    gradients: Mapping[int, LinearGradient] = MappingProxyType({})
 
 
 @dataclass(frozen=True)
@@ -113,7 +115,24 @@ class SolidFill:
     rgb: tuple[int, int, int]
 
 
-Fill = SolidFill
+@dataclass(frozen=True)
+class GradientStop:
+    offset: float  # 0.0 to 1.0
+    rgb: tuple[int, int, int]
+    opacity: float = 1.0
+
+
+@dataclass(frozen=True)
+class LinearGradient:
+    id: str
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    stops: tuple[GradientStop, ...]
+
+
+Fill = SolidFill | LinearGradient
 
 
 @dataclass(frozen=True)
