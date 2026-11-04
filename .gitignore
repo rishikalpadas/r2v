@@ -6,3 +6,4 @@ eval/dataset/
 .superpowers/
 *.egg-info/
 eval/dataset_synthetic/
+eval/cache_enhanced/
