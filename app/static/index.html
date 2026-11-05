@@ -219,7 +219,9 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
     const a = document.createElement("a");
     a.href = blobUrl(state.svg, "image/svg+xml");
     a.download = (state.file.name.replace(/\.[^.]+$/, "") || "image") + ".svg";
+    document.body.appendChild(a);
     a.click();
+    a.remove();
   });
 
   $("downloadPdf").addEventListener("click", () => {
@@ -232,7 +234,9 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
     const a = document.createElement("a");
     a.href = blobUrl(bytes, "application/pdf");
     a.download = (state.file.name.replace(/\.[^.]+$/, "") || "image") + ".pdf";
+    document.body.appendChild(a);
     a.click();
+    a.remove();
   });
 
   setZoom(1);
