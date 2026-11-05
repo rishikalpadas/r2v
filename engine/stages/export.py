@@ -1,6 +1,9 @@
 """Export stage: assemble a VectorDoc from fitted curves and serialise it to SVG."""
 from __future__ import annotations
 
+import math
+import zlib
+
 from dataclasses import dataclass, replace
 from xml.sax.saxutils import quoteattr
 
@@ -388,3 +391,233 @@ def to_svg(doc: VectorDoc) -> str:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{doc.width}" height="{doc.height}" '
         f'viewBox="0 0 {doc.width} {doc.height}">{defs}{body}</svg>'
     )
+
+
+def _arc_to_beziers(arc: Arc) -> list[CubicBezier]:
+    cx, cy = arc.center
+    r = arc.radius
+    if r <= 0:
+        return [CubicBezier(arc.p0, arc.p0, arc.p1, arc.p1)]
+    
+    th0 = math.atan2(arc.p0[1] - cy, arc.p0[0] - cx)
+    th1 = math.atan2(arc.p1[1] - cy, arc.p1[0] - cx)
+    dth = th1 - th0
+    if arc.sweep and dth < 0:
+        dth += 2 * math.pi
+    elif not arc.sweep and dth > 0:
+        dth -= 2 * math.pi
+        
+    num_segs = max(1, math.ceil(abs(dth) / (math.pi / 2)))
+    step = dth / num_segs
+    beziers = []
+    
+    cur_th = th0
+    for i in range(num_segs):
+        next_th = cur_th + step
+        k = (4.0 / 3.0) * math.tan(step / 4.0)
+        p0 = arc.p0 if i == 0 else (cx + r * math.cos(cur_th), cy + r * math.sin(cur_th))
+        p3 = arc.p1 if i == num_segs - 1 else (cx + r * math.cos(next_th), cy + r * math.sin(next_th))
+        c1 = (p0[0] - k * r * math.sin(cur_th), p0[1] + k * r * math.cos(cur_th))
+        c2 = (p3[0] + k * r * math.sin(next_th), p3[1] - k * r * math.cos(next_th))
+        beziers.append(CubicBezier(p0, c1, c2, p3))
+        cur_th = next_th
+        
+    return beziers
+
+
+def to_pdf(doc: VectorDoc) -> bytes:
+    """Export a VectorDoc directly to a valid, standalone, compressed vector PDF 1.4."""
+    w, h = doc.width, doc.height
+    prec = max(2, doc.precision)
+
+    def py(y: float) -> float:
+        return h - y
+
+    def fmt(v: float) -> str:
+        s = f"{v:.{prec}f}"
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return "0" if s in ("-0", "") else s
+
+    stream_ops: list[str] = []
+    shadings: list[dict] = []
+    shading_map: dict[int, str] = {}
+
+    # Sort elements by z_order
+    elements = [(p.z_order, p) for p in doc.paths] + [(p.z_order, p) for p in doc.primitives]
+    elements.sort(key=lambda t: t[0])
+
+    for _, elem in elements:
+        fill = elem.fill
+        is_gradient = isinstance(fill, LinearGradient)
+        sh_name = None
+
+        if is_gradient:
+            grad_id = id(fill)
+            if grad_id not in shading_map:
+                sh_name = f"Sh{len(shadings) + 1}"
+                shading_map[grad_id] = sh_name
+                # LinearGradient coords in PDF space:
+                # PDF y is inverted
+                c0 = [round(c / 255.0, 4) for c in fill.stops[0].rgb]
+                c1 = [round(c / 255.0, 4) for c in fill.stops[-1].rgb]
+                shadings.append({
+                    "name": sh_name,
+                    "x1": fill.x1,
+                    "y1": py(fill.y1),
+                    "x2": fill.x2,
+                    "y2": py(fill.y2),
+                    "c0": c0,
+                    "c1": c1,
+                })
+            else:
+                sh_name = shading_map[grad_id]
+
+        if is_gradient:
+            stream_ops.append("q")  # push graphics state for clip
+        else:
+            r, g, b = [c / 255.0 for c in fill.rgb]
+            stream_ops.append(f"{fmt(r)} {fmt(g)} {fmt(b)} rg")
+
+        if isinstance(elem, Path):
+            for contour in elem.contours:
+                if not contour:
+                    continue
+                p0 = contour[0].p0
+                stream_ops.append(f"{fmt(p0[0])} {fmt(py(p0[1]))} m")
+                for seg in contour:
+                    if isinstance(seg, Line):
+                        stream_ops.append(f"{fmt(seg.p1[0])} {fmt(py(seg.p1[1]))} l")
+                    elif isinstance(seg, CubicBezier):
+                        c1 = seg.c1
+                        c2 = seg.c2
+                        p1 = seg.p1
+                        stream_ops.append(
+                            f"{fmt(c1[0])} {fmt(py(c1[1]))} {fmt(c2[0])} {fmt(py(c2[1]))} {fmt(p1[0])} {fmt(py(p1[1]))} c"
+                        )
+                    elif isinstance(seg, Arc):
+                        for bez in _arc_to_beziers(seg):
+                            c1 = bez.c1
+                            c2 = bez.c2
+                            p1 = bez.p1
+                            stream_ops.append(
+                                f"{fmt(c1[0])} {fmt(py(c1[1]))} {fmt(c2[0])} {fmt(py(c2[1]))} {fmt(p1[0])} {fmt(py(p1[1]))} c"
+                            )
+                stream_ops.append("h")
+        elif isinstance(elem, Primitive):
+            shape = elem.shape
+            if isinstance(shape, Rect):
+                if not shape.angle_deg:
+                    stream_ops.append(f"{fmt(shape.x)} {fmt(py(shape.y + shape.h))} {fmt(shape.w)} {fmt(shape.h)} re")
+                else:
+                    rad = math.radians(shape.angle_deg)
+                    cos_a, sin_a = math.cos(rad), math.sin(rad)
+                    p0 = (shape.x, shape.y)
+                    p1 = (shape.x + shape.w * cos_a, shape.y + shape.w * sin_a)
+                    p2 = (shape.x + shape.w * cos_a - shape.h * sin_a, shape.y + shape.w * sin_a + shape.h * cos_a)
+                    p3 = (shape.x - shape.h * sin_a, shape.y + shape.h * cos_a)
+                    stream_ops.append(f"{fmt(p0[0])} {fmt(py(p0[1]))} m {fmt(p1[0])} {fmt(py(p1[1]))} l {fmt(p2[0])} {fmt(py(p2[1]))} l {fmt(p3[0])} {fmt(py(p3[1]))} l h")
+            elif isinstance(shape, (Circle, Ellipse)):
+                cx, cy = shape.cx, shape.cy
+                rx = shape.r if isinstance(shape, Circle) else shape.rx
+                ry = shape.r if isinstance(shape, Circle) else shape.ry
+                rot = getattr(shape, "angle_deg", 0.0)
+                kappa = 0.5522847498307936
+                pts = [
+                    ((cx + rx, cy), (cx + rx, cy + kappa * ry), (cx + kappa * rx, cy + ry), (cx, cy + ry)),
+                    ((cx, cy + ry), (cx - kappa * rx, cy + ry), (cx - rx, cy + kappa * ry), (cx - rx, cy)),
+                    ((cx - rx, cy), (cx - rx, cy - kappa * ry), (cx - kappa * rx, cy - ry), (cx, cy - ry)),
+                    ((cx, cy - ry), (cx + kappa * rx, cy - ry), (cx + rx, cy - kappa * ry), (cx + rx, cy)),
+                ]
+                rad = math.radians(rot)
+                cos_r, sin_r = math.cos(rad), math.sin(rad)
+                def rot_pt(pt: Point) -> Point:
+                    dx, dy = pt[0] - cx, pt[1] - cy
+                    return (cx + dx * cos_r - dy * sin_r, cy + dx * sin_r + dy * cos_r)
+
+                first = rot_pt(pts[0][0])
+                stream_ops.append(f"{fmt(first[0])} {fmt(py(first[1]))} m")
+                for p0, c1, c2, p1 in pts:
+                    rc1 = rot_pt(c1)
+                    rc2 = rot_pt(c2)
+                    rp1 = rot_pt(p1)
+                    stream_ops.append(f"{fmt(rc1[0])} {fmt(py(rc1[1]))} {fmt(rc2[0])} {fmt(py(rc2[1]))} {fmt(rp1[0])} {fmt(py(rp1[1]))} c")
+                stream_ops.append("h")
+            elif isinstance(shape, Polygon):
+                if shape.points:
+                    p0 = shape.points[0]
+                    stream_ops.append(f"{fmt(p0[0])} {fmt(py(p0[1]))} m")
+                    for pt in shape.points[1:]:
+                        stream_ops.append(f"{fmt(pt[0])} {fmt(py(pt[1]))} l")
+                    stream_ops.append("h")
+
+        if is_gradient:
+            # Clip to path (non-zero winding) and paint shading
+            stream_ops.append("W n")
+            stream_ops.append(f"/{sh_name} sh")
+            stream_ops.append("Q")  # pop graphics state (restores clip)
+        else:
+            # Fill path (even-odd winding rule matches SVG fill-rule=evenodd)
+            stream_ops.append("f*")
+
+    content_data = "\n".join(stream_ops).encode("latin-1")
+    compressed = zlib.compress(content_data)
+
+    # Build PDF object hierarchy
+    objects: list[bytes] = []
+
+    # Obj 1: Catalog
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    # Obj 2: Pages
+    objects.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+
+    # Shading objects if any
+    shading_entries = []
+    shading_obj_nums = {}
+    next_obj = 5
+    for sh in shadings:
+        sh_num = next_obj
+        shading_obj_nums[sh["name"]] = sh_num
+        shading_entries.append(f"/{sh['name']} {sh_num} 0 R")
+        next_obj += 1
+
+    shading_res_str = f"/Shading << {' '.join(shading_entries)} >>" if shading_entries else ""
+
+    # Obj 3: Page
+    page_dict = f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] /Contents 4 0 R /Resources << {shading_res_str} >> >>".encode("latin-1")
+    objects.append(page_dict)
+
+    # Obj 4: Content stream
+    stream_dict = f"<< /Length {len(compressed)} /Filter /FlateDecode >>\nstream\n".encode("latin-1") + compressed + b"\nendstream"
+    objects.append(stream_dict)
+
+    # Add each Shading object
+    for sh in shadings:
+        c0_s = " ".join(str(c) for c in sh["c0"])
+        c1_s = " ".join(str(c) for c in sh["c1"])
+        sh_dict = (
+            f"<< /ShadingType 2 /ColorSpace /DeviceRGB "
+            f"/Coords [{fmt(sh['x1'])} {fmt(sh['y1'])} {fmt(sh['x2'])} {fmt(sh['y2'])}] "
+            f"/Function << /FunctionType 2 /Domain [0 1] /C0 [{c0_s}] /C1 [{c1_s}] /N 1 >> "
+            f"/Extend [true true] >>"
+        ).encode("latin-1")
+        objects.append(sh_dict)
+
+    # Assemble complete PDF with cross-reference table
+    out = bytearray()
+    out.extend(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for i, obj in enumerate(objects, 1):
+        offsets.append(len(out))
+        out.extend(f"{i} 0 obj\n".encode("latin-1"))
+        out.extend(obj)
+        out.extend(b"\nendobj\n")
+
+    xref_offset = len(out)
+    out.extend(f"xref\n0 {len(objects) + 1}\n".encode("latin-1"))
+    out.extend(b"0000000000 65535 f \n")
+    for off in offsets:
+        out.extend(f"{off:010d} 00000 n \n".encode("latin-1"))
+
+    out.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("latin-1"))
+    return bytes(out)

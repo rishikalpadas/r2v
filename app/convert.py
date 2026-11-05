@@ -1,11 +1,12 @@
 """Shared conversion used by the CLI and the preview server."""
 from __future__ import annotations
 
+import base64
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from engine import to_svg, vectorize
+from engine import to_pdf, to_svg, vectorize
 from engine.loader import load_image
 from eval.metrics import count_nodes, mean_delta_e, render_svg, ssim
 
@@ -32,6 +33,7 @@ class Conversion:
     ssim: float | None
     delta_e: float | None
     stage_seconds: Mapping[str, float]
+    pdf_base64: str = ""
 
 
 def to_overrides(options: Mapping[str, object]) -> dict[str, object]:
@@ -48,6 +50,8 @@ def convert(image_bytes: bytes, options: Mapping[str, object] | None = None) -> 
     result = vectorize(image_bytes, overrides=to_overrides(options or {}))
     seconds = time.perf_counter() - start
     svg = to_svg(result.doc)
+    pdf_bytes = to_pdf(result.doc)
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
     nodes, paths = count_nodes(svg)
 
     source = load_image(image_bytes).pixels
@@ -68,4 +72,5 @@ def convert(image_bytes: bytes, options: Mapping[str, object] | None = None) -> 
         ssim=score,
         delta_e=delta,
         stage_seconds={r.stage: r.duration_s for r in result.reports},
+        pdf_base64=pdf_b64,
     )

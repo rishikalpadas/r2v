@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import sys
 from pathlib import Path
 
@@ -10,9 +11,9 @@ from engine import InputError, StageError
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m app.cli", description="Convert a raster image to SVG.")
+    parser = argparse.ArgumentParser(prog="python -m app.cli", description="Convert a raster image to SVG or PDF.")
     parser.add_argument("input", type=Path, help="PNG, JPEG, WebP, BMP, TIFF or GIF file")
-    parser.add_argument("-o", "--output", type=Path, help="output SVG path (default: input name with .svg)")
+    parser.add_argument("-o", "--output", type=Path, help="output SVG or PDF path (default: input name with .svg)")
     parser.add_argument("--max-colors", type=int, help="maximum colors to keep (default 16)")
     parser.add_argument("--layer-mode", choices=["stacked", "cutout"], help="SVG layering (default stacked)")
     parser.add_argument("--no-fit", action="store_true", help="skip curve fitting (raw pixel outlines)")
@@ -44,7 +45,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: conversion failed ({exc})", file=sys.stderr)
         return 1
 
-    output.write_text(result.svg, encoding="utf-8")
+    if output.suffix.lower() == ".pdf":
+        output.write_bytes(base64.b64decode(result.pdf_base64))
+    else:
+        output.write_text(result.svg, encoding="utf-8")
     quality = f"SSIM {result.ssim:.4f}, mean dE {result.delta_e:.2f}" if result.ssim is not None else "quality n/a (image too small)"
     print(f"wrote {output}  ({result.width}x{result.height}, {result.paths} shapes, {result.nodes} nodes, "
           f"{result.seconds:.2f}s, {quality})")

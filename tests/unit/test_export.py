@@ -303,3 +303,40 @@ def test_fit_params_reject_non_finite(bad):
 
     with pytest.raises(ValueError):
         FitParams(**bad)
+
+
+
+def test_to_pdf_export():
+    import pypdfium2 as pdfium
+    from engine.stages.export import to_pdf
+    from engine.types import GradientStop, LinearGradient
+
+    grad = LinearGradient(
+        id="g0",
+        x1=0.0,
+        y1=0.0,
+        x2=10.0,
+        y2=8.0,
+        stops=(GradientStop(0.0, (255, 0, 0), 1.0), GradientStop(1.0, (0, 0, 255), 1.0)),
+    )
+    contour = (
+        Line((0.0, 0.0), (10.0, 0.0)),
+        CubicBezier((10.0, 0.0), (10.0, 2.0), (8.0, 4.0), (8.0, 4.0)),
+        Arc((8.0, 4.0), (0.0, 8.0), center=(4.0, 6.0), radius=5.0, large_arc=False, sweep=False),
+        Line((0.0, 8.0), (0.0, 0.0)),
+    )
+    path_solid = Path((contour,), RED, 0)
+    path_grad = Path((contour,), grad, 1)
+    doc = _doc(paths=(path_solid, path_grad))
+
+    pdf_bytes = to_pdf(doc)
+    assert pdf_bytes.startswith(b"%PDF-1.4")
+    assert pdf_bytes.rstrip().endswith(b"%%EOF")
+    assert b"/Shading" in pdf_bytes
+
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    assert len(pdf) == 1
+    page = pdf[0]
+    assert page.get_size() == (10.0, 8.0)
+    img = page.render(scale=1).to_pil()
+    assert img.size == (10, 8)

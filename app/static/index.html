@@ -93,6 +93,7 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
     <label>Zoom <input type="range" id="zoom" min="0.25" max="8" step="0.25" value="1"><output id="zoomOut">1×</output></label>
     <span class="spacer"></span>
     <button class="btn" id="download" disabled>Download SVG</button>
+    <button class="btn ghost" id="downloadPdf" disabled>Download PDF</button>
   </div>
 
   <div class="status" id="status" aria-live="polite">Choose an image to start.</div>
@@ -114,7 +115,7 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  const state = { file: null, svg: null, w: 0, h: 0, mode: "fill", urls: [], req: 0 };
+  const state = { file: null, svg: null, pdf_base64: null, w: 0, h: 0, mode: "fill", urls: [], req: 0 };
   const OUTLINE_STYLE = '<style>*{fill:none!important;stroke:#d2491d!important;stroke-width:1px!important;vector-effect:non-scaling-stroke}</style>';
 
   function setStatus(text, kind) { const s = $("status"); s.textContent = text; s.className = "status" + (kind ? " " + kind : ""); }
@@ -162,6 +163,7 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
       if (id !== state.req) return;
       if (!resp.ok) throw new Error(data.error || resp.statusText);
       state.svg = data.svg;
+      state.pdf_base64 = data.pdf_base64;
       renderVector();
       $("stats").hidden = false;
       $("sSsim").textContent = data.ssim == null ? "n/a" : data.ssim.toFixed(4); grade($("sSsim"), data.ssim, 0.97, 0.93, true);
@@ -171,6 +173,7 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
       $("sSize").textContent = (new Blob([data.svg]).size / 1024).toFixed(1) + " KB";
       $("stages").textContent = Object.entries(data.stage_seconds).map(([k, v]) => `${k} ${(v * 1000).toFixed(0)}ms`).join(" · ");
       $("download").disabled = false;
+      $("downloadPdf").disabled = !state.pdf_base64;
       setStatus(`Done: ${state.file.name}`);
     } catch (err) {
       if (id === state.req) setStatus("Error: " + err.message, "error");
@@ -181,7 +184,8 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
 
   function load(file) {
     if (!file) return;
-    freeUrls(); state.file = file; state.svg = null; $("download").disabled = true;
+    freeUrls(); state.file = file; state.svg = null; state.pdf_base64 = null;
+    $("download").disabled = true; $("downloadPdf").disabled = true;
     const url = blobUrl(file, file.type);
     const probe = new Image();
     probe.onload = () => {
@@ -217,6 +221,20 @@ input[type=range] { accent-color: var(--accent); width: 120px; }
     a.download = (state.file.name.replace(/\.[^.]+$/, "") || "image") + ".svg";
     a.click();
   });
+
+  $("downloadPdf").addEventListener("click", () => {
+    if (!state.pdf_base64) return;
+    const binary = atob(state.pdf_base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    const a = document.createElement("a");
+    a.href = blobUrl(bytes, "application/pdf");
+    a.download = (state.file.name.replace(/\.[^.]+$/, "") || "image") + ".pdf";
+    a.click();
+  });
+
   setZoom(1);
 })();
 </script>
