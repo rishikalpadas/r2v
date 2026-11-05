@@ -220,3 +220,17 @@ def test_axis_snap_keeps_g1_with_bezier_neighbour():
     assert b.c1[1] == pytest.approx(b.p0[1], abs=1e-9)  # handle follows the now-horizontal line
     assert math.dist(b.c1, b.p0) == pytest.approx(6.0)  # handle length preserved
     assert b.c1[0] > b.p0[0]
+
+
+def test_fit_span_scored_short_span_noise_selects_line():
+    from engine.geometry.segment_fit import fit_span_scored
+    # 12-sample short span with slight corner-blending (chord ~ 13 px, sagitta ~ 2 px)
+    pts = [
+        (2255.98, 457.91), (2252.18, 455.66), (2251.62, 455.85), (2250.95, 456.03),
+        (2250.20, 456.19), (2249.38, 456.30), (2248.53, 456.35), (2247.70, 456.33),
+        (2246.92, 456.25), (2246.24, 456.12), (2245.68, 455.99), (2243.01, 458.26),
+    ]
+    params = FitParams(tolerance_px=2.25)
+    segs, cost = fit_span_scored(pts, params, noise=0.75)
+    assert len(segs) == 1
+    assert isinstance(segs[0], Line)

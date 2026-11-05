@@ -155,18 +155,29 @@ def fit_span_scored(
     tol = params.tolerance_px
     candidates: list[tuple[float, tuple[Segment, ...]]] = []
 
+    chord = float(np.hypot(*(pts[-1] - pts[0])))
     line, line_sse = fit_line(points)
-    if float(np.max(_dist_to_segment(pts, pts[0], pts[-1]))) <= tol:
+    line_err = float(np.max(_dist_to_segment(pts, pts[0], pts[-1])))
+    line_tol = tol
+    if noise is not None and chord < max(16.0, tol * 6.0):
+        # On short spans with noise, samples right next to placed corners can blur.
+        interior = pts[2:-2] if len(pts) > 5 else (pts[1:-1] if len(pts) > 3 else pts)
+        if float(np.max(_dist_to_segment(interior, pts[0], pts[-1]))) <= tol:
+            line_tol = max(tol, line_err)
+    if line_err <= line_tol:
         candidates.append((_model_cost(line_sse, _LINE_PARAMS, params, noise), (line,)))
 
     arc_fit = fit_arc(points)
     if arc_fit is not None and _arc_max_error(arc_fit[0], pts) <= tol:
-        candidates.append((_model_cost(arc_fit[1], _ARC_PARAMS, params, noise), (arc_fit[0],)))
+        if noise is None or (chord >= 16.0 and arc_fit[0].radius >= 16.0):
+            candidates.append((_model_cost(arc_fit[1], _ARC_PARAMS, params, noise), (arc_fit[0],)))
 
-    min_chord = max(6.0, tol * 3.0) if noise is not None else 0.0
-    chain = fit_cubic(points, tol, tangent_samples, min_chord)
-    sse = float(np.sum(_bezier_distances(chain, pts) ** 2))
-    candidates.append((_model_cost(sse, _BEZIER_PARAMS * len(chain), params, noise), tuple(chain)))
+    allow_cubic = (noise is None) or (chord >= max(16.0, tol * 6.0)) or not candidates
+    if allow_cubic:
+        min_chord = max(6.0, tol * 3.0) if noise is not None else 0.0
+        chain = fit_cubic(points, tol, tangent_samples, min_chord)
+        sse = float(np.sum(_bezier_distances(chain, pts) ** 2))
+        candidates.append((_model_cost(sse, _BEZIER_PARAMS * len(chain), params, noise), tuple(chain)))
     cost, segments = min(candidates, key=lambda c: c[0])
     return segments, cost
 

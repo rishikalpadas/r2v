@@ -363,3 +363,42 @@ def test_segment_is_deterministic():
     px = _noisy_rgba(rgb)
     a, b = segment(_img(px), SegmentParams()), segment(_img(px.copy()), SegmentParams())
     assert np.array_equal(a.labels, b.labels) and np.array_equal(a.palette_rgb, b.palette_rgb)
+
+
+def test_prune_spurs_orthogonal_and_peninsula():
+    from engine.stages.segment_regions import prune_spurs
+    grid = np.zeros((10, 10), np.int32)
+    # 90-degree square corner at [1:5, 1:5]
+    grid[1:5, 1:5] = 1
+    # 1-pixel spur sticking out from square at (5, 2)
+    grid[5, 2] = 1
+    # 2-pixel wide terminal peninsula at (5, 6) and (5, 7) attached to [1:5, 6:8]
+    grid[1:5, 6:8] = 1
+    grid[5, 6] = 1
+    grid[5, 7] = 1
+
+    cleaned = prune_spurs(grid, max_iterations=4)
+    # The 90-degree square corner [1:5, 1:5] must be fully preserved
+    assert (cleaned[1:5, 1:5] == 1).all()
+    # The 1-pixel spur at (5, 2) must be pruned to 0
+    assert cleaned[5, 2] == 0
+    # The 2-pixel peninsula at (5, 6) and (5, 7) must be pruned to 0
+    assert cleaned[5, 6] == 0
+    assert cleaned[5, 7] == 0
+
+
+def test_absorb_specks_compact_vs_sliver():
+    # 1. Compact dot (3x3 square, area 9, aspect 1.0) with high delta-e to background stays
+    labels = np.zeros((20, 20), np.int32)
+    labels[8:11, 8:11] = 1
+    palette = np.array([[0, 0, 0], [255, 255, 255]], np.uint8)
+    out, pal = absorb_specks(labels, palette, scale=1.0, min_area_px=12.0, keep_delta_e=15.0)
+    assert len(pal) == 2
+    assert (out == 1).sum() == 9
+
+    # 2. Elongated thin sliver (1x16, area 16, aspect 16.0) with high delta-e is absorbed
+    labels_sliver = np.zeros((30, 30), np.int32)
+    labels_sliver[5:21, 10] = 1
+    out_sl, pal_sl = absorb_specks(labels_sliver, palette, scale=1.0, min_area_px=12.0, keep_delta_e=15.0)
+    assert len(pal_sl) == 1
+    assert (out_sl == 0).all()

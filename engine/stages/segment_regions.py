@@ -459,7 +459,21 @@ def absorb_specks(
     n = len(palette_rgb)
     limit = min_area_px * scale * scale
     area = np.bincount(labels[labels >= 0], minlength=n).astype(np.float64)
-    small = np.flatnonzero(area < limit)
+    sliver_limit = max(limit, 50.0 * scale * scale)
+    boxes = ndimage.find_objects(labels + 1, max_label=n)
+
+    def _is_candidate(i: int) -> bool:
+        if area[i] < limit:
+            return True
+        if area[i] < sliver_limit and boxes[i] is not None:
+            h = boxes[i][0].stop - boxes[i][0].start
+            w = boxes[i][1].stop - boxes[i][1].start
+            aspect = max(h, w) / max(min(h, w), 1)
+            thickness = min(h, w)
+            return bool(aspect >= 3.0 and thickness <= 3.5 * scale)
+        return False
+
+    small = [i for i in range(n) if _is_candidate(i)]
     if n < 2 or len(small) == 0:
         return labels, palette_rgb
     a, b, _ = _edge_arrays(labels)
@@ -476,15 +490,30 @@ def absorb_specks(
             i = parent[i]
         return int(i)
 
-    for s in sorted(small.tolist(), key=lambda i: (area[i], i)):
-        if find(s) != s or area[s] >= limit:
+    for s in sorted(small, key=lambda i: (area[i], i)):
+        if find(s) != s:
+            continue
+        bx = boxes[s] if s < len(boxes) else None
+        if bx is not None:
+            h = bx[0].stop - bx[0].start
+            w = bx[1].stop - bx[1].start
+            aspect = max(h, w) / max(min(h, w), 1)
+            fill_ratio = area[s] / max(w * h, 1)
+            thickness = min(h, w)
+            is_compact = (aspect <= 2.5) and (fill_ratio >= 0.35)
+            is_sliver = (aspect >= 3.0) and (thickness <= 3.5 * scale)
+        else:
+            is_compact = True
+            is_sliver = False
+        max_allowed = sliver_limit if is_sliver else limit
+        if area[s] >= max_allowed:
             continue
         nbs = {find(nb) for nb in border[s]} - {s}
         if not nbs:
             continue
         de = {nb: _de(pal_lab[s], pal_lab[nb]) for nb in nbs}
         target = min(de, key=lambda nb: (de[nb], -area[nb], nb))
-        if de[target] >= keep_delta_e:
+        if is_compact and de[target] >= keep_delta_e:
             continue
         parent[s] = target
         area[target] += area[s]
@@ -494,6 +523,55 @@ def absorb_specks(
         return labels, palette_rgb
     out, survivors = _relabel(labels, root)
     return out, palette_rgb[survivors]
+
+
+def prune_spurs(labels: np.ndarray, max_iterations: int = 4) -> np.ndarray:
+    """Prune 1-pixel wide spurs and 2-pixel wide peninsulas protruding from regions.
+
+    A pixel is pruned if 3 of its 4 orthogonal neighbours agree on a different label,
+    or if it forms a 2-pixel wide terminal peninsula bounded by an adjacent label.
+    Preserves 90-degree corners (which have at most 2 matching orthogonal neighbours).
+    """
+    out = labels.copy()
+    for _ in range(max_iterations):
+        up = np.pad(out[:-1, :], ((1, 0), (0, 0)), mode="edge")
+        down = np.pad(out[1:, :], ((0, 1), (0, 0)), mode="edge")
+        left = np.pad(out[:, :-1], ((0, 0), (1, 0)), mode="edge")
+        right = np.pad(out[:, 1:], ((0, 0), (0, 1)), mode="edge")
+
+        m1 = (up == down) & (down == left) & (up != out)
+        m2 = (up == down) & (down == right) & (up != out)
+        m3 = (up == left) & (left == right) & (up != out)
+        m4 = (down == left) & (left == right) & (down != out)
+
+        cand = m1 | m2 | m3 | m4
+        repl = np.where(m1 | m2 | m3, up, down)
+
+        left2 = np.pad(out[:, :-2], ((0, 0), (2, 0)), mode="edge")
+        right2 = np.pad(out[:, 2:], ((0, 0), (0, 2)), mode="edge")
+        up2 = np.pad(out[:-2, :], ((2, 0), (0, 0)), mode="edge")
+        down2 = np.pad(out[2:, :], ((0, 2), (0, 0)), mode="edge")
+
+        p_down_l = (left == right2) & (left == down) & (left != out)
+        p_down_r = (right == left2) & (right == down) & (right != out)
+        p_up_l = (left == right2) & (left == up) & (left != out)
+        p_up_r = (right == left2) & (right == up) & (right != out)
+        p_right_u = (up == down2) & (up == right) & (up != out)
+        p_right_d = (down == up2) & (down == right) & (down != out)
+        p_left_u = (up == down2) & (up == left) & (up != out)
+        p_left_d = (down == up2) & (down == left) & (down != out)
+
+        p_cand = p_down_l | p_down_r | p_up_l | p_up_r | p_right_u | p_right_d | p_left_u | p_left_d
+        p_repl = np.where(p_down_l | p_up_l, left,
+                 np.where(p_down_r | p_up_r, right,
+                 np.where(p_right_u | p_left_u, up, down)))
+
+        all_cand = cand | p_cand
+        if not all_cand.any():
+            break
+        final_repl = np.where(cand, repl, p_repl)
+        out[all_cand] = final_repl[all_cand]
+    return out
 
 
 def refine_regions(
@@ -512,4 +590,5 @@ def refine_regions(
                                              smooth_sums=smooth_sums)
     labels, palette_rgb = absorb_slivers(labels, palette_rgb, lab, scale)
     labels, palette_rgb = absorb_specks(labels, palette_rgb, scale, speck_area_px)
+    labels = prune_spurs(labels)
     return labels, palette_rgb
