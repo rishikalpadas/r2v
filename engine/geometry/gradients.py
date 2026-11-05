@@ -5,6 +5,7 @@ from typing import Mapping
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.csgraph as csg
+import scipy.ndimage as ndi
 from skimage.color import deltaE_ciede2000
 
 from engine.stages.segment_regions import (
@@ -155,6 +156,23 @@ def detect_and_merge_gradients(
         fit = fit_gradient_axis(source_rgb, group_mask, scale)
         if fit is None:
             continue
+
+        # Absorb adjacent boundary bands into this gradient group
+        # (prevents isolated slivers on letter curves where outline contrast suppresses quiet_share)
+        dilated = ndi.binary_dilation(group_mask)
+        touching_labels = np.unique(out_labels[dilated & ~group_mask])
+        for t_id in touching_labels:
+            if t_id < 0 or t_id in gradients:
+                continue
+            t_dE = deltaE_ciede2000(palette_lab[[t_id]], palette_lab[members]).min()
+            if t_dE < max_delta_e:
+                t_mask = out_labels == t_id
+                combined_mask = group_mask | t_mask
+                new_fit = fit_gradient_axis(source_rgb, combined_mask, scale)
+                if new_fit is not None:
+                    group_mask = combined_mask
+                    fit = new_fit
+                    members = np.append(members, t_id)
 
         x1, y1, x2, y2, start_rgb, end_rgb = fit
         target_id = int(members[0])

@@ -223,8 +223,11 @@ def detect_primitive(
     rect = _detect_rect(arr, corners, scale)
     if rect is not None:
         return rect
+    circle = _detect_circle(arr, scale)
+    if circle is not None:
+        return circle
     if len(corners) < MIN_POLY_CORNERS:
         # Up to two corners are tolerated: the tips of a pixelated ellipse can read as corners.
         # The fit tolerances below reject lenses, half-discs and other genuinely cornered shapes.
-        return _detect_circle(arr, scale) or _detect_ellipse(arr, scale)
-    return _detect_polygon(arr, corners, scale)
+        return _detect_ellipse(arr, scale)
+    return _detect_polygon(arr, corners, scale) or _detect_ellipse(arr, scale)
