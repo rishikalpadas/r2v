@@ -459,12 +459,16 @@ def absorb_specks(
     n = len(palette_rgb)
     limit = min_area_px * scale * scale
     area = np.bincount(labels[labels >= 0], minlength=n).astype(np.float64)
-    sliver_limit = max(limit, 50.0 * scale * scale)
+    sliver_limit = max(limit, 200.0 * scale * scale)
     boxes = ndimage.find_objects(labels + 1, max_label=n)
 
     a, b, _ = _edge_arrays(labels)
     keys = np.unique(np.concatenate([a.astype(np.int64) * n + b, b.astype(np.int64) * n + a]))
     border: dict[int, set[int]] = defaultdict(set)
+    border_len: dict[int, int] = defaultdict(int)
+    for p1, p2 in zip(a.tolist(), b.tolist()):
+        border_len[p1] += 1
+        border_len[p2] += 1
     for key in keys.tolist():
         border[key // n].add(key % n)
 
@@ -475,11 +479,12 @@ def absorb_specks(
             h = boxes[i][0].stop - boxes[i][0].start
             w = boxes[i][1].stop - boxes[i][1].start
             aspect = max(h, w) / max(min(h, w), 1)
-            thickness = min(h, w)
+            perim = max(border_len[i], 1)
+            mean_thickness = 2.0 * area[i] / perim
             # Standalone islands inside a single region are only slivers if needle-like (aspect >= 8)
             if len(border[i]) < 2:
-                return bool(aspect >= 8.0 or thickness <= 1.0 * scale)
-            return bool(aspect >= 3.0 and thickness <= 3.5 * scale)
+                return bool(aspect >= 8.0 or mean_thickness <= 1.0 * scale)
+            return bool((aspect >= 3.0 or mean_thickness <= 2.5 * scale) and mean_thickness <= 3.5 * scale)
         return False
 
     small = [i for i in range(n) if _is_candidate(i)]
@@ -503,9 +508,10 @@ def absorb_specks(
             w = bx[1].stop - bx[1].start
             aspect = max(h, w) / max(min(h, w), 1)
             fill_ratio = area[s] / max(w * h, 1)
-            thickness = min(h, w)
-            is_compact = (aspect <= 2.5) and (fill_ratio >= 0.35)
-            is_sliver = (aspect >= 3.0) and (thickness <= 3.5 * scale)
+            perim = max(border_len[s], 1)
+            mean_thickness = 2.0 * area[s] / perim
+            is_compact = (aspect <= 2.5) and (fill_ratio >= 0.35) and (mean_thickness > 2.0 * scale)
+            is_sliver = (aspect >= 3.0 or mean_thickness <= 2.5 * scale) and (mean_thickness <= 3.5 * scale)
         else:
             is_compact = True
             is_sliver = False

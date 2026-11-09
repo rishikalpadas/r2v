@@ -432,3 +432,34 @@ def test_gradient_expansion_into_fading_canvas_background():
     target_id = next(iter(grads.keys()))
     g_ys, g_xs = np.where(out_labels == target_id)
     assert g_ys.max() >= 55, f'Expected gradient to expand down near y=55+, got max y={g_ys.max()}'
+
+
+def test_letter_counter_ringing_sliver_absorbed():
+    # Gibbs ringing ribbon inside a script letter counter: a 2-pixel wide curved sliver
+    # with high contrast against the dark stroke, but subtle contrast (dE < 15) against the grey fill.
+    # absorb_specks must absorb the sliver into the grey fill rather than leaving a split counter.
+    from engine.stages.segment_regions import absorb_specks
+    h, w = 100, 100
+    labels = np.zeros((h, w), np.int32)  # 0: grey canvas / counter
+    # Region 1: dark letter stroke (ring/loop around counter)
+    ys, xs = np.mgrid[0:h, 0:w]
+    dist = np.hypot(xs - 50, ys - 50)
+    angle = np.arctan2(ys - 50, xs - 50)
+    arc = (angle >= 0) & (angle <= np.pi / 2)
+    stroke = (dist >= 30) & (dist <= 38) & arc
+    labels[stroke] = 1
+    # Region 2: ringing sliver adjacent to inner stroke (dist between 27 and 30)
+    ringing = (dist >= 27) & (dist < 30) & arc
+    labels[ringing] = 2
+
+    palette = np.array([
+        [205, 210, 214],  # 0: grey counter fill
+        [5, 20, 43],      # 1: dark navy stroke
+        [238, 242, 243],  # 2: whitish ringing sliver (dE ~ 10 to grey, dE ~ 85 to stroke)
+    ], np.uint8)
+
+    out_labels, out_pal = absorb_specks(labels, palette, scale=1.0)
+    # Region 2 (ringing sliver) should be completely absorbed into 0 (grey counter)
+    unique_remaining = np.unique(out_labels)
+    assert 2 not in unique_remaining, 'Whitish ringing sliver must be absorbed into grey counter'
+    assert len(out_pal) == 2, f'Expected 2 survivor colors, got {len(out_pal)}'

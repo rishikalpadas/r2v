@@ -264,7 +264,7 @@ def _fit_oriented_rect(pts: np.ndarray) -> tuple[np.ndarray, float, float, float
 
 def _detect_oriented_rect_fit(curve: BoundaryCurve, scale: float) -> FittedCurve | None:
     pts = np.asarray(curve.points, np.float64)
-    if len(pts) < 8:
+    if len(pts) < 4:
         return None
     min_x, min_y = pts.min(axis=0)
     max_x, max_y = pts.max(axis=0)
@@ -281,7 +281,7 @@ def _detect_oriented_rect_fit(curve: BoundaryCurve, scale: float) -> FittedCurve
         return None
     poly_area = 0.5 * np.abs(np.dot(pts[:, 0], np.roll(pts[:, 1], 1)) - np.dot(pts[:, 1], np.roll(pts[:, 0], 1)))
     fill_ratio = poly_area / (bw * bh)
-    if fill_ratio < 0.72:
+    if fill_ratio < 0.68:
         return None
 
     edges_p1 = box
@@ -358,6 +358,10 @@ def _fit_smooth(
     min_length = MIN_CLOSED_LENGTH_PX if curve.closed else MIN_OPEN_LENGTH_PX
     if _length(curve.points) < min_length * scale:
         return _fit_curve(curve), None
+    if curve.closed:
+        rect_fit = _detect_oriented_rect_fit(curve, scale)
+        if rect_fit is not None:
+            return rect_fit, None
     if params.adaptive:
         samples = _raw_samples(curve, context)
         fitted = fit_curve_adaptive(curve, samples, params, scale, CORNER_WINDOW, CORNERLESS_SPANS)
