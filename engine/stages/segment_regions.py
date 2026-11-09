@@ -462,6 +462,12 @@ def absorb_specks(
     sliver_limit = max(limit, 50.0 * scale * scale)
     boxes = ndimage.find_objects(labels + 1, max_label=n)
 
+    a, b, _ = _edge_arrays(labels)
+    keys = np.unique(np.concatenate([a.astype(np.int64) * n + b, b.astype(np.int64) * n + a]))
+    border: dict[int, set[int]] = defaultdict(set)
+    for key in keys.tolist():
+        border[key // n].add(key % n)
+
     def _is_candidate(i: int) -> bool:
         if area[i] < limit:
             return True
@@ -470,17 +476,15 @@ def absorb_specks(
             w = boxes[i][1].stop - boxes[i][1].start
             aspect = max(h, w) / max(min(h, w), 1)
             thickness = min(h, w)
+            # Standalone islands inside a single region are only slivers if needle-like (aspect >= 8)
+            if len(border[i]) < 2:
+                return bool(aspect >= 8.0 or thickness <= 1.0 * scale)
             return bool(aspect >= 3.0 and thickness <= 3.5 * scale)
         return False
 
     small = [i for i in range(n) if _is_candidate(i)]
     if n < 2 or len(small) == 0:
         return labels, palette_rgb
-    a, b, _ = _edge_arrays(labels)
-    keys = np.unique(np.concatenate([a.astype(np.int64) * n + b, b.astype(np.int64) * n + a]))
-    border: dict[int, set[int]] = defaultdict(set)
-    for key in keys.tolist():
-        border[key // n].add(key % n)
     pal_lab = _rgb_to_lab(palette_rgb)
     parent = np.arange(n)
 
@@ -505,15 +509,18 @@ def absorb_specks(
         else:
             is_compact = True
             is_sliver = False
-        max_allowed = sliver_limit if is_sliver else limit
-        if area[s] >= max_allowed:
-            continue
         nbs = {find(nb) for nb in border[s]} - {s}
         if not nbs:
             continue
+        # Standalone islands inside 1 neighbor: sliver limit only absorbs if aspect >= 8
+        if len(nbs) < 2 and area[s] >= limit and aspect < 8.0:
+            continue
+        max_allowed = sliver_limit if is_sliver else limit
+        if area[s] >= max_allowed:
+            continue
         de = {nb: _de(pal_lab[s], pal_lab[nb]) for nb in nbs}
         target = min(de, key=lambda nb: (de[nb], -area[nb], nb))
-        if is_compact and de[target] >= keep_delta_e:
+        if (is_compact or (len(nbs) == 1 and aspect < 8.0)) and de[target] >= keep_delta_e:
             continue
         parent[s] = target
         area[target] += area[s]

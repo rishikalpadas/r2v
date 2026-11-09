@@ -122,6 +122,11 @@ def detect_and_merge_gradients(
     sums = np.bincount(inverse.ravel(), weights=quiet.astype(np.float64))
     quiet_share = sums / counts
 
+    # Identify canvas background regions (large regions touching outer border)
+    perimeter = np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]])
+    unique_p, counts_p = np.unique(perimeter, return_counts=True)
+    canvas_bg = {int(p) for p, cnt in zip(unique_p, counts_p) if cnt >= 0.10 * len(perimeter)}
+
     pi, pj = keys // n, keys % n
     palette_lab = _rgb_to_lab(palette_rgb)
     dE = deltaE_ciede2000(palette_lab[pi], palette_lab[pj])
@@ -129,6 +134,8 @@ def detect_and_merge_gradients(
     # Filter quiet candidate boundary edges
     min_count = round(16 * scale)
     cand_mask = (quiet_share >= min_quiet_share) & (counts >= min_count) & (dE < max_delta_e)
+    if canvas_bg:
+        cand_mask &= ~np.isin(pi, list(canvas_bg)) & ~np.isin(pj, list(canvas_bg))
     cand_i = pi[cand_mask]
     cand_j = pj[cand_mask]
 
@@ -138,6 +145,9 @@ def detect_and_merge_gradients(
     adj = sp.coo_matrix((np.ones(len(cand_i)), (cand_i, cand_j)), shape=(n, n))
     adj = adj + adj.T
     n_comp, comp_labels = csg.connected_components(adj, directed=False)
+
+    region_areas = np.bincount(labels[labels >= 0], minlength=n)
+    max_band_px = 500.0 * scale * scale
 
     out_labels = labels.copy()
     gradients: dict[int, LinearGradient] = {}
@@ -162,7 +172,7 @@ def detect_and_merge_gradients(
         dilated = ndi.binary_dilation(group_mask)
         touching_labels = np.unique(out_labels[dilated & ~group_mask])
         for t_id in touching_labels:
-            if t_id < 0 or t_id in gradients:
+            if t_id < 0 or t_id in gradients or t_id in canvas_bg or region_areas[t_id] > max_band_px:
                 continue
             t_dE = deltaE_ciede2000(palette_lab[[t_id]], palette_lab[members]).min()
             if t_dE < max_delta_e:
