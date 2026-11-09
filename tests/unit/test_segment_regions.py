@@ -402,3 +402,33 @@ def test_absorb_specks_compact_vs_sliver():
     out_sl, pal_sl = absorb_specks(labels_sliver, palette, scale=1.0, min_area_px=12.0, keep_delta_e=15.0)
     assert len(pal_sl) == 1
     assert (out_sl == 0).all()
+
+
+
+def test_gradient_expansion_into_fading_canvas_background():
+    # A vertical stripe fading into canvas background:
+    # Top half is detected as gradient, bottom half was assigned to canvas background.
+    # detect_and_merge_gradients must expand into the tinted background tail.
+    from engine.geometry.gradients import detect_and_merge_gradients
+    h, w = 80, 60
+    source_rgb = np.full((h, w, 3), 200, np.uint8)
+    labels = np.zeros((h, w), np.int32)
+    for y in range(10, 65):
+        t = (y - 10) / 55.0
+        c = (1.0 - t) * np.array([100, 200, 190]) + t * np.array([200, 200, 200])
+        source_rgb[y, 15:36] = np.clip(c, 0, 255).astype(np.uint8)
+
+    labels[10:25, 15:36] = 1
+    labels[25:40, 15:36] = 2
+
+    palette = np.array([
+        [200, 200, 200],
+        [120, 200, 192],
+        [150, 200, 195],
+    ], np.uint8)
+
+    out_labels, out_pal, grads = detect_and_merge_gradients(labels, palette, source_rgb, scale=1.0)
+    assert len(grads) >= 1
+    target_id = next(iter(grads.keys()))
+    g_ys, g_xs = np.where(out_labels == target_id)
+    assert g_ys.max() >= 55, f'Expected gradient to expand down near y=55+, got max y={g_ys.max()}'

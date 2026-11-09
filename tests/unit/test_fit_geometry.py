@@ -162,3 +162,30 @@ def test_narrow_rect_keeps_both_end_corners():
     assert not isinstance(fitted.primitive, (Circle, Ellipse))
     ends = {s.p0 for s in fitted.segments}
     assert {(11, 12), (15, 12), (15, 51), (11, 51)} <= ends
+
+
+
+def test_oriented_stitch_rect_fitted_as_polygon():
+    # Rotated stitch dash (e.g. 30 deg, aspect 5:1): should be detected as oriented rectangle
+    # and fitted with 4 Lines and a Polygon primitive, preserving crisp right angles.
+    from engine.stages.fit_geometry import _detect_oriented_rect_fit
+    from engine.types import BoundaryCurve, Polygon
+    w, h = 4.0, 20.0
+    ang = np.radians(30)
+    c, s = np.cos(ang), np.sin(ang)
+    R = np.array([[c, -s], [s, c]])
+    corners = np.array([[-w / 2, -h / 2], [w / 2, -h / 2], [w / 2, h / 2], [-w / 2, h / 2]])
+    rot_corners = corners @ R.T + np.array([50.0, 50.0])
+    pts = []
+    for i in range(4):
+        p1 = rot_corners[i]
+        p2 = rot_corners[(i + 1) % 4]
+        n_pts = int(np.linalg.norm(p2 - p1) * 2)
+        for t in np.linspace(0, 1, n_pts, endpoint=False):
+            pts.append(tuple(p1 + t * (p2 - p1)))
+    curve = BoundaryCurve(id=1, left=0, right=1, points=tuple(pts), closed=True)
+    fitted = _detect_oriented_rect_fit(curve, scale=1.0)
+    assert fitted is not None
+    assert len(fitted.segments) == 4
+    assert all(isinstance(seg, Line) for seg in fitted.segments)
+    assert isinstance(fitted.primitive, Polygon)

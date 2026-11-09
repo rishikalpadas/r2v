@@ -14,7 +14,8 @@ from engine.geometry.primitives import detect_primitive
 from engine.geometry.segment_fit import fit_span
 from engine.geometry.subpixel import EdgeContext, subpixel_dense
 from engine.presets import FitParams
-from engine.types import OUTSIDE, BoundaryCurve, BoundaryGraph, FittedCurve, Line, Point
+from scipy.spatial import ConvexHull
+from engine.types import OUTSIDE, BoundaryCurve, BoundaryGraph, FittedCurve, Line, Point, Polygon
 
 _COLLINEAR_EPS = 1e-9
 # Lengths below are in original-image pixels and are multiplied by the processing scale where
@@ -236,9 +237,91 @@ def _fit_open(
     return FittedCurve(curve.id, segments, primitive=None), plan
 
 
+def _fit_oriented_rect(pts: np.ndarray) -> tuple[np.ndarray, float, float, float]:
+    hull = ConvexHull(pts)
+    hull_pts = pts[hull.vertices]
+    edges = np.diff(np.vstack([hull_pts, hull_pts[0]]), axis=0)
+    edge_angles = np.unique(np.arctan2(edges[:, 1], edges[:, 0]) % (np.pi / 2))
+    best_area = float("inf")
+    best_box = None
+    best_w, best_h = 0.0, 0.0
+    best_ang = 0.0
+    for ang in edge_angles:
+        R = np.array([[np.cos(ang), np.sin(ang)], [-np.sin(ang), np.cos(ang)]])
+        rot_pts = hull_pts @ R.T
+        min_x, min_y = rot_pts.min(axis=0)
+        max_x, max_y = rot_pts.max(axis=0)
+        w, h = max_x - min_x, max_y - min_y
+        area = w * h
+        if area < best_area:
+            best_area = area
+            best_w, best_h = w, h
+            best_ang = np.degrees(ang)
+            corners_rot = np.array([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
+            best_box = corners_rot @ R
+    return best_box, best_w, best_h, best_ang
+
+
+def _detect_oriented_rect_fit(curve: BoundaryCurve, scale: float) -> FittedCurve | None:
+    pts = np.asarray(curve.points, np.float64)
+    if len(pts) < 8:
+        return None
+    min_x, min_y = pts.min(axis=0)
+    max_x, max_y = pts.max(axis=0)
+    w_raw, h_raw = max_x - min_x, max_y - min_y
+    min_dim, max_dim = min(w_raw, h_raw), max(w_raw, h_raw)
+    if min_dim < 2.0 or max_dim > 150.0 * scale:
+        return None
+    try:
+        box, bw, bh, ang = _fit_oriented_rect(pts)
+    except Exception:
+        return None
+    aspect = max(bw, bh) / max(min(bw, bh), 1e-3)
+    if aspect < 2.0 or min(bw, bh) > 25.0 * scale or max(bw, bh) > 150.0 * scale:
+        return None
+    poly_area = 0.5 * np.abs(np.dot(pts[:, 0], np.roll(pts[:, 1], 1)) - np.dot(pts[:, 1], np.roll(pts[:, 0], 1)))
+    fill_ratio = poly_area / (bw * bh)
+    if fill_ratio < 0.72:
+        return None
+
+    edges_p1 = box
+    edges_p2 = np.roll(box, -1, axis=0)
+    edge_vecs = edges_p2 - edges_p1
+    edge_lens_sq = np.sum(edge_vecs**2, axis=1)
+    diff = pts[:, None, :] - edges_p1[None, :, :]
+    t = np.clip(np.sum(diff * edge_vecs[None, :, :], axis=2) / edge_lens_sq[None, :], 0.0, 1.0)
+    proj = edges_p1[None, :, :] + t[:, :, None] * edge_vecs[None, :, :]
+    dists = np.linalg.norm(pts[:, None, :] - proj, axis=2)
+    min_dists = np.min(dists, axis=1)
+    max_dev = float(np.percentile(min_dists, 95.0))
+    if max_dev > 2.5 * scale:
+        return None
+
+    signed_area_ring = 0.5 * np.sum(pts[:, 0] * np.roll(pts[:, 1], 1) - pts[:, 1] * np.roll(pts[:, 0], 1))
+    signed_area_box = 0.5 * np.sum(box[:, 0] * np.roll(box[:, 1], 1) - box[:, 1] * np.roll(box[:, 0], 1))
+    if (signed_area_ring > 0) != (signed_area_box > 0):
+        box = box[::-1]
+
+    dists0 = np.linalg.norm(box - pts[0], axis=1)
+    start_idx = int(np.argmin(dists0))
+    box = np.roll(box, -start_idx, axis=0)
+
+    pts_box = [(float(p[0]), float(p[1])) for p in box]
+    segments = (
+        Line(pts_box[0], pts_box[1]),
+        Line(pts_box[1], pts_box[2]),
+        Line(pts_box[2], pts_box[3]),
+        Line(pts_box[3], pts_box[0]),
+    )
+    return FittedCurve(curve.id, segments, primitive=Polygon(tuple(pts_box)))
+
+
 def _fit_closed(
     curve: BoundaryCurve, params: FitParams, scale: float, context: EdgeContext | None
 ) -> _Fit:
+    rect_fit = _detect_oriented_rect_fit(curve, scale)
+    if rect_fit is not None:
+        return rect_fit, None
     ring, samples = _samples(curve, params.smooth_sigma, context)
     n = len(ring)
     window = samples_at_scale(CORNER_WINDOW, scale)

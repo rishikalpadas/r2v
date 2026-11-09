@@ -184,6 +184,29 @@ def detect_and_merge_gradients(
                     fit = new_fit
                     members = np.append(members, t_id)
 
+        # If this gradient region touches canvas_bg, expand into tinted canvas_bg pixels
+        # that belong to the fading tail of the artwork (fading into the canvas background)
+        if canvas_bg and (dilated & np.isin(out_labels, list(canvas_bg))).any():
+            bg_id = next(iter(canvas_bg))
+            bg_rgb = palette_rgb[bg_id].astype(float)
+            bg_mask = np.isin(out_labels, list(canvas_bg))
+            diff_to_bg = np.linalg.norm(source_rgb.astype(float) - bg_rgb, axis=2)
+            tinted_bg = bg_mask & (diff_to_bg >= 5.0)
+            struct = ndi.generate_binary_structure(2, 2)
+            cur = group_mask.copy()
+            max_iter = round(60 * scale)
+            for _ in range(max_iter):
+                dil_cur = ndi.binary_dilation(cur, structure=struct)
+                new_pts = dil_cur & tinted_bg & ~cur
+                if not new_pts.any():
+                    break
+                cur |= new_pts
+            if cur.sum() > group_mask.sum():
+                new_fit = fit_gradient_axis(source_rgb, cur, scale)
+                if new_fit is not None:
+                    group_mask = cur
+                    fit = new_fit
+
         x1, y1, x2, y2, start_rgb, end_rgb = fit
         target_id = int(members[0])
 
